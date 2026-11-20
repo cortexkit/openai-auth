@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { APICallError } from 'ai'
+import { prepareCodexRequest } from '../codex-request'
 import { resetSettingsForTest } from '../config'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { EMPTY_BEARER_MESSAGE } from '../index'
@@ -153,6 +154,73 @@ describe('orderCodexBody', () => {
 })
 
 describe('createWebSocketFetch', () => {
+  test('restores GPT-6.2 replayed call status before WebSocket suffix comparison and preserves GPT-6.1 input', async () => {
+    const user = { type: 'message', role: 'user', content: 'go' }
+    const call = {
+      type: 'function_call',
+      call_id: 'c1',
+      name: 'read',
+      arguments: '{ "path": "README.md" }',
+    }
+    const completed = { ...call, status: 'completed' }
+    const output = { type: 'function_call_output', call_id: 'c1', output: 'ok' }
+    for (const model of ['gpt-6.1-sol', 'gpt-6.2-sol']) {
+      const sent: Array<Record<string, unknown>> = []
+      await withFakeWebSocket(
+        ({ message }) => ({
+          send(data) {
+            sent.push(JSON.parse(data))
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: `resp_${sent.length}` },
+              }),
+            )
+          },
+        }),
+        async () => {
+          const fetch = createWebSocketFetch()
+          const metadata = {
+            threadID: 'session-1',
+            turnID: 'turn',
+            windowID: 'window',
+          }
+          const send = async (input: unknown[]) => {
+            const headers = new Headers()
+            const { init } = prepareCodexRequest({
+              init: streamRequest({ model, input }),
+              headers,
+              metadata,
+              installationID: 'installation',
+              websocket: true,
+              responsesLite: false,
+              rewriteLite: () => {},
+            })
+            const response = await fetch('https://example.test/responses', {
+              ...init,
+              headers,
+            })
+            await response.text()
+          }
+          try {
+            const expectedCall = model === 'gpt-6.2-sol' ? completed : call
+            await send([user, call])
+            expect(JSON.stringify(sent[1]?.input)).toBe(
+              JSON.stringify([user, expectedCall]),
+            )
+            // A host that already carries status should match the restored history.
+            await send([user, expectedCall, output])
+            expect(sent).toHaveLength(3)
+            expect(sent[2]?.previous_response_id).toBe('resp_2')
+            expect(sent[2]?.input).toEqual([output])
+          } finally {
+            fetch.close()
+          }
+        },
+      )
+    }
+  })
+
   test('prewarm continuation uses the actual ordered request signature', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(

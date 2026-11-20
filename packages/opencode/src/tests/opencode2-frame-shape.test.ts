@@ -4,9 +4,9 @@
 // left alone. Every such `response.create` frame goes out as OpenCode 1's
 // WebSocket request builder shapes it, with the frame turn in its turn
 // metadata. Its `input` stays the host's, except that the mid-conversation
-// effort rule may insert one `configuration_update` item before the turn's
-// user message. Shaping a frame never changes the headers the socket was
-// opened with.
+// effort rule may insert a `configuration_update` and full frames for GPT-6.2
+// and later may restore missing function call status. Shaping a frame never
+// changes the headers the socket was opened with.
 
 import { afterEach, describe, expect, it } from 'bun:test'
 import { rmSync } from 'node:fs'
@@ -147,6 +147,51 @@ const turnMetadata = (text: string) =>
   }
 
 describe('WebSocket frame shaping', () => {
+  it('restores status on full GPT-6.2 frames but not on chained or GPT-6.1 frames', () => {
+    const replay = call('c1')
+    const history = [user('one'), replay, output('c1')]
+    const shaped = (extra: Record<string, unknown>) =>
+      JSON.parse(
+        rewriteCodexFrame(
+          JSON.stringify(hostFrame(history, extra)),
+          SESSION,
+          codexState(),
+        ) ?? 'null',
+      )
+
+    expect(JSON.stringify(shaped({ model: 'gpt-6.2-sol' }).input)).toBe(
+      JSON.stringify([
+        history[0],
+        { ...replay, status: 'completed' },
+        history[2],
+      ]),
+    )
+    const chained = shaped({ model: 'gpt-6.2-sol', previous_response_id: 'r1' })
+    expect(chained.previous_response_id).toBe('r1')
+    expect(JSON.stringify(chained.input)).toBe(JSON.stringify(history))
+    expect(JSON.stringify(shaped({ model: 'gpt-6.1-sol' }).input)).toBe(
+      JSON.stringify(history),
+    )
+  })
+
+  it('restores the host input when another edit accompanies replayed call status', () => {
+    class Rewriting extends MidConversationEffort {
+      override apply(body: Record<string, unknown>): boolean {
+        const input = body.input as Array<Record<string, unknown>>
+        expect(input[1]?.status).toBe('completed')
+        input[1] = { ...input[1], arguments: '{"path":"different.md"}' }
+        return true
+      }
+    }
+    const history = [user('one'), call('c1'), output('c1')]
+    const host = hostFrame(history, { model: 'gpt-6.2-sol' })
+    const effort = new Rewriting(codexState().http)
+    const sent = JSON.parse(
+      rewriteCodexFrame(JSON.stringify(host), SESSION, effort) ?? 'null',
+    )
+    expect(JSON.stringify(sent.input)).toBe(JSON.stringify(history))
+  })
+
   it("uses OpenCode 1's Codex metadata and field order while preserving the legacy host's prompt layout", () => {
     const { clock, runtime: rt } = runtime()
     const effort = codexState(rt)
@@ -315,6 +360,23 @@ describe('WebSocket frame shaping', () => {
 
 describe('frameInputKept', () => {
   const host = [user('one'), assistant('hi'), user('two')]
+  it('accepts exact status restoration together with one effort update only on a supported full frame', () => {
+    const replay = call('c1')
+    const original = [replay, user('one')]
+    const completed = { ...replay, status: 'completed' }
+    const sent = [completed, update('high'), user('one')]
+    expect(frameInputKept(original, sent, 'gpt-6.2-sol')).toBe(true)
+    expect(frameInputKept(original, sent, 'gpt-6.1-sol')).toBe(false)
+    expect(frameInputKept(original, sent)).toBe(false)
+    expect(
+      frameInputKept(
+        [{ ...replay, status: 'in_progress' }, original[1]],
+        sent,
+        'gpt-6.2-sol',
+      ),
+    ).toBe(false)
+  })
+
   it("accepts the host's input, and one configuration_update right before a user message", () => {
     expect(frameInputKept(host, structuredClone(host))).toBe(true)
     expect(frameInputKept(undefined, undefined)).toBe(true)

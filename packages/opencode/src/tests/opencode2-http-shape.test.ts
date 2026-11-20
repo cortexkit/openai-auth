@@ -91,6 +91,28 @@ async function send(
 }
 
 describe('OpenCode 2 HTTP shape', () => {
+  it('restores replayed call status on GPT-6.2 HTTP without changing GPT-6.1 input', async () => {
+    const host = await start()
+    const call = {
+      type: 'function_call',
+      call_id: 'c1',
+      name: 'read',
+      arguments: '{ "path": "README.md" }',
+    }
+    const output = { type: 'function_call_output', call_id: 'c1', output: 'ok' }
+    const input = [user('one'), call, output]
+    for (const model of ['gpt-6.1-sol', 'gpt-6.2-sol']) {
+      const sent = await send(host, { model, input, stream: true })
+      expect(JSON.stringify((await sent.json()).input)).toBe(
+        JSON.stringify(
+          model === 'gpt-6.2-sol'
+            ? [input[0], { ...call, status: 'completed' }, output]
+            : input,
+        ),
+      )
+    }
+  })
+
   for (const lite of [false, true]) {
     it(`captures host history before effort and Lite exactly once (Lite=${lite})`, async () => {
       const effort = new MidConversationEffort()

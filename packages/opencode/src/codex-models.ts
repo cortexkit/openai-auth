@@ -1,3 +1,5 @@
+import { gptModelVersion } from '@cortexkit/openai-auth-core/internal'
+
 export const ALLOWED_MODELS = new Set([
   'gpt-5.5',
   'gpt-5.3-codex-spark',
@@ -35,8 +37,7 @@ export function codexOAuthModelListed(apiId: string): boolean {
   // The minor is optional: a major-only id like gpt-6-astra carries no
   // decimal, and requiring one silently dropped it from the catalogue even
   // though the backend serves it.
-  const match = apiId.match(/^gpt-(\d+(?:\.\d+)?)/)
-  const version = match?.[1]
+  const version = gptModelVersion(apiId)
   return version ? parseFloat(version) > 5.4 : false
 }
 

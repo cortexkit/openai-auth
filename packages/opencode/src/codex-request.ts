@@ -1,6 +1,7 @@
 import {
   isRecord,
   moveInstructionsToDeveloperMessage,
+  restoreReplayedCallStatus,
 } from '@cortexkit/openai-auth-core/internal'
 import { orderCodexBody } from './codex-body'
 import { DUMP_SESSION_HEADER } from './dump'
@@ -135,6 +136,8 @@ export function prepareCodexRequest(input: {
   /** Background replays read the turn without recording history. Defaults to false. */
   skipTurnUpdate?: boolean
   preserveInstructions?: boolean
+  /** OpenCode 2 owns the history of frames it sends with previous_response_id. */
+  skipCallStatusRestore?: boolean
   /** Each host owns its effort policy; it runs once, after host-history capture. */
   applyEffort?: (
     body: Record<string, unknown>,
@@ -190,6 +193,8 @@ export function prepareCodexRequest(input: {
 
   const parsed = body
   if (!parsed) return { init: input.init }
+  if (!input.skipCallStatusRestore && 'input' in parsed)
+    parsed.input = restoreReplayedCallStatus(parsed.input, parsed.model)
   const useResponsesLite =
     input.responsesLite &&
     typeof parsed.model === 'string' &&

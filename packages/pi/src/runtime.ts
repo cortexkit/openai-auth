@@ -64,6 +64,7 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   reportVaultRoutingLimit,
+  restoreReplayedCallStatus,
   type SessionDispatch,
   sessionCacheKeepPlan,
   startVaultRoutingWait,
@@ -1003,13 +1004,16 @@ export class PiOpenAIRuntime {
         onPayload: async (payload, payloadModel) => {
           const replacement = await options?.onPayload?.(payload, payloadModel)
           const source = replacement === undefined ? payload : replacement
+          if (!isRecord(source)) return source
+          const input = restoreReplayedCallStatus(source.input, source.model)
           if (
-            !isRecord(source) ||
-            typeof source.instructions !== 'string' ||
-            source.instructions.length === 0
+            input === source.input &&
+            (typeof source.instructions !== 'string' ||
+              source.instructions.length === 0)
           )
             return source
           const body = { ...source }
+          if (input !== source.input) body.input = input
           moveInstructionsToDeveloperMessage(body)
           return body
         },

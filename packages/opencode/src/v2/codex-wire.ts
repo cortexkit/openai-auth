@@ -4,6 +4,7 @@
 // socket reuse by handshake headers, so a frame's turn metadata travels in the
 // frame's `client_metadata`, never in a handshake header.
 
+import { restoreReplayedCallStatus } from '@cortexkit/openai-auth-core/internal'
 import {
   CODEX_USER_AGENT,
   CODEX_VERSION,
@@ -386,16 +387,26 @@ export function codexReplayRequest(
 }
 
 /**
- * Whether a frame's `input` as sent is the host's `input`, compared parsed:
- * unchanged, or with only the mid-conversation effort rule's edit, one
- * `configuration_update` item inserted right before a user message.
+ * Whether a frame's `input` as sent matches the host's parsed `input`. The
+ * effort rule may insert one `configuration_update` before a user message.
+ * On a full frame for GPT-6.2 or later, replayed function calls may also regain
+ * their missing `status: 'completed'`.
  *
- * The host chains each next frame from its own copy of the conversation, as
- * it was before any plugin edit, so any other change to `input` would leave
- * the server holding a conversation the host's next incremental frame no
- * longer lines up with.
+ * The host computes its next continuation from its own history. The status
+ * restoration preserves item count and order, and a continuation sends only
+ * new items, so it won't resend the calls whose status was restored.
  */
-export function frameInputKept(host: unknown, sent: unknown): boolean {
+export function frameInputKept(
+  host: unknown,
+  sent: unknown,
+  fullFrameModel?: unknown,
+): boolean {
+  if (frameInputMatches(host, sent)) return true
+  const restored = restoreReplayedCallStatus(host, fullFrameModel)
+  return restored !== host && frameInputMatches(restored, sent)
+}
+
+function frameInputMatches(host: unknown, sent: unknown): boolean {
   if (JSON.stringify(host) === JSON.stringify(sent)) return true
   if (
     !Array.isArray(host) ||
@@ -423,10 +434,12 @@ export function frameInputKept(host: unknown, sent: unknown): boolean {
  * (see `frame-turn.ts`), never the HTTP turn, and shaping never writes the
  * session's HTTP turn state.
  *
- * `input` keeps the host's items. The one exception is the effort rule
- * (`MidConversationEffort`), which may insert its `configuration_update`
- * item; if anything else changed `input`, the host's `input` goes out
- * instead. No Lite rewrite: see `responsesLiteHttpBody`.
+ * `input` keeps the host's items except for the effort rule's
+ * `configuration_update` and completed call status restored on full frames
+ * for GPT-6.2 or later. The host's next continuation sends only new items;
+ * the server keeps the restored calls without any change to their count or
+ * order. If anything else changed `input`, the host's input goes out instead.
+ * No Lite rewrite: see `responsesLiteHttpBody`.
  */
 export function rewriteCodexFrame(
   frame: string,
@@ -441,6 +454,7 @@ export function rewriteCodexFrame(
   // rule below may insert its item.
   const turn = effort.http.advanceFrame(scope.sessionID, body)
   const session = effort.http.get(scope.sessionID)
+  const chained = 'previous_response_id' in body
   // Codex does not accept output caps.
   delete body.max_output_tokens
   const prepared = prepareCodexRequest({
@@ -460,6 +474,7 @@ export function rewriteCodexFrame(
     // shape. Leave instructions where the host put them; 2.3.2 moves the
     // system prompt into input before it computes continuations.
     preserveInstructions: true,
+    skipCallStatusRestore: chained,
     applyEffort: (parsed) => {
       effort.apply(parsed, scope, 'ws')
     },
@@ -468,7 +483,9 @@ export function rewriteCodexFrame(
   if (!sent) return undefined
   if (onModel && typeof sent.model === 'string') onModel(sent.model)
   // `body` is still the host's frame: the builder parsed its own copy.
-  if (!frameInputKept(body.input, sent.input)) {
+  if (
+    !frameInputKept(body.input, sent.input, chained ? undefined : body.model)
+  ) {
     if ('input' in body) sent.input = body.input
     else delete sent.input
     return JSON.stringify(sent)

@@ -119,10 +119,12 @@ afterEach(async () => {
 
 async function httpBody(
   options?: Pick<SimpleStreamOptions, 'onPayload' | 'sessionId'>,
+  requestModel = model,
+  requestContext = context,
 ) {
   const bodies: Record<string, unknown>[] = []
   const result = await runtime
-    .stream(model, context, {
+    .stream(requestModel, requestContext, {
       apiKey,
       transport: 'sse',
       ...options,
@@ -154,6 +156,84 @@ async function httpBody(
   if (!body) throw new Error('No captured HTTP body')
   return body
 }
+
+test('Pi restores GPT-6.2 replayed call status without instructions and keeps GPT-6.1 bytes', async () => {
+  for (const id of ['gpt-6.1-sol', 'gpt-6.2-sol']) {
+    const requestContext: Context = {
+      messages: [
+        firstUser,
+        {
+          role: 'assistant',
+          api: model.api,
+          provider: model.provider,
+          model: id,
+          content: [
+            {
+              type: 'toolCall',
+              id: 'call_1|fc_1',
+              name: 'read',
+              arguments: { path: 'README.md' },
+            },
+          ],
+          stopReason: 'toolUse',
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { ...model.cost, total: 0 },
+          },
+          timestamp: 2,
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'call_1|fc_1',
+          toolName: 'read',
+          content: [{ type: 'text', text: 'ok' }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    }
+    const replayed = {
+      type: 'function_call',
+      id: 'fc_1',
+      call_id: 'call_1',
+      name: 'read',
+      arguments: '{"path":"README.md"}',
+    }
+    let sdkInput: readonly unknown[] = []
+    let sdkBytes = ''
+    const sent = await httpBody(
+      {
+        onPayload(raw) {
+          const { instructions: _instructions, ...body } = raw as {
+            instructions?: string
+            input: unknown[]
+          }
+          sdkInput = body.input
+          expect(sdkInput[1]).toEqual(replayed)
+          sdkBytes = JSON.stringify(body)
+          return body
+        },
+      },
+      { ...model, id },
+      requestContext,
+    )
+    if (id === 'gpt-6.1-sol') expect(JSON.stringify(sent)).toBe(sdkBytes)
+    else {
+      expect(JSON.stringify(sent.input)).toBe(
+        JSON.stringify([
+          sdkInput[0],
+          { ...replayed, status: 'completed' },
+          sdkInput[2],
+        ]),
+      )
+      expect(sdkInput[1]).toEqual(replayed)
+    }
+  }
+})
 
 test('Codex HTTP sends system instructions as the leading developer message', async () => {
   const body = await httpBody({ sessionId })
