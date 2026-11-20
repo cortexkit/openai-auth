@@ -10,6 +10,7 @@ import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import { VAULT_MODE_REFUSALS } from '@cortexkit/openai-auth-core/internal'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { OpenAIAttemptData } from '../v2/adapter'
+import { SessionAccounts } from '../v2/session-accounts'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 import {
   fixture,
@@ -112,6 +113,221 @@ const placementRefusalError = {
   kind: 'no-account',
   message: 'Thalamus routing declined this request, so it was not sent.',
 }
+
+test.each([
+  ['ordered', 'b'],
+  ['sticky-balanced', 'c'],
+] as const)(
+  'turn placement: %s asks once on turn two and uses route %s',
+  async (mode, next) => {
+    const env = await placementRequest(
+      [{ account_id: 'account-b' }, { account_id: `account-${next}` }],
+      { mode },
+    )
+    const { sessionID } = env.request
+    env.routes.push({
+      ...env.routes[0]!,
+      id: 'vault:c',
+      identity: 'account-c',
+      credentialId: 'credential-c',
+    })
+    try {
+      env.openai.beginTurn(sessionID)
+      expect(await env.send()).toBe('Bearer vault:b-token')
+      expect(accountAsks(env)).toHaveLength(1)
+
+      env.openai.beginTurn(sessionID)
+      expect(await env.send('title')).toBe('Bearer vault:b-token')
+      expect(accountAsks(env)).toHaveLength(1)
+      expect(await env.send()).toBe(`Bearer vault:${next}-token`)
+      expect(accountAsks(env)).toHaveLength(2)
+      expect(accountAsks(env)[1]).toEqual({
+        provider: 'openai',
+        modelId: 'gpt-5.5',
+        hold_wait_max_s: 0,
+        refusals: true,
+        warm_credential: 'credential-b',
+        candidates: {
+          view_digest: expect.any(String),
+          accounts: ['a', 'b', 'c'].map((id) => ({
+            account_id: `account-${id}`,
+            credential_id: `credential-${id}`,
+          })),
+        },
+      })
+      expect(env.openai.activeAccount(sessionID)).toBe(`vault:${next}`)
+      if (mode === 'sticky-balanced')
+        expect(env.pins.get(sessionID)).toBe('vault:c')
+      for (const kind of [
+        'primary',
+        'title',
+        'compaction',
+        'generate',
+      ] as const) {
+        expect(await env.send(kind)).toBe(`Bearer vault:${next}-token`)
+      }
+      expect(accountAsks(env)).toHaveLength(2)
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+function accountAsks(env: Awaited<ReturnType<typeof placementRequest>>) {
+  return env.accountFor.mock.calls.map(([ask]) => ask)
+}
+
+test('turn placement: refusal on turn two sends nothing and keeps the recorded account', async () => {
+  const env = await placementRequest([
+    { account_id: 'account-b' },
+    { refused: { code: 'account_selection_final' } },
+  ])
+  const { sessionID } = env.request
+  try {
+    env.openai.beginTurn(sessionID)
+    expect(await env.send()).toBe('Bearer vault:b-token')
+    env.openai.beginTurn(sessionID)
+    await expect(env.send()).rejects.toMatchObject(placementRefusalError)
+    expect(env.accountFor).toHaveBeenCalledTimes(2)
+    expect(env.providerFetch).toHaveBeenCalledTimes(1)
+    expect(env.authorized).toEqual(['vault:b'])
+    expect(env.openai.activeAccount(sessionID)).toBe('vault:b')
+    expect(env.pins.get(sessionID)).toBe('vault:b')
+  } finally {
+    await env.dispose()
+  }
+})
+
+test('turn placement: reloaded adapter asks on the next prompt despite the shared account record', async () => {
+  const sessionAccounts = new SessionAccounts()
+  const options = { sessionAccounts, mode: 'ordered' } as const
+  const before = await placementRequest([{ account_id: 'account-b' }], options)
+  try {
+    before.openai.beginTurn(before.request.sessionID)
+    expect(await before.send()).toBe('Bearer vault:b-token')
+  } finally {
+    await before.dispose()
+  }
+  const reloaded = await placementRequest([null], options)
+  const { sessionID } = reloaded.request
+  try {
+    expect(reloaded.openai.activeAccount(sessionID)).toBe('vault:b')
+    expect(await reloaded.send()).toBe('Bearer vault:b-token')
+    expect(reloaded.accountFor).not.toHaveBeenCalled()
+    reloaded.openai.beginTurn(sessionID)
+    expect(await reloaded.send()).toBe('Bearer vault:b-token')
+    expect(accountAsks(reloaded)).toEqual([
+      expect.objectContaining({ warm_credential: 'credential-b' }),
+    ])
+  } finally {
+    await reloaded.dispose()
+  }
+})
+
+test.each([
+  ['every local choice blocked', false],
+  ['an alternative with free quota', true],
+] as const)(
+  'turn placement: unmeasured quota is offered and followed with %s',
+  async (_case, hasReadyAccount) => {
+    const env = await placementRequest([{ account_id: 'account-b' }, null])
+    const { sessionID } = env.request
+    env.routes[1]!.quota = { limits: [] }
+    if (!hasReadyAccount) env.routes[0]!.quota = { limits: [] }
+    env.routes.push({
+      ...env.routes[0]!,
+      id: 'vault:c',
+      identity: 'account-c',
+      credentialId: 'credential-c',
+      quota: quotaMap(99),
+    })
+    env.storage.killswitch = {
+      enabled: true,
+      schema: 'floors-v1',
+      defaults: { primary: 25, secondary: 0 },
+    }
+    if (hasReadyAccount) env.storage.quota = { failClosedOnUnknownQuota: true }
+    try {
+      env.openai.beginTurn(sessionID)
+      expect(await env.send()).toBe('Bearer vault:b-token')
+      expect(env.pins.snapshot().get(sessionID)).toEqual({
+        accountId: 'vault:b',
+        inputBytes: 1,
+        wireIdentity: 'account-b',
+      })
+      expect(accountAsks(env)).toEqual([
+        expect.objectContaining({
+          candidates: {
+            view_digest: expect.any(String),
+            accounts: [
+              { account_id: 'account-a', credential_id: 'credential-a' },
+              { account_id: 'account-b', credential_id: 'credential-b' },
+            ],
+          },
+        }),
+      ])
+      // The tool step must stay on routing's account, even without a reading yet.
+      expect(await env.send()).toBe('Bearer vault:b-token')
+      expect(env.accountFor).toHaveBeenCalledTimes(1)
+      env.openai.beginTurn(sessionID)
+      expect(await env.send()).toBe('Bearer vault:b-token')
+      expect(accountAsks(env)[1]).toMatchObject({
+        warm_credential: 'credential-b',
+      })
+      expect(env.authorized).toEqual(['vault:b', 'vault:b', 'vault:b'])
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+test.each(['floor', 'declined', 'authorization'] as const)(
+  'turn placement: a %s refusal on the routed account does not send on another account',
+  async (refusal) => {
+    const env = await placementRequest([{ account_id: 'account-b' }])
+    try {
+      expect(await env.send()).toBe('Bearer vault:b-token')
+      if (refusal === 'floor') {
+        env.storage.killswitch = {
+          enabled: true,
+          schema: 'floors-v1',
+          defaults: { primary: 25 },
+        }
+        env.routes[1]!.quota = quotaMap(99)
+      } else if (refusal === 'declined') env.routes.pop()
+      else env.refused.add('vault:b')
+      await expect(env.send()).rejects.toMatchObject({
+        kind: 'no-account',
+        message: VAULT_MODE_REFUSALS['vault-refused'],
+      })
+      expect(env.accountFor).toHaveBeenCalledTimes(1)
+      expect(env.providerFetch).toHaveBeenCalledTimes(1)
+      expect(env.authorized).toEqual(
+        refusal === 'authorization' ? ['vault:b', 'vault:b'] : ['vault:b'],
+      )
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+test('without a routing accessor the unknown-quota block still stops before dispatch', async () => {
+  const env = await placementRequest([])
+  Reflect.deleteProperty(globalThis, key)
+  for (const route of env.routes) route.quota = { limits: [] }
+  try {
+    env.openai.beginTurn(env.request.sessionID)
+    await expect(env.send()).rejects.toMatchObject({
+      kind: 'no-account',
+      message: 'openai primary request refused (no-account)',
+    })
+    expect(env.accountFor).not.toHaveBeenCalled()
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+  } finally {
+    await env.dispose()
+  }
+})
 
 test.each(['primary', 'title', 'compaction', 'generate'] as const)(
   'short first placement refusal waits before routing a %s request to B',

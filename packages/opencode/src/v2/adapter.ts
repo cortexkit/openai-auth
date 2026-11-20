@@ -28,13 +28,12 @@
 // rechecking routing and quota admission, never after a limit or provider failure.
 //
 // While this host is enrolled with the Claustrum vault (vault mode), the
-// OpenAI accounts the vault serves it are the only accounts routed, through
-// the same admission and modes, by OpenCode 1's rules (`core/pool-request.ts`):
-// no pool row is read, refreshed or sent with, and only ChatGPT logins are
-// admitted, never API keys. A vault account holds no token: when routing
-// picks one, the vault is asked to authorize that one send, and a refusal
-// moves the request to the next vault account before anything is sent; with
-// none left the request is refused locally with a fixed vault-mode message. The receipt (served token and record
+// OpenAI accounts the vault serves it are the only accounts routed: no pool
+// row is read, refreshed or sent with, and only ChatGPT logins are admitted,
+// never API keys. Thalamus owns placement when it answers; otherwise the
+// plugin uses the session's account or its own admission and modes. The
+// vault must authorize each send, and the plugin cannot replace an explicit
+// routing pick the vault refuses. The receipt (served token and record
 // version) becomes the attempt's `data`, never a header, and a 401 on that
 // attempt is reported to the vault against that record version.
 
@@ -675,6 +674,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // not to a later refusal. Keep the consumed wait until a new user prompt.
   const heldTurns = new Map<string, string>()
   const waitCounts = new Map<string, number>()
+  // The prompt hook marks a turn before model selection, where the wire body
+  // is not available yet. Only the primary request consumes that marker.
+  const unplacedTurns = new Set<string>()
   const pendingWaits = new Map<
     string,
     {
@@ -844,8 +846,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     targets: readonly Target[],
     storage: AccountStorage | null,
     at: number,
+    killswitch = poolKillswitchVerdicts(targets, storage, at),
   ): PoolRoutingInput => {
-    const killswitch = poolKillswitchVerdicts(targets, storage, at)
     const routingRows: RoutingRow[] = targets.map((target) => ({
       id: target.id,
       kind: 'oauth',
@@ -988,7 +990,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const pinned = routePinnedRow(routing, options, id)
     if (pinned.kind === 'serve') admissionTiers?.set(id, pinned.tier)
     else admissionTiers?.delete(id)
-    // Routing has already chosen from local admission's eligible accounts.
+    // A preferred account has already passed eligibility for this choice.
     if (id === preferred) return id
     if (pinned.kind === 'none') return undefined
     if (pinned.kind === 'move') {
@@ -1091,13 +1093,95 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       if (ready) keepRequestHandoff(input, accountId, ready)
       return accountId
     }
-    const firstReading = waitForFirstQuotaReading(
-      routingInput(
-        targets.filter((target) => target.id !== input.rerouteFrom?.accountId),
-        storage,
-        at,
-      ),
-    )
+    const primary = input.kind === 'primary'
+    let routedTarget: Target | undefined
+    let placementBlocked = false
+    if (
+      routingEnabled &&
+      input.phase === 'request' &&
+      !input.wake &&
+      !input.rerouteFrom &&
+      !input.excluded?.length
+    ) {
+      const current =
+        sessionAccounts.activeAccount(input.sessionID) ??
+        pins.get(input.sessionID)
+      const newTurn = primary && unplacedTurns.delete(input.sessionID)
+      const place = newTurn || current === undefined
+      for (let retried = false; ; retried = true) {
+        const routes = (vault?.routes() ?? [])
+          .filter((route) => route.kind === 'oauth')
+          .map((route) => ({ ...route, quota: route.quota }))
+        // Missing or expired readings do not establish that a floor was breached.
+        const floorSettings = storage && {
+          ...storage,
+          quota: { ...storage.quota, failClosedOnUnknownQuota: false },
+        }
+        const floors = poolKillswitchVerdicts(routes, floorSettings, at)
+        const eligible = routes.filter(
+          (route) => floors.get(route.id) !== false,
+        )
+        let account = current
+        if (place) {
+          if (!eligible.some((route) => route.identity && route.credentialId)) {
+            placementBlocked = true
+            break
+          }
+          const activity = limits?.activity.get(input.sessionID)
+          const answer = await chooseVaultRouting({
+            vaultMode,
+            fresh: true,
+            sessionId: input.sessionID,
+            request: { modelId: input.modelID, kind: input.kind },
+            routes,
+            routing: routingInput(routes, storage, at, floors),
+            warmAccountId: current,
+            wait: {
+              activity,
+              accountKey:
+                activity && limits?.accountKey(activity.accountKey.accountId),
+              maxSameAccountWait: storage?.routing?.maxSameAccountWait,
+            },
+          })
+          if (typeof answer === 'string') account = answer
+          else if (answer) {
+            const delayMs = !retried
+              ? vaultRoutingPlacementRetryMs(answer)
+              : undefined
+            if (delayMs === undefined)
+              throw new OpenCode2AuthError({
+                kind: 'no-account',
+                providerID: OPENAI_PROVIDER_ID,
+                sessionID: input.sessionID,
+                requestKind: input.kind,
+                message: VAULT_ROUTING_REFUSAL_MESSAGE,
+              })
+            await waitForRoutingRetry(delayMs, input.signal)
+            input.signal?.throwIfAborted()
+            at = now()
+            targets = currentTargets(storage, at, vaultMode)
+            continue
+          }
+        }
+        if (account !== undefined) {
+          routedTarget = eligible.find((route) => route.id === account)
+          if (!routedTarget) throw vaultRefusal()
+        }
+        break
+      }
+    }
+    const firstReading =
+      routedTarget || placementBlocked
+        ? undefined
+        : waitForFirstQuotaReading(
+            routingInput(
+              targets.filter(
+                (target) => target.id !== input.rerouteFrom?.accountId,
+              ),
+              storage,
+              at,
+            ),
+          )
     if (firstReading) {
       const end = startWait(
         input,
@@ -1121,7 +1205,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             : 'resumed',
         )
     }
-    let byId = new Map(targets.map((target) => [target.id, target]))
+    const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
     const admissionTiers = hasVaultRoutingAccessor()
       ? new Map<string, AdmissionTier>()
@@ -1147,11 +1231,6 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const previousId = input.previousAccountId ?? input.rerouteFrom?.accountId
     const previousKey = previousId && limits?.accountKey(previousId)
     const signal = input.rerouteFrom?.limit as OpenAILimitSignal | undefined
-    const routingWait = {
-      activity,
-      accountKey: activityKey,
-      maxSameAccountWait: setting,
-    }
     let continued: string | undefined
     if (
       routingEnabled &&
@@ -1204,7 +1283,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           request: { modelId: input.modelID, kind: input.kind },
           routes: vault?.routes() ?? [],
           routing,
-          wait: { ...routingWait, accountKey: limits?.accountKey(from) },
+          wait: {
+            activity,
+            accountKey: limits?.accountKey(from),
+            maxSameAccountWait: setting,
+          },
           eligibleIds: targets
             .filter(
               (target) =>
@@ -1280,7 +1363,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         },
       ]
     }
-    let candidates = targets.flatMap(readLimitCandidate)
+    const candidates = targets.flatMap(readLimitCandidate)
     const facts: PolicyFacts = {
       phase: input.phase === 'retry' ? 'after-limit' : 'pre-send',
       host: 'opencode2',
@@ -1500,9 +1583,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       input.rerouteFrom ? [input.rerouteFrom.accountId] : [],
     )
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
-    const primary = input.kind === 'primary'
     const activeAccount = sessionAccounts.activeAccount(input.sessionID)
-    const pin = pins.get(input.sessionID)
     // Accounts that have nothing to send this request with: a pool row
     // without a usable token (its refresh failed, or it was signed out), or a
     // vault account the vault refused to authorize. Nothing was sent with
@@ -1512,12 +1593,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     let plannedPin: StickyPin | undefined
     let reservation: PinReservation | undefined
     let accountId: string | undefined
-    let routingConsulted = false
-    let retriedPlacement = false
     let explicitPick: string | undefined
     const reserveAccount = (id: string) => {
-      const checkedAt = admitSticky(routing).projections.get(id)?.checkedAt
-      const identity = byId.get(id)?.identity
+      const checkedAt = routedTarget
+        ? projectQuota(
+            isQuotaMap(routedTarget.quota) ? routedTarget.quota : undefined,
+          ).checkedAt
+        : admitSticky(routing).projections.get(id)?.checkedAt
+      const identity = (routedTarget ?? byId.get(id))?.identity
       return pins.reserve(input.sessionID, {
         accountId: id,
         inputBytes: NOMINAL_REQUEST_BYTES,
@@ -1526,12 +1609,25 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     }
     try {
-      for (;;) {
+      while (!placementBlocked) {
         const skip = new Set([...excluded, ...refused])
         accountId = undefined
         admissionTiers?.clear()
         plannedPin = undefined
-        if (wakeAccount && !skip.has(wakeAccount)) {
+        if (routedTarget) {
+          accountId = routedTarget.id
+          // Local admission describes billing, but cannot redirect routing's pick.
+          const plan = planOrdered({
+            ...routing,
+            requestPull: () => {},
+            placement: 'roster',
+            mainId: null,
+          })
+          if (plan.kind === 'send') {
+            const tier = plan.tiers[accountId]
+            if (tier) admissionTiers?.set(accountId, tier)
+          }
+        } else if (wakeAccount && !skip.has(wakeAccount)) {
           accountId = wakeAccount
           wakeAccount = undefined
         } else if (mode === 'sticky-balanced') {
@@ -1614,69 +1710,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           break
         }
         if (primary && mode === 'sticky-balanced') {
-          // Reserve this request's bytes before optional routing or authorization
-          // yields, so other sessions include it when balancing account choices.
+          // Reserve before authorization yields so other sessions count these bytes.
           reservation = reserveAccount(accountId)
+          if (routedTarget) plannedPin = reservation.pin
         }
-        if (!routingConsulted) {
-          routingConsulted = true
-          const preferred =
-            continued ??
-            (!routingEnabled || input.wake
-              ? undefined
-              : await chooseVaultRouting({
-                  vaultMode,
-                  fresh: pin === undefined && activeAccount === undefined,
-                  sessionId: input.sessionID,
-                  request: {
-                    modelId: input.modelID,
-                    kind: input.kind,
-                    retry:
-                      input.phase === 'retry' ||
-                      input.rerouteFrom !== undefined,
-                  },
-                  routes: vault?.routes() ?? [],
-                  warmAccountId:
-                    mode === 'sticky-balanced' ? pin : activeAccount,
-                  routing,
-                  wait: routingWait,
-                  eligibleIds: targets
-                    .filter((target) => !skip.has(target.id))
-                    .map((target) => target.id),
-                }))
+        if (continued) {
+          const preferred = continued
           continued = undefined
-          if (preferred && typeof preferred !== 'string') {
-            const delayMs = !retriedPlacement
-              ? vaultRoutingPlacementRetryMs(preferred)
-              : undefined
-            if (delayMs !== undefined) {
-              // Routing may be starting up. No account has been chosen, so
-              // release the provisional reservation while routing gets ready.
-              if (reservation) pins.rollback(reservation)
-              reservation = undefined
-              await waitForRoutingRetry(delayMs, input.signal)
-              input.signal?.throwIfAborted()
-              retriedPlacement = true
-              routingConsulted = false
-              at = now()
-              targets = currentTargets(storage, at, vaultMode)
-              byId = new Map(targets.map((target) => [target.id, target]))
-              routing = routingInput(targets, storage, at)
-              candidates = targets.flatMap(readLimitCandidate)
-              continue
-            }
-            throw new OpenCode2AuthError({
-              kind: 'no-account',
-              providerID: OPENAI_PROVIDER_ID,
-              sessionID: input.sessionID,
-              requestKind: input.kind,
-              message: VAULT_ROUTING_REFUSAL_MESSAGE,
-            })
-          }
-          if (
-            preferred &&
-            (preferred !== accountId || mode === 'sticky-balanced')
-          ) {
+          if (preferred !== accountId || mode === 'sticky-balanced') {
             if (reservation) pins.rollback(reservation)
             reservation = undefined
             if (mode === 'sticky-balanced') {
@@ -1700,10 +1741,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             if (primary && mode === 'sticky-balanced')
               reservation = reserveAccount(accountId)
           }
-          if (preferred) {
-            explicitPick = preferred
-            accountId = preferred
-          }
+          explicitPick = preferred
+          accountId = preferred
         }
         const row = byId.get(accountId)?.row
         if (row) {
@@ -1721,7 +1760,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             })
             break
           }
-          if (explicitPick === accountId) {
+          if (routedTarget || explicitPick === accountId) {
             const refusal = vaultRefusal()
             if (input.phase !== 'retry') throw refusal
             // OpenCode's retry veto has no message field; keep its provider error.
@@ -2613,8 +2652,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   return {
     adapter,
-    beginTurn: clearTurn,
+    beginTurn(sessionId) {
+      clearTurn(sessionId)
+      unplacedTurns.delete(sessionId)
+      unplacedTurns.add(sessionId)
+      if (unplacedTurns.size > DEFAULT_MAX_RECORDS) {
+        const oldest = unplacedTurns.values().next().value
+        if (oldest !== undefined) unplacedTurns.delete(oldest)
+      }
+    },
     dispose: () => {
+      unplacedTurns.clear()
       heldTurns.clear()
       waitCounts.clear()
       pendingWaits.clear()
@@ -2637,6 +2685,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     },
     forgetSession(sessionId) {
+      unplacedTurns.delete(sessionId)
       clearTurn(sessionId)
       for (const [key, entry] of requestHandoffs) {
         if (entry.sessionID === sessionId) dropRequestHandoff(key)

@@ -107,8 +107,8 @@ export function startVaultRoutingWait(input: {
 }
 
 /**
- * Optional routing advice can choose only accounts allowed by the routing plan
- * and the request's eligibility filter.
+ * Placement offers every eligible vault login that passes the user's floors.
+ * A continue still uses the local plan to find alternatives to the exhausted account.
  * The Pi host adapter is not wired because its provider stream gives no reliable request purpose.
  */
 export async function chooseVaultRouting(input: {
@@ -132,29 +132,30 @@ export async function chooseVaultRouting(input: {
     (!continuation && (!input.fresh || request.retry))
   )
     return undefined
-  const plan = planOrdered({
-    ...input.routing,
-    rows:
-      continuation && input.eligibleIds
-        ? input.routing.rows.filter((row) =>
-            input.eligibleIds?.includes(row.id),
-          )
-        : input.routing.rows,
-    placement: 'roster',
-    mainId: null,
-  })
-  if (plan.kind === 'block' && !continuation) return undefined
-  const order =
-    plan.kind === 'send'
-      ? plan.order.filter(
-          (id) => !continuation || plan.tiers[id] !== 'last-path',
-        )
-      : []
-  const eligible = new Set(input.eligibleIds ?? order)
+  const eligible = input.eligibleIds && new Set(input.eligibleIds)
+  const rows = input.routing.rows.filter(
+    (row) => !eligible || eligible.has(row.id),
+  )
+  const plan =
+    continuation &&
+    planOrdered({
+      ...input.routing,
+      rows,
+      placement: 'roster',
+      mainId: null,
+    })
+  const admitted = new Set(
+    !plan
+      ? rows
+          .filter((row) => input.routing.killswitch.get(row.id) !== false)
+          .map((row) => row.id)
+      : plan.kind === 'send'
+        ? plan.order.filter((id) => plan.tiers[id] !== 'last-path')
+        : [],
+  )
   const candidates = input.routes.flatMap((route) =>
     route.id !== continuation?.previousId &&
-    order.includes(route.id) &&
-    eligible.has(route.id) &&
+    admitted.has(route.id) &&
     route.identity &&
     route.credentialId
       ? [

@@ -95,7 +95,7 @@ export function fixture(
   vaultMode = true,
   mode: 'ordered' | 'sticky-balanced' = 'ordered',
   now: () => number = Date.now,
-  deps: Pick<OpenAIAdapterDeps, 'limits' | 'log'> = {},
+  deps: Pick<OpenAIAdapterDeps, 'limits' | 'log' | 'sessionAccounts'> = {},
 ) {
   const rows: PoolRow[] = [
     {
@@ -193,6 +193,8 @@ export async function placementRequest(
     report?: (payload: Record<string, unknown>) => unknown
     now?: () => number
     log?: OpenAIAdapterDeps['log']
+    mode?: 'ordered' | 'sticky-balanced'
+    sessionAccounts?: OpenAIAdapterDeps['sessionAccounts']
     extraTimerDelays?: readonly number[]
   } = {},
 ) {
@@ -208,8 +210,9 @@ export async function placementRequest(
     accountFor,
     report: options.report,
   }))
-  const env = fixture(true, 'sticky-balanced', options.now, {
+  const env = fixture(true, options.mode ?? 'sticky-balanced', options.now, {
     log: options.log,
+    sessionAccounts: options.sessionAccounts,
   })
   const host = fakeOpenCode2Host()
   const installation = await installPoolHooks(host.ctx, env.openai.adapter, {
