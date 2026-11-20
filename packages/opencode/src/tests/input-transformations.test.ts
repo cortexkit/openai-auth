@@ -9,6 +9,7 @@ import { installPoolHooks } from '../v2/setup'
 import { observeHttpCompletion, streamResponsesWebSocket } from '../ws'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 import { fixture } from './fixtures/opencode2-routing'
+import { restoreEnv } from './setup-env'
 
 const MESSAGE = 'Codex transformed input items'
 const MODEL = 'gpt-6.2-sol'
@@ -172,12 +173,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await flushForTest()
-  if (previousLogFile === undefined)
-    delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
-  else process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = previousLogFile
-  if (previousLogLevel === undefined)
-    delete process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
-  else process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = previousLogLevel
+  restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE', previousLogFile)
+  restoreEnv('OPENCODE_OPENAI_AUTH_LOG_LEVEL', previousLogLevel)
   await rm(logDir, { recursive: true, force: true })
 })
 
