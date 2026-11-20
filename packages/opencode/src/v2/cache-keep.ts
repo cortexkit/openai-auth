@@ -254,6 +254,7 @@ function createEntry(
     return { token: access.token, identity: access.row.identity }
   }
   const manager: OpenAICacheKeepManager = createCacheKeepManager({
+    host: 'opencode2',
     observeBillingSend(target, body, receipt, attempt) {
       if (!receipt.credentialId || !hasVaultRoutingAccessor()) return undefined
       const sessionId = target.meta.routingSessionId

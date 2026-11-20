@@ -41,6 +41,7 @@ import {
   sessionCacheKeepPlan,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
+import { logInputTransformations } from '../input-transformations'
 import {
   hashSidebarSessionId,
   type SidebarState,
@@ -260,10 +261,12 @@ function extractKeepwarmUsage(
 
 function extractKeepwarmSseUsage(
   bodyText: string,
+  host: 'opencode1' | 'opencode2',
 ): ReturnType<typeof emptyKeepwarmUsage> {
   let eventName: string | undefined
   let dataLines: string[] = []
   let usage: ReturnType<typeof emptyKeepwarmUsage> | undefined
+  let completed = false
 
   const flushEvent = () => {
     if (!dataLines.length) return
@@ -277,6 +280,10 @@ function extractKeepwarmSseUsage(
       const type = event.type ?? currentEvent
       if (type !== 'response.completed' && type !== 'response.done') return
       const response = event.response as Record<string, unknown> | undefined
+      if (type === 'response.completed' && !completed) {
+        completed = true
+        logInputTransformations(response, 'http', host)
+      }
       usage = extractUsageObject(response?.usage ?? event.usage)
     } catch {
       // Ignore malformed diagnostic events and keep scanning.
@@ -362,6 +369,7 @@ export interface CacheKeepCredentialCheck {
 
 export interface OpenAICacheKeepAdapterBaseOptions {
   fetchImpl: typeof fetch
+  host?: 'opencode1' | 'opencode2'
   /** Optional vault billing observer; absent on OpenCode 1 and local sends. */
   observeBillingSend?: (
     target: CacheKeepTargetView<OpenAICacheKeepMeta>,
@@ -646,7 +654,7 @@ export function createOpenAICacheKeepAdapter(
         isSse,
       })
       const usage = isSse
-        ? extractKeepwarmSseUsage(text)
+        ? extractKeepwarmSseUsage(text, options.host ?? 'opencode1')
         : extractKeepwarmUsage(text)
       const quota = normalizeQuotaHeaders(response.headers)
       return {
@@ -678,6 +686,7 @@ export function createCacheKeepManager(
 ): OpenAICacheKeepManager {
   const {
     fetchImpl,
+    host = 'opencode1',
     observeBillingSend,
     getMainToken: _getMainToken,
     refreshFallback: _refreshFallback,
@@ -702,6 +711,7 @@ export function createCacheKeepManager(
     logger,
     adapter: createOpenAICacheKeepAdapter({
       fetchImpl,
+      host,
       observeBillingSend,
       ...local,
       vault,

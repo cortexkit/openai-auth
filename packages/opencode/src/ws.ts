@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from './dump'
+import { logInputTransformations } from './input-transformations'
 import { createLogger } from './logger'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
@@ -821,6 +822,8 @@ export function streamResponsesWebSocket(
 
     if (event.type === 'response.completed' || event.type === 'response.done') {
       completed = true
+      if (event.type === 'response.completed')
+        logInputTransformations(event.response, 'websocket', 'opencode1')
       // Belt-and-suspenders: the completed frame may carry the full output list;
       // fold any finalized function_call ids it lists into the streamed set.
       collectFinalizedFromResponse(event, finalizedFunctionCallIds)
@@ -1355,7 +1358,10 @@ export function observeHttpCompletion(
       if (!data || data === '[DONE]') continue
       try {
         const event = JSON.parse(data)
-        if (event.type === 'response.completed') completed = true
+        if (event.type === 'response.completed' && !completed) {
+          completed = true
+          logInputTransformations(event.response, 'http', 'opencode1')
+        }
         if (
           event.type === 'response.failed' ||
           event.type === 'response.incomplete' ||

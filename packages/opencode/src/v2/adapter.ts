@@ -139,6 +139,7 @@ import {
   vaultMainRouteId,
   waitForFirstQuotaReading,
 } from '../core/pool-routing'
+import { logInputTransformations } from '../input-transformations'
 import {
   isNonEmittingFrame,
   parseRateLimitSignal,
@@ -612,6 +613,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     Pick<ClaustrumScopedAttempt, 'accountIdentity' | 'credentialId'>
   >()
   const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
+  let transformationLogs: WeakSet<Attempt<OpenAIAttemptData>> | undefined
   const billingCounts = new Map<string, number>()
   const observeBillingModel = (
     attempt: Attempt<OpenAIAttemptData> | undefined,
@@ -2203,8 +2205,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         (event.type === 'response.failed' || event.type === 'error')
       )
         state.failed = true
-      if (state && isRecord(event) && event.type === 'response.completed')
-        state.completed = true
+      if (isRecord(event) && event.type === 'response.completed') {
+        if (state) state.completed = true
+        if (
+          !transformationLogs?.has(attempt) &&
+          logInputTransformations(
+            event.response,
+            transport === 'ws' ? 'websocket' : 'http',
+            'opencode2',
+          )
+        ) {
+          transformationLogs ??= new WeakSet()
+          transformationLogs.add(attempt)
+        }
+      }
       if (
         attempt.data?.kind === 'vault' &&
         data.includes('codex.rate_limits')
