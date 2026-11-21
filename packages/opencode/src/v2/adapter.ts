@@ -21,11 +21,11 @@
 //
 // The installer retries a request refused before any output on another
 // account; `attach` records the refusal before the next choice. After output,
-// continuation needs proof of an interrupted read: an HTTP body-reader failure,
-// or inspected WebSocket output without a terminal frame followed by a transport
-// error (the host never writes to the socket after output). Either may continue
-// with the host's delay and the same live ChatGPT account identity, after
-// rechecking routing and quota admission, never after a limit or provider failure.
+// continuation needs proof of an interrupted read before any terminal or error
+// frame: an HTTP body-reader failure, or a WebSocket transport error (the host
+// never writes to the socket after output). Either may continue with the host's
+// delay and the same live ChatGPT account identity, after rechecking routing and
+// quota admission, never after a limit or provider failure.
 //
 // While this host is enrolled with the Claustrum vault (vault mode), the
 // OpenAI accounts the vault serves it are the only accounts routed: no pool
@@ -736,6 +736,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           }
     }
   >()
+  const attemptsWithOutput = new WeakSet<Attempt<OpenAIAttemptData>>()
+  const attemptsWithTerminalFrame = new WeakSet<Attempt<OpenAIAttemptData>>()
   const requestKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}`
   // Retry choices reserve live pending bytes, but publish their pin and active
@@ -2236,14 +2238,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     inspectEvent: ({ data, transport, attempt }) => {
       const event = parseJson(data)
+      const type = isRecord(event) ? event.type : undefined
+      const completed = type === 'response.completed'
+      const failed = type === 'response.failed' || type === 'error'
+      const incomplete = type === 'response.incomplete'
+      if (completed || failed || incomplete)
+        attemptsWithTerminalFrame.add(attempt)
       let billingDone = false
       const state = attempt.data && feedback.get(attempt.data)
-      if (
-        state &&
-        isRecord(event) &&
-        (event.type === 'response.failed' || event.type === 'error')
-      )
-        state.failed = true
+      if (state && failed) state.failed = true
       if (isRecord(event) && event.type === 'response.completed') {
         if (state) state.completed = true
         if (
@@ -2274,12 +2277,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         const record = billing.get(attempt)
         if (record) {
           record.event(event)
-          billingDone =
-            transport === 'ws' &&
-            isRecord(event) &&
-            (event.type === 'response.incomplete' ||
-              event.type === 'response.failed' ||
-              event.type === 'error')
+          billingDone = transport === 'ws' && (failed || incomplete)
         }
         if (
           vaultRoutingStreamMayFail(data) ||
@@ -2338,14 +2336,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           }
         }
       }
-      // HTTP acceptance belongs to the body reader, not an SSE lifecycle
-      // frame. A WebSocket has no body end, so its completion is explicit.
-      return billingDone ||
-        (transport === 'ws' &&
-          isRecord(event) &&
-          event.type === 'response.completed')
-        ? { ...verdict, done: true }
-        : verdict
+      if (verdict?.outputStarted) attemptsWithOutput.add(attempt)
+      if (billingDone || completed) verdict = { ...verdict, done: true }
+      // An HTTP body can still fail after the final frame. Block continuation
+      // explicitly once output has started, without vetoing pre-output refusals.
+      if (
+        attemptsWithOutput.has(attempt) &&
+        attemptsWithTerminalFrame.has(attempt)
+      )
+        verdict = { ...verdict, hostRetry: 'veto' }
+      return verdict
     },
     limitFromError(error: HostError, attempt) {
       const parsed = parseJson(error.message)
@@ -2467,7 +2467,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }
         state.owner?.afterProbe(state.probe, clean, Boolean(outcome.limit))
       }
-      if (data && outcome.outputStarted && outcome.error?.reason === 'failed') {
+      if (
+        data &&
+        outcome.outputStarted &&
+        outcome.error?.reason === 'failed' &&
+        !attemptsWithTerminalFrame.has(attempt)
+      ) {
         interrupted.set(requestKey(attempt), {
           accountId: attempt.accountId,
           modelID: attempt.modelID,

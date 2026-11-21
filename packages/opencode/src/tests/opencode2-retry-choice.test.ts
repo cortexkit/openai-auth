@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
+  type AttemptOutcome,
   type ChooseAccountInput,
   installOpenCode2Auth,
   OpenCode2AuthError,
@@ -18,7 +19,11 @@ import {
 import { SessionPins } from '../v2/pins'
 import { fakeOpenCode2Host, quotaMap, scope } from './fixtures/opencode2-host'
 
-async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
+async function fixture(
+  ids = ['a', 'b'],
+  vault?: VaultAccess,
+  withLimits = true,
+) {
   const rows = ids.map((id) => ({
     id,
     type: 'oauth',
@@ -98,7 +103,7 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     }),
   } as unknown as OpenCodeLimitSource
   const openai = createOpenAIAdapter({
-    limits,
+    limits: withLimits ? limits : undefined,
     onRoute: (sessionId, accountId) => routes.push([sessionId, accountId]),
     source,
     pins,
@@ -110,6 +115,7 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
   const drops: string[] = []
   const sameAccount: SameAccountRetryInput[] = []
   const retryReasons: string[] = []
+  const attemptEnds: AttemptOutcome[] = []
   const host = fakeOpenCode2Host()
   const installation = await installOpenCode2Auth(host.ctx, {
     ...openai.adapter,
@@ -125,6 +131,10 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     retrySameAccount: (input) => {
       sameAccount.push(input)
       return openai.adapter.retrySameAccount?.(input)
+    },
+    onAttemptEnd: (attempt, outcome) => {
+      attemptEnds.push(outcome)
+      return openai.adapter.onAttemptEnd?.(attempt, outcome)
     },
   })
   openai.attach(installation)
@@ -148,26 +158,41 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     await host.fire('http.request', draft)
     return draft
   }
-  const refuse = async (draft: Awaited<ReturnType<typeof request>>) => {
-    await host.fire('http.response', {
+  const refuse = async (
+    draft: Awaited<ReturnType<typeof request>>,
+    frame?: object,
+  ) => {
+    const response = {
       ...scope(),
       request: draft.request,
-      response: Response.json(
-        { error: { type: 'usage_limit_reached' } },
-        { status: 429 },
-      ),
-    })
+      response: frame
+        ? new Response(
+            `data: {"type":"response.created","response":{}}\n\ndata: ${JSON.stringify(frame)}\n\n`,
+            { headers: { 'content-type': 'text/event-stream' } },
+          )
+        : Response.json(
+            { error: { type: 'usage_limit_reached' } },
+            { status: 429 },
+          ),
+    }
+    await host.fire('http.response', response)
+    if (frame) await response.response.text()
     const retry = {
       sessionID: 'ses_1',
       model: { providerID: 'openai', id: 'gpt-5.5' },
       attempt: 1,
-      error: { type: 'api', message: 'usage limit', status: 429 },
+      error: frame
+        ? { type: 'stream', message: 'usage limit' }
+        : { type: 'api', message: 'usage limit', status: 429 },
       decision: { retry: true, delay: 1234 },
     }
     await host.fire('retry', retry)
     return retry.decision
   }
-  const interrupt = async (draft: Awaited<ReturnType<typeof request>>) => {
+  const interrupt = async (
+    draft: Awaited<ReturnType<typeof request>>,
+    terminalFrame?: { type: string },
+  ) => {
     let fail: (error: Error) => void = () => {}
     const response = {
       ...scope(),
@@ -177,7 +202,10 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
           start(controller) {
             controller.enqueue(
               new TextEncoder().encode(
-                'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+                'data: {"type":"response.output_text.delta","delta":"hello"}\n\n' +
+                  (terminalFrame
+                    ? `data: ${JSON.stringify(terminalFrame)}\n\n`
+                    : ''),
               ),
             )
             fail = (error) => controller.error(error)
@@ -188,9 +216,17 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     }
     await host.fire('http.response', response)
     const reader = response.response.body!.getReader()
-    expect(new TextDecoder().decode((await reader.read()).value)).toContain(
-      'hello',
-    )
+    const decoder = new TextDecoder()
+    let seen = decoder.decode((await reader.read()).value)
+    if (terminalFrame) {
+      while (!seen.includes(terminalFrame.type)) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        seen += decoder.decode(chunk.value, { stream: true })
+      }
+      expect(seen).toContain(terminalFrame.type)
+    }
+    expect(seen).toContain('hello')
     fail(new TypeError('connection reset'))
     await expect(reader.read()).rejects.toThrow('connection reset')
   }
@@ -208,6 +244,7 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     return retry.decision
   }
   return {
+    host,
     rows,
     reads,
     view,
@@ -225,6 +262,7 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     continueStep,
     sameAccount,
     retryReasons,
+    attemptEnds,
     installation,
     setUsable(value: boolean) {
       usable = value
@@ -373,7 +411,144 @@ describe('OpenCode 2 interrupted-read continuation', () => {
   })
 })
 
-async function vaultFixture() {
+const terminalFrames = {
+  completed: {
+    type: 'response.completed',
+    response: {
+      id: 'resp_1',
+      status: 'completed',
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    },
+  },
+  'failed-overloaded': {
+    type: 'response.failed',
+    response: {
+      id: 'resp_1',
+      status: 'failed',
+      error: { code: 'server_is_overloaded', message: 'overloaded' },
+    },
+  },
+  error: {
+    type: 'error',
+    error: { code: 'server_error', message: 'internal error' },
+  },
+  incomplete: {
+    type: 'response.incomplete',
+    response: {
+      id: 'resp_1',
+      status: 'incomplete',
+      incomplete_details: { reason: 'max_output_tokens' },
+    },
+  },
+} as const
+
+async function receiveWebSocketFrames(
+  host: Awaited<ReturnType<typeof fixture>>['host'],
+  ...frames: object[]
+) {
+  const requestScope = scope()
+  const model = {
+    ...requestScope,
+    model: { providerID: 'openai', id: 'gpt-5.5' },
+    headers: {} as Record<string, string>,
+  }
+  await host.fire('model.request', model)
+  await host.fire('experimental.ws.handshake', {
+    ...requestScope,
+    model: model.model,
+    url: 'wss://codex.test/v1/responses',
+    headers: { ...model.headers },
+  })
+  await host.fire('experimental.ws.send', {
+    ...requestScope,
+    model: model.model,
+    frame: '{"type":"response.create","input":[]}',
+  })
+  for (const frame of frames)
+    await host.fire('experimental.ws.receive', {
+      ...requestScope,
+      model: model.model,
+      frame: JSON.stringify(frame),
+    })
+}
+
+describe('A terminal or error frame after output blocks continuation', () => {
+  for (const [name, frame] of Object.entries(terminalFrames)) {
+    test(`HTTP pool: ${name} then body read failure is not continued`, async () => {
+      const f = await fixture()
+      try {
+        await f.interrupt(await f.request(), frame)
+        expect(await f.continueStep()).toEqual({ retry: false })
+        expect(f.retryReasons).toEqual(['output-started'])
+        expect(f.sameAccount).toEqual([])
+        if (frame.type === 'response.completed')
+          expect(f.attemptEnds).toEqual([{ status: 200, outputStarted: true }])
+      } finally {
+        await f.installation.dispose()
+      }
+    })
+
+    test(`WS pool (no vault billing record): ${name} after output is not continued`, async () => {
+      const f = await fixture()
+      try {
+        await receiveWebSocketFrames(
+          f.host,
+          { type: 'response.output_text.delta', delta: 'hello' },
+          frame,
+        )
+        expect(await f.continueStep()).toEqual({ retry: false })
+        expect(f.retryReasons).toEqual(['output-started'])
+        expect(f.sameAccount).toEqual([])
+      } finally {
+        await f.installation.dispose()
+      }
+    })
+  }
+
+  test('control: WS pool delta only, then transport failure, is continued', async () => {
+    const f = await fixture()
+    try {
+      await receiveWebSocketFrames(f.host, {
+        type: 'response.output_text.delta',
+        delta: 'hello',
+      })
+      expect(await f.continueStep()).toEqual({ retry: true, delay: 1234 })
+      expect(f.retryReasons).toEqual(['continue-same-account'])
+    } finally {
+      await f.installation.dispose()
+    }
+  })
+
+  test('a later HTTP attempt in the same session can still continue', async () => {
+    const f = await fixture()
+    try {
+      await f.interrupt(await f.request(), terminalFrames['failed-overloaded'])
+      expect(await f.continueStep()).toEqual({ retry: false })
+      // The veto must also leave no interrupted-read entry for the ended attempt.
+      expect(
+        await f.openai.adapter.retrySameAccount!({
+          ...scope(),
+          providerID: 'openai',
+          modelID: 'gpt-5.5',
+          accountId: 'a',
+          error: { type: 'provider.transport', message: 'body read failed' },
+          attempt: 1,
+          continuation: 'interrupted-read',
+        }),
+      ).toBeUndefined()
+      await f.interrupt(await f.request())
+      expect(await f.continueStep()).toEqual({ retry: true, delay: 1234 })
+      expect(f.retryReasons).toEqual([
+        'output-started',
+        'continue-same-account',
+      ])
+    } finally {
+      await f.installation.dispose()
+    }
+  })
+})
+
+async function vaultFixture(withLimits = true) {
   const routes = [
     {
       id: 'vault:a',
@@ -411,10 +586,36 @@ async function vaultFixture() {
     recordSnapshot: async () => {},
     requestReading: () => {},
   } as unknown as VaultAccess
-  return { ...(await fixture(['a', 'b'], vault)), state, vaultRoutes: routes }
+  return {
+    ...(await fixture(['a', 'b'], vault, withLimits)),
+    state,
+    vaultRoutes: routes,
+  }
 }
 
 describe('OpenCode 2 vault interrupted-read continuation', () => {
+  for (const frame of [
+    terminalFrames.completed,
+    terminalFrames['failed-overloaded'],
+  ]) {
+    test(`HTTP vault without limits: ${frame.type} then body read failure is not continued`, async () => {
+      const f = await vaultFixture(false)
+      try {
+        const first = await f.request()
+        expect(first.request.headers.get('authorization')).toBe(
+          'Bearer vault-token-1',
+        )
+        await f.interrupt(first, frame)
+        expect(await f.continueStep()).toEqual({ retry: false })
+        expect(f.retryReasons).toEqual(['output-started'])
+        expect(f.sameAccount).toEqual([])
+        expect(f.reads).toEqual({ current: 0, peek: 0, token: 0 })
+      } finally {
+        await f.installation.dispose()
+      }
+    })
+  }
+
   test('continues with a newer receipt for the same vault identity without reading the local pool', async () => {
     const f = await vaultFixture()
     try {
@@ -482,6 +683,25 @@ describe('OpenCode 2 vault interrupted-read continuation', () => {
 })
 
 describe('OpenCode 2 kept retry choice', () => {
+  test('an HTTP response.failed limit before output still reroutes', async () => {
+    const f = await fixture()
+    try {
+      const first = await f.request()
+      expect(first.request.headers.get('authorization')).toBe('Bearer a-token')
+      expect(
+        await f.refuse(first, {
+          type: 'response.failed',
+          response: { error: { code: 'usage_limit_reached' } },
+        }),
+      ).toEqual({ retry: true, delay: 0 })
+      expect((await f.request()).request.headers.get('authorization')).toBe(
+        'Bearer b-token',
+      )
+    } finally {
+      await f.installation.dispose()
+    }
+  })
+
   test('reroute chooses once per attempt and consumes the chosen account', async () => {
     const f = await fixture()
     try {
