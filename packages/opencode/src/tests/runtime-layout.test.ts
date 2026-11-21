@@ -94,6 +94,10 @@ const PREPARE_SETTLE_MS = 25_000
  * On windows-2022 CI runners they normally take 0.3-0.9 s per case (two
  * measured runs, 18 Nov 2026), but a runner stall stretched a whole window of
  * them to 1.2-5.3 s, with no lock, lease or file left over from earlier cases.
+ * The held-open cleanup cases use it too: they run the move up to three times
+ * over the same files and wait out a 500 ms sharing-violation budget, and on
+ * one windows-2022 run (21 Nov 2026) took 1.6, 2.5 and 5.0 s while the same
+ * job on windows-latest passed.
  * Don't raise this further without measuring where the time goes.
  */
 const CREDENTIAL_CASE_TIMEOUT_MS = 20_000
@@ -840,6 +844,7 @@ describe('moving an existing layout', () => {
       expect(marker()?.oldFilesRemoved).toBe(true)
       expect(logged.filter((line) => line.level === 'warn')).toEqual([])
     },
+    CREDENTIAL_CASE_TIMEOUT_MS,
   )
 
   it('cleanup after a crash waits for the store lock and compares again before it unlinks', async () => {
