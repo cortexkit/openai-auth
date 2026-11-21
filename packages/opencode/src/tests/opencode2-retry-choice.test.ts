@@ -481,8 +481,16 @@ describe('A terminal or error frame after output blocks continuation', () => {
         expect(await f.continueStep()).toEqual({ retry: false })
         expect(f.retryReasons).toEqual(['output-started'])
         expect(f.sameAccount).toEqual([])
+        // HTTP attempts end with the body reader, not the completed frame,
+        // so billing still reports a body cut after it as cut.
         if (frame.type === 'response.completed')
-          expect(f.attemptEnds).toEqual([{ status: 200, outputStarted: true }])
+          expect(f.attemptEnds).toEqual([
+            {
+              status: 200,
+              outputStarted: true,
+              error: { message: 'connection reset', reason: 'failed' },
+            },
+          ])
       } finally {
         await f.installation.dispose()
       }

@@ -2337,7 +2337,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }
       }
       if (verdict?.outputStarted) attemptsWithOutput.add(attempt)
-      if (billingDone || completed) verdict = { ...verdict, done: true }
+      // HTTP acceptance belongs to the body reader, not an SSE lifecycle
+      // frame. A WebSocket has no body end, so its completion is explicit.
+      if (billingDone || (transport === 'ws' && completed))
+        verdict = { ...verdict, done: true }
       // An HTTP body can still fail after the final frame. Block continuation
       // explicitly once output has started, without vetoing pre-output refusals.
       if (
