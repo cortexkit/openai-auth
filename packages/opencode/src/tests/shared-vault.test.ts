@@ -8,6 +8,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as claustrum from '@cortexkit/common-auth/claustrum'
 import {
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
@@ -402,6 +403,29 @@ describe('one host vault per process', () => {
     expect(vaults.size).toBe(2)
     expect(daemon.lists).toBe(2)
     expect(daemon.connections).toBe(2)
+  })
+
+  test('shared vault client options omit the project root for scoped and enrollment connections', async () => {
+    const scoped = spyOn(claustrum, 'connectClaustrumScopedClient')
+    const enrollment = spyOn(claustrum, 'connectClaustrumEnrollmentClient')
+    cleanups.push(
+      () => scoped.mockRestore(),
+      () => enrollment.mockRestore(),
+    )
+    await plugin({}, join(dir, 'project'))
+    await ready()
+    const [vault] = vaults
+    await vault!.connectStep()
+    for (const connection of [scoped, enrollment]) {
+      expect(connection.mock.calls.length).toBeGreaterThan(0)
+      for (const [options] of connection.mock.calls) {
+        expect(options).not.toHaveProperty('projectRoot')
+        expect(options).toMatchObject({
+          connectionFile: daemon.connectionFile,
+          storagePath: vaultPaths(stateDir, 'opencode').tokenPath,
+        })
+      }
+    }
   })
 
   test('injected enrollment connectors also remain isolated', async () => {

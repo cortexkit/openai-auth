@@ -278,8 +278,6 @@ export interface OpenAiVaultOptions {
   stateDir: string
   /** The vault's connection file; `CLAUSTRUM_SUBC_CONNECTION` or the default by default. */
   connectionFile?: () => string
-  /** The project this host runs in, part of the identity the vault sees. */
-  projectRoot?: string
   /** Replaces the request-path connection (tests). */
   connectScoped?: () => Promise<ClaustrumScopedClient>
   /** Replaces the setup-only enrollment connection (tests). */
@@ -389,7 +387,6 @@ export class OpenAiVault {
   #clientOptions() {
     return {
       connectionFile: this.#connectionFile(),
-      projectRoot: this.#options.projectRoot ?? process.cwd(),
       storagePath: this.paths.tokenPath,
       // The Claustrum client's default logger prints transport error classes
       // to stderr; they go to this plugin's debug log instead.

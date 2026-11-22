@@ -2308,7 +2308,6 @@ describe('routing', () => {
           await roster.promise
           return connectClaustrumScopedClient({
             connectionFile: running.connectionFile,
-            projectRoot: dir,
             storagePath: vaultPaths(stateDir, 'opencode').tokenPath,
           })
         },

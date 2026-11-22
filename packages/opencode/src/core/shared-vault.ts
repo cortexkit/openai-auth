@@ -101,8 +101,6 @@ export function acquireOpenCodeVault(
         connectionFile === 'host'
           ? (options.connectionFile ?? resolveClaustrumConnectionPath)()
           : connectionFile,
-      // ClaustrumClient uses projectRoot only as identity.project_root metadata; scoped authorization uses the enrollment token.
-      ...(!isolated ? { projectRoot: stateDir } : {}),
       // Every holder of this entry reads the same pool store (the store paths
       // are part of the key), so a route id any current holder has loaded is
       // reserved. A released holder is no longer in the set and is never asked.

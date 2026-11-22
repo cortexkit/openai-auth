@@ -636,7 +636,6 @@ export async function CodexAuthPlugin(
       host: 'opencode',
       stateDir:
         options.vault?.stateDir ?? vaultStateDir(accountPaths.statePath),
-      ...(input.directory ? { projectRoot: input.directory } : {}),
       reservedRouteIds: () =>
         poolAccountSource?.peek().rows.map((row) => row.id) ?? [],
       ...(options.vault?.connectionFile
