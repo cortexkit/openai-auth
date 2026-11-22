@@ -1,13 +1,24 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { existsSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  existsSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { join, resolve } from 'node:path'
 import type { CommandApplyRequest } from '@cortexkit/common-auth/commands'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
-import { startMockDaemon } from '../../../core/src/tests/fixtures/mock-claustrum'
+import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum'
+import { getResolvedSettingsView } from '../config'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { createRpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
+import * as sidebarState from '../sidebar-state'
 import {
   getSidebarState,
   resolveSessionSidebarRouting,
@@ -19,6 +30,7 @@ import { acquireSessionPins } from '../v2/shared-pins'
 import {
   fakeOpenCode2Host,
   poolFiles,
+  type RoutingModeSeed,
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
@@ -29,11 +41,17 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
+type SharedFixture = {
+  legacyMode: RoutingModeSeed
+  secondLegacyMode?: RoutingModeSeed
+}
+
 async function fixture(
   connectionFile?: () => string,
   twoLocations = true,
   accounts = ['main', 'alpha', 'beta'],
   observation: { intervalMs?: number } = { intervalMs: 250 },
+  shared?: SharedFixture,
 ) {
   const sources = new Set<PoolAccountSource>()
   const originalSubscribe = PoolAccountSource.prototype.subscribe
@@ -50,11 +68,33 @@ async function fixture(
   cleanups.push(() => subscribe.mockRestore())
   const files = poolFiles()
   cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
-  seedPool(
-    files,
-    'sticky-balanced',
-    accounts.map((id) => ({ id, identity: `${id}-identity`, usedPercent: 20 })),
-  )
+  const rows = accounts.map((id) => ({
+    id,
+    identity: `${id}-identity`,
+    usedPercent: 20,
+  }))
+  seedPool(files, shared?.legacyMode ?? 'sticky-balanced', rows)
+  const secondFiles = shared?.secondLegacyMode ? poolFiles() : files
+  if (shared?.secondLegacyMode) {
+    cleanups.push(() =>
+      rmSync(secondFiles.dir, { recursive: true, force: true }),
+    )
+    seedPool(secondFiles, shared.secondLegacyMode, rows)
+  }
+  if (shared) {
+    const name = 'OPENCODE_OPENAI_AUTH_SETTINGS_FILE'
+    const previous = process.env[name]
+    const settingsFile = join(files.dir, 'settings.jsonc')
+    writeFileSync(
+      settingsFile,
+      JSON.stringify({ routing_mode: 'sticky-balanced' }),
+    )
+    process.env[name] = settingsFile
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env[name]
+      else process.env[name] = previous
+    })
+  }
   const file = join(files.dir, 'sidebar.json')
   const calls: string[] = []
   const fetchImpl = Object.assign(
@@ -66,10 +106,10 @@ async function fixture(
     },
     { preconnect() {} },
   ) as typeof fetch
-  const start = async (directory: string) => {
+  const start = async (directory: string, pool = files) => {
     const host = fakeOpenCode2Host({ directory: join(files.dir, directory) })
     const dispose = await setupOpenAIAuth(host.ctx, {
-      paths: files.paths,
+      paths: pool.paths,
       sidebarStateFile: file,
       sidebarObservationIntervalMs: observation.intervalMs,
       heartbeat: false,
@@ -89,7 +129,7 @@ async function fixture(
     return { host, client, dispose }
   }
   const a = await start('a')
-  const b = twoLocations ? await start('b') : a
+  const b = twoLocations ? await start('b', secondFiles) : a
   const observer = acquireOpenCodeVault(
     {
       host: 'opencode',
@@ -108,7 +148,100 @@ async function fixture(
     observer.release()
     subscribe.mockRestore()
   }
-  return { files, file, calls, a, b }
+  return { files, secondFiles, file, calls, a, b, start }
+}
+
+const publishers = (globalThis as unknown as Record<PropertyKey, unknown>)[
+  Symbol.for('@cortexkit/openai-auth/opencode2-sidebar-publishers')
+] as Map<string, { settled(): Promise<void> }>
+
+function sidebarSettled(file: string) {
+  const publisher = publishers.get(resolve(file))
+  if (!publisher) throw new Error('No sidebar publisher for the fixture')
+  return publisher.settled()
+}
+
+function sidebarObserver() {
+  const intervals = spyOn(globalThis, 'setInterval')
+  cleanups.push(() => intervals.mockRestore())
+  const intervalMs = 60_001
+  return {
+    intervalMs,
+    async tick(file: string) {
+      const callback = intervals.mock.calls.find(
+        ([, delay]) => delay === intervalMs,
+      )?.[0]
+      if (!callback) throw new Error('No sidebar observation timer')
+      callback()
+      await sidebarSettled(file)
+    },
+  }
+}
+
+async function mainFirst(client: ReturnType<typeof createRpcClient>) {
+  expect(
+    await client.apply({
+      command: 'openai',
+      sectionId: 'routing',
+      actionId: 'mode',
+      values: { mode: 'main-first' },
+    }),
+  ).toMatchObject({ ok: true })
+}
+
+function placePin(files: ReturnType<typeof poolFiles>, sessionId: string) {
+  acquireSessionPins(files.paths()).place({
+    sessionId,
+    requestBytes: 100,
+    validPinnedAccountIds: ['main'],
+    excludeAccountIds: [],
+    quotaCheckedAtByAccount: {},
+    wireAccountIdByAccount: {},
+    persist: true,
+    select: () => ({ accountId: 'main', source: 'weighted' }),
+  })
+}
+
+async function vaultFixture(
+  observation: ReturnType<typeof sidebarObserver>,
+  shared?: SharedFixture,
+) {
+  const daemonFiles = poolFiles()
+  cleanups.push(() => rmSync(daemonFiles.dir, { recursive: true, force: true }))
+  const daemon = await startMockDaemon({
+    directory: daemonFiles.dir,
+    credentials: {
+      'chatgpt:openai': vaultLogin('chatgpt-vault-main'),
+      'chatgpt:openai:other': vaultLogin('chatgpt-vault-other'),
+    },
+  })
+  cleanups.push(() => daemon.stop())
+  const connectionFile = () => daemon.connectionFile
+  const f = await fixture(connectionFile, true, ['main'], observation, shared)
+  const options = {
+    host: 'opencode' as const,
+    stateDir: join(f.files.dir, 'vault'),
+    connectionFile,
+    pollIntervalMs: 0,
+  }
+  const observer = acquireOpenCodeVault(options, f.files.paths())
+  cleanups.push(() => observer.release())
+  expect(
+    (
+      await observer.vault.waitForApproval({
+        sleep: async () => daemon.approve('request-1'),
+      })
+    ).state,
+  ).toBe('approved')
+  await observer.vault.refresh()
+  if (f.secondFiles !== f.files) {
+    const other = acquireOpenCodeVault(options, f.secondFiles.paths())
+    cleanups.push(() => other.release())
+    await other.vault.refresh()
+  }
+  await observation.tick(f.file)
+  expect((await getSidebarState(f.file)).vaultDiscovered).toBe(true)
+  return { ...f, vault: observer.vault }
 }
 
 async function changed(file: string, previous: number) {
@@ -283,6 +416,114 @@ test('OpenCode 2 publisher: one observer per file survives a location disposal',
     ).ok,
   ).toBe(true)
   expect((await changed(f.file, before)).route).toBe('fallback-first')
+})
+
+test('OpenCode 2 publisher: vault locations agree on the changed shared mode despite different old stores', async () => {
+  const observation = sidebarObserver()
+  const f = await vaultFixture(observation, {
+    legacyMode: 'ordered',
+    secondLegacyMode: 'main-first',
+  })
+  const publish = spyOn(sidebarState, 'setSidebarMachineState')
+  cleanups.push(() => publish.mockRestore())
+  await mainFirst(f.a.client)
+  await until(
+    async () =>
+      getResolvedSettingsView(null, f.secondFiles.configPath).routing?.mode ===
+      'main-first',
+  )
+  publish.mockClear()
+  // Both old stores can still be written independently of the shared preferences.
+  for (const { configPath } of [f.files, f.secondFiles])
+    writeFileSync(configPath, `${readFileSync(configPath, 'utf8')}\n`)
+  await observation.tick(f.file)
+  const states = publish.mock.calls.map(
+    ([{ lastUpdated: _, ...state }]) => state,
+  )
+  expect(states.map((state) => state.route)).toEqual([
+    'main-first',
+    'main-first',
+  ])
+  expect(states[0]).toEqual(states[1])
+  const settled = readFileSync(f.file, 'utf8')
+  await observation.tick(f.file)
+  expect(readFileSync(f.file, 'utf8')).toBe(settled)
+
+  // A shared-file edit must also publish if neither old store changes.
+  writeFileSync(
+    join(f.files.dir, 'settings.jsonc'),
+    JSON.stringify({
+      routing_mode: 'fallback-first',
+      killswitch_enabled: true,
+      quota_fail_closed_on_unknown: true,
+    }),
+  )
+  for (const { configPath } of [f.files, f.secondFiles])
+    await until(
+      async () =>
+        getResolvedSettingsView(null, configPath).routing?.mode ===
+        'fallback-first',
+    )
+  await observation.tick(f.file)
+  const next = await getSidebarState(f.file)
+  expect(next.route).toBe('fallback-first')
+  expect(next.vaultAccounts?.map((row) => row.killed)).toEqual([true, true])
+})
+
+test('OpenCode 2 publisher: an equivalent vault refresh does not rewrite the sidebar', async () => {
+  const observation = sidebarObserver()
+  const f = await vaultFixture(observation)
+  const before = readFileSync(f.file, 'utf8')
+  const roster = f.vault.snapshot()
+  const rosterInode = statSync(f.vault.paths.rosterPath).ino
+  const publish = spyOn(sidebarState, 'setSidebarMachineState')
+  cleanups.push(() => publish.mockRestore())
+  await f.vault.refresh()
+  expect(f.vault.snapshot()).toEqual(roster)
+  expect(f.vault.snapshot()).not.toBe(roster)
+  expect(statSync(f.vault.paths.rosterPath).ino).toBe(rosterInode)
+  await observation.tick(f.file)
+  await observation.tick(f.file)
+  expect(publish).not.toHaveBeenCalled()
+  expect(readFileSync(f.file, 'utf8')).toBe(before)
+})
+
+test('OpenCode 2 publisher: a pin notification after a mode change uses the current route', async () => {
+  const f = await fixture()
+  await mainFirst(f.a.client)
+  placePin(f.files, 'pin-after-change')
+  await sidebarSettled(f.file)
+  expect(
+    (await getSidebarState(f.file)).activeRouting?.['pin-after-change']?.route,
+  ).toBe('main-first')
+})
+
+test('OpenCode 2 publisher: setup only replays existing pins in sticky mode', async () => {
+  const f = await fixture(undefined, false)
+  placePin(f.files, 'earlier-pin')
+  await sidebarSettled(f.file)
+  await sidebarState.removeSidebarActiveRouting(
+    'earlier-pin',
+    undefined,
+    f.file,
+  )
+  await f.start('sticky-project')
+  await sidebarSettled(f.file)
+  expect(
+    (await getSidebarState(f.file)).activeRouting?.['earlier-pin']?.route,
+  ).toBe('sticky-balanced')
+
+  await mainFirst(f.a.client)
+  await sidebarState.removeSidebarActiveRouting(
+    'earlier-pin',
+    undefined,
+    f.file,
+  )
+  await f.start('main-first-project')
+  await sidebarSettled(f.file)
+  expect(
+    (await getSidebarState(f.file)).activeRouting?.['earlier-pin'],
+  ).toBeUndefined()
 })
 
 test('OpenCode 2 publisher: real enrollment and disconnect publish exclusive vault state without local polling', async () => {

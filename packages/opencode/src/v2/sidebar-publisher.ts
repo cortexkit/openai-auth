@@ -1,5 +1,6 @@
 import { statSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { StickyPin } from '@cortexkit/common-auth/routing'
 import {
   type AccountPaths,
@@ -7,6 +8,8 @@ import {
   loadAccounts,
   type OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
+import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
+import { getResolvedSettingsView } from '../config'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import {
   buildPoolSidebarMachineState,
@@ -17,6 +20,7 @@ import {
   getSidebarStateFile,
   persistSidebarStickyAssignment,
   removeSidebarActiveRouting,
+  type SidebarAccountState,
   setSidebarMachineState,
   upsertSidebarActiveRouting,
 } from '../sidebar-state'
@@ -39,7 +43,7 @@ interface Producer {
 type SidebarWrite = (
   file: string,
   producer: Producer,
-  routing: RoutingChange | undefined,
+  publication: Publication | undefined,
   live: () => boolean,
 ) => Promise<void>
 
@@ -60,14 +64,23 @@ function enrollmentStamp(producer: Producer): string {
   return stamp([producer.vault.paths.tokenPath, producer.vault.paths.statePath])
 }
 
-function inputStamp(producer: Producer): string {
-  return (
-    stamp([
-      producer.paths.configPath,
-      producer.paths.statePath,
-      producer.vault.paths.rosterPath,
-    ]) + enrollmentStamp(producer)
-  )
+function observeInputs(producer: Producer) {
+  const { configPath, statePath } = producer.paths
+  const shared = getSettingsDecision(configPath) === 'shared'
+  const settings = shared
+    ? getResolvedSettingsView(null, configPath)
+    : undefined
+  return {
+    stamp: stamp([configPath, statePath]) + enrollmentStamp(producer),
+    settings: {
+      mode: settings?.routing?.mode,
+      killswitch: settings?.killswitch,
+      quota: settings?.quota,
+    },
+    // Vault discovery can replace the cached roster with a fresh object even
+    // if the account rows the sidebar displays have not changed.
+    rows: producer.vault.snapshot()?.rows,
+  }
 }
 
 type RoutingChange = {
@@ -77,6 +90,10 @@ type RoutingChange = {
   pin?: StickyPin
 }
 
+type Publication =
+  | RoutingChange
+  | { replayPins: ReadonlyMap<string, StickyPin> }
+
 class SidebarPublisher {
   private readonly producers = new Set<Producer>()
   private readonly subscriptions = new Map<
@@ -85,7 +102,7 @@ class SidebarPublisher {
   >()
   private readonly observations = new Map<
     Producer,
-    { stamp: string; roster: unknown }
+    ReturnType<typeof observeInputs>
   >()
   readonly protocol = PUBLISHER_PROTOCOL
   private chain = Promise.resolve()
@@ -98,10 +115,7 @@ class SidebarPublisher {
 
   add(producer: Producer): () => void {
     this.producers.add(producer)
-    this.observations.set(producer, {
-      stamp: inputStamp(producer),
-      roster: producer.vault.snapshot(),
-    })
+    this.observations.set(producer, observeInputs(producer))
     const unsubscribe = producer.source.subscribe(() => {
       void this.publish(producer)
     })
@@ -117,25 +131,22 @@ class SidebarPublisher {
               sessionId,
               pin,
               accountId: pin?.accountId,
-              route: 'sticky-balanced',
             })
         }),
       }
       this.subscriptions.set(producer.pins, subscription)
     }
     subscription.producers.add(producer)
-    // Observe persisted settings/enrollment and the vault's cached roster only.
+    // Observe effective settings, persisted local state and cached vault rows.
     // Publication must never call a quota poll, roster discovery or token refresh.
     this.timer ??= setInterval(() => {
       for (const owner of this.producers) {
-        const next = {
-          stamp: inputStamp(owner),
-          roster: owner.vault.snapshot(),
-        }
+        const next = observeInputs(owner)
         const previous = this.observations.get(owner)
         if (
           next.stamp !== previous?.stamp ||
-          next.roster !== previous?.roster
+          !isDeepStrictEqual(next.settings, previous?.settings) ||
+          !isDeepStrictEqual(next.rows, previous?.rows)
         ) {
           this.observations.set(owner, next)
           void this.publish(owner)
@@ -159,7 +170,7 @@ class SidebarPublisher {
     }
   }
 
-  publish(producer: Producer, routing?: RoutingChange): Promise<void> {
+  publish(producer: Producer, publication?: Publication): Promise<void> {
     this.chain = this.chain
       .then(async () => {
         if (!this.producers.has(producer)) return
@@ -167,7 +178,7 @@ class SidebarPublisher {
         await (producer.write ?? writeSidebar)(
           this.file,
           producer,
-          routing,
+          publication,
           () => this.producers.has(producer),
         )
       })
@@ -186,7 +197,12 @@ class SidebarPublisher {
   }
 }
 
-const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
+const writeSidebar: SidebarWrite = async (
+  file,
+  producer,
+  publication,
+  live,
+) => {
   const authority = await producer.vault.authority()
   const vaultMode = authority !== 'local'
   const authorityStamp = enrollmentStamp(producer)
@@ -194,9 +210,18 @@ const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
     live() &&
     producer.vault.enrolled() === vaultMode &&
     enrollmentStamp(producer) === authorityStamp
-  const store = await (vaultMode
-    ? loadAccountSettings(producer.paths)
-    : loadAccounts(producer.paths))
+  const store = getResolvedSettingsView(
+    await (vaultMode
+      ? loadAccountSettings(producer.paths)
+      : loadAccounts(producer.paths)),
+    producer.paths.configPath,
+  )
+  if (
+    publication &&
+    'replayPins' in publication &&
+    store.routing?.mode !== 'sticky-balanced'
+  )
+    return
   const machine = vaultMode
     ? buildVaultSidebarMachineState(
         producer.vault.snapshot()?.rows,
@@ -211,8 +236,30 @@ const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
       )
   const hooks = { canWrite, vaultMode }
   await setSidebarMachineState(machine, file, hooks)
-  if (!canWrite() || !routing) return
+  if (!publication) return
   const accounts = machine.vaultAccounts ?? machine.fallbacks
+  if ('replayPins' in publication) {
+    for (const [sessionId, pin] of publication.replayPins)
+      await writeSidebarRouting(
+        file,
+        { sessionId, pin, accountId: pin.accountId },
+        machine.route,
+        accounts,
+        hooks,
+      )
+  } else {
+    await writeSidebarRouting(file, publication, machine.route, accounts, hooks)
+  }
+}
+
+async function writeSidebarRouting(
+  file: string,
+  routing: RoutingChange,
+  mode: string,
+  accounts: SidebarAccountState[],
+  hooks: { canWrite: () => boolean; vaultMode: boolean },
+) {
+  if (!hooks.canWrite()) return
   if (routing.accountId === undefined) {
     // Removing one session's active route also removes its projected pin.
     await removeSidebarActiveRouting(routing.sessionId, accounts, file, hooks)
@@ -232,7 +279,7 @@ const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
           lastSeenAt: now,
         },
         validPinnedAccountIds: [
-          ...(vaultMode ? [] : ['main']),
+          ...(hooks.vaultMode ? [] : ['main']),
           ...accounts.filter((row) => row.enabled).map((row) => row.id),
         ],
       },
@@ -244,7 +291,7 @@ const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
     {
       sessionId: routing.sessionId,
       activeId: routing.accountId,
-      route: routing.route ?? machine.route,
+      route: routing.route ?? mode,
       updatedAt: Date.now(),
     },
     accounts,
@@ -260,7 +307,7 @@ const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
 // replaced rather than reused, and it keeps serving only the producers it already
 // has until they release. Changes to how the file is built need no bump, because
 // each producer carries its own bundle's `write`.
-const PUBLISHER_PROTOCOL = 2
+const PUBLISHER_PROTOCOL = 3
 const registryKey = Symbol.for(
   '@cortexkit/openai-auth/opencode2-sidebar-publishers',
 )
@@ -287,13 +334,8 @@ export function acquireSidebarPublisher(
   producer = { ...producer, write: producer.write ?? writeSidebar }
   const stop = owner.add(producer)
   let released = false
-  for (const [sessionId, pin] of producer.pins.snapshot())
-    void owner.publish(producer, {
-      sessionId,
-      pin,
-      accountId: pin.accountId,
-      route: 'sticky-balanced',
-    })
+  const replayPins = producer.pins.snapshot()
+  if (replayPins.size) void owner.publish(producer, { replayPins })
   return {
     publish: () => owner.publish(producer),
     route: (sessionId: string, accountId: string, route: string) => {
