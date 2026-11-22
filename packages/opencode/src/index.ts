@@ -4068,6 +4068,8 @@ export async function CodexAuthPlugin(
             mode,
             sessionId,
             requestKind: JSON.stringify([requestPath, requestKind]),
+            primary: requestKind === 'primary',
+            waitForReset: resolved(reqStorage).waitForReset,
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,

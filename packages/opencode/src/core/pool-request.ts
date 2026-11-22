@@ -67,6 +67,7 @@ import {
   type OpenAiLimitsOwner,
   openAiConfirmedBlockers,
   openAiHoldFacts,
+  openAiResetWait,
   openAiTerminalFacts,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
@@ -224,6 +225,8 @@ export interface PoolRequestContext {
   sessionId: string | undefined
   /** Separates endpoint and conversation/auxiliary retries within a session. */
   requestKind?: string
+  primary?: boolean
+  waitForReset?: boolean
   /** The buffered request body, when there is one. */
   body: string | undefined
   replayable: boolean
@@ -385,12 +388,15 @@ function policyFacts(
 function policyResponse(
   ctx: PoolRequestContext,
   decision: LimitDecision,
+  waitForReset = false,
 ): Response {
   const wire = buildOpenAiQuotaRefusal({
     decision,
     now: ctx.now(),
     host: 'opencode1',
-    maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+    maxSameAccountWait: waitForReset
+      ? undefined
+      : ctx.storage?.routing?.maxSameAccountWait,
   })
   if (wire.kind !== 'http')
     throw new Error('Expected an OC1 HTTP quota refusal')
@@ -640,6 +646,7 @@ function terminalResponse(
     now,
     effectiveModel: requestModel(ctx),
     maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+    waitForReset: openAiResetWait(ctx.waitForReset, ctx.primary, ctx.sessionId),
     activity: policy.activity(),
     currentAccountKey: policy.currentAccountKey(),
     provenance: owner?.provenance,
@@ -663,6 +670,7 @@ function terminalResponse(
                   : 'timed-mark',
           },
     ),
+    terminal.scan?.waitForReset !== undefined,
   )
 }
 

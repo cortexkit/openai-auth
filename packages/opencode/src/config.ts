@@ -16,6 +16,7 @@ import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisi
 import { settingsIdentity } from '@cortexkit/openai-auth-core/settings-install'
 import {
   type SettingsSnapshot,
+  type SettingsView,
   unreadSettingsView,
 } from '@cortexkit/openai-auth-core/settings-snapshot'
 import { createLogger } from './logger'
@@ -174,7 +175,7 @@ function sharedSnapshot(configPath: string): SettingsSnapshot | undefined {
 export function getResolvedSettingsView(
   store: AccountStorage | null,
   configPath = getConfigPath(),
-): AccountStorage {
+): AccountStorage & Partial<Pick<SettingsView, 'waitForReset'>> {
   if (getSettingsDecision(configPath) !== 'shared')
     return store ?? { version: 1, accounts: [] }
   return (

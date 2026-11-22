@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   type AccountKey,
   type BuiltRefusal,
@@ -25,6 +26,7 @@ import {
   quotaResetAt,
 } from './limit-policy'
 import type { LimitProvenanceStore } from './limit-provenance'
+import { hasVaultRoutingAccessor } from './vault-routing'
 
 export type OpenAiQuotaCause = 'killswitch' | 'quota' | 'timed-mark'
 export const OPENAI_FINAL_CAUSES = {
@@ -75,6 +77,18 @@ export interface OpenAiTerminalAccount {
   marks?: readonly { until: number; evidenceAt: number }[]
 }
 
+export function openAiResetWait(
+  enabled: boolean | undefined,
+  primary: boolean | undefined,
+  sessionId: string | undefined,
+): TerminalScanFacts['waitForReset'] {
+  if (!enabled || !primary || hasVaultRoutingAccessor()) return undefined
+  const hash = createHash('sha256')
+    .update(sessionId ?? '')
+    .digest()
+  return { jitterMs: (hash.readUInt32BE(0) % 21) * 1000 }
+}
+
 /** Consider all blocked accounts, not just the first account in routing order. */
 export function openAiTerminalFacts(input: {
   accounts: readonly OpenAiTerminalAccount[]
@@ -82,6 +96,7 @@ export function openAiTerminalFacts(input: {
   familyOf?: TerminalScanFacts['familyOf']
   now: number
   maxSameAccountWait?: unknown
+  waitForReset?: TerminalScanFacts['waitForReset']
   activity?: SessionActivity
   currentAccountKey?: AccountKey
   provenance?: LimitProvenanceStore
@@ -181,6 +196,7 @@ export function openAiTerminalFacts(input: {
     familyOf,
     maxAgeMs: QUOTA_STALENESS_MS,
     maxSameAccountWait: readMaxSameAccountWait(input.maxSameAccountWait),
+    ...(input.waitForReset && { waitForReset: input.waitForReset }),
     activity,
     accountKey: activity?.accountKey,
   }

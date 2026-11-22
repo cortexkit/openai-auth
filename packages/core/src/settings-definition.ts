@@ -47,6 +47,12 @@ export const openaiSettings = defineSettings({
       default: '15m',
       legacy: legacy(['routing', 'maxSameAccountWait']),
     },
+    wait_for_reset: {
+      ...both,
+      value: boolean(),
+      default: false,
+      legacy: [],
+    },
     fallback_on: {
       ...both,
       hosts: 'OpenCode 1 and Pi; not read by OpenCode 2',

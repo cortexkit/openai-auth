@@ -261,7 +261,9 @@ async function fixture(
       record,
       log,
     })
-  const open = (snapshot?: Pick<SettingsSnapshot, 'refresh' | 'report'>) =>
+  const open = (
+    snapshot?: Pick<SettingsSnapshot, 'refresh' | 'report' | 'get'>,
+  ) =>
     buildSettingsDiagnostics({
       configPath: install.configIdentity,
       snapshot,
@@ -430,6 +432,9 @@ describe('config-scoped Diagnostics section', () => {
       report(): ReportEntry[] {
         throw new Error('Separate install must not report settings')
       },
+      get(): never {
+        throw new Error('Separate install must not read shared settings')
+      },
     }
     const section = settingsDiagnosticsSection({
       configPath: separate.install.configIdentity,
@@ -438,12 +443,21 @@ describe('config-scoped Diagnostics section', () => {
     })
     expect(section.title).toBe('Diagnostics')
     expect(await section.build()).toEqual({
-      lines: ["Settings stay in this install's account store."],
+      lines: [
+        "Settings stay in this install's account store.",
+        'wait_for_reset: false',
+      ],
     })
     expect(await shared.open()).toEqual({
-      lines: [text.file(shared.install.target), text.sharedFound],
+      lines: [
+        text.file(shared.install.target),
+        text.sharedFound,
+        'wait_for_reset: false',
+      ],
     })
-    expect(await section.build()).toEqual({ lines: [text.separate] })
+    expect(await section.build()).toEqual({
+      lines: [text.separate, 'wait_for_reset: false'],
+    })
     expect(separate.warnings).toEqual([])
   })
 
@@ -451,11 +465,19 @@ describe('config-scoped Diagnostics section', () => {
     const f = await fixture()
     await f.start()
     expect(await f.open()).toEqual({
-      lines: [text.file(f.install.target), text.sharedMissing],
+      lines: [
+        text.file(f.install.target),
+        text.sharedMissing,
+        'wait_for_reset: false',
+      ],
     })
     await put(f.install.target, '{}')
     expect(await f.open()).toEqual({
-      lines: [text.file(f.install.target), text.sharedFound],
+      lines: [
+        text.file(f.install.target),
+        text.sharedFound,
+        'wait_for_reset: false',
+      ],
     })
     expect(f.warnings).toEqual([])
   })
@@ -466,7 +488,11 @@ describe('config-scoped Diagnostics section', () => {
     })
     expect((await f.start()).move?.outcome).toBe('moved')
     expect(await f.open()).toEqual({
-      lines: [text.file(f.install.target), text.sharedMoved],
+      lines: [
+        text.file(f.install.target),
+        text.sharedMoved,
+        'wait_for_reset: false',
+      ],
     })
     await rm(f.install.target)
     expect(await f.open()).toEqual({
@@ -474,6 +500,7 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedMissing,
         text.removedFile(f.install.target),
+        'wait_for_reset: false',
       ],
     })
     const handle = openSettings(openaiSettings, {
@@ -487,7 +514,11 @@ describe('config-scoped Diagnostics section', () => {
       { host: 'opencode' },
     )
     expect(await f.open()).toEqual({
-      lines: [text.file(f.install.target), text.sharedFound],
+      lines: [
+        text.file(f.install.target),
+        text.sharedFound,
+        'wait_for_reset: false',
+      ],
     })
     expect(f.warnings).toEqual([text.removedFile(f.install.target)])
   })
@@ -504,6 +535,7 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedFound,
         existing,
+        'wait_for_reset: false',
       ])
     expect(f.warnings).toEqual([existing])
     const note = `${f.install.configIdentity}.MOVED_READPLEASE`
@@ -514,6 +546,7 @@ describe('config-scoped Diagnostics section', () => {
     expect((await f.open()).lines).toEqual([
       text.file(f.install.target),
       text.sharedFound,
+      'wait_for_reset: false',
     ])
     await rm(f.install.target)
     const removed = text.removedFile(f.install.target)
@@ -522,6 +555,7 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedMissing,
         removed,
+        'wait_for_reset: false',
       ])
     expect(f.warnings).toEqual([existing, removed])
     await put(f.install.target, '{}')
@@ -530,6 +564,7 @@ describe('config-scoped Diagnostics section', () => {
       text.file(f.install.target),
       text.sharedFound,
       existing,
+      'wait_for_reset: false',
     ])
     expect(f.warnings).toEqual([existing, removed])
   })
@@ -568,6 +603,7 @@ describe('config-scoped Diagnostics section', () => {
     expect((await mover.open()).lines).toEqual([
       text.file(mover.install.target),
       text.sharedFound,
+      'wait_for_reset: false',
     ])
   })
 
@@ -600,6 +636,7 @@ describe('config-scoped Diagnostics section', () => {
           { window: 'primary', floor: 30 },
         ],
         cache_keep_window: [{ start_hour: 1, end_hour: 1 }],
+        wait_for_reset: { default: false, opencode: true },
       }),
     )
     expect(snapshot.report()).toEqual([])
@@ -613,6 +650,7 @@ describe('config-scoped Diagnostics section', () => {
       text.checks.localBoth,
       text.checks.duplicateQuota,
       text.checks.warmWindow,
+      'wait_for_reset: true',
     ])
     expect(lines.join('\n')).not.toContain('private stored value')
     await put(f.install.target, 'not json')
@@ -621,7 +659,11 @@ describe('config-scoped Diagnostics section', () => {
     )
     await put(f.install.target, '{}')
     expect(await f.open(snapshot)).toEqual({
-      lines: [text.file(f.install.target), text.sharedFound],
+      lines: [
+        text.file(f.install.target),
+        text.sharedFound,
+        'wait_for_reset: false',
+      ],
     })
   })
 
@@ -635,6 +677,7 @@ describe('config-scoped Diagnostics section', () => {
       expect(lines).toEqual([
         text.file(f.install.target),
         text.legacySetting('quota_check_interval_minutes'),
+        'wait_for_reset: false',
       ])
       expect(lines.join('\n')).not.toContain('private stored value')
     }
@@ -648,6 +691,7 @@ describe('config-scoped Diagnostics section', () => {
       text.legacyFailed(
         `opencode ${f.install.configIdentity}: SOURCE_NOT_JSON`,
       ),
+      'wait_for_reset: false',
     ])
   })
 
@@ -667,6 +711,9 @@ describe('config-scoped Diagnostics section', () => {
       },
       report(): ReportEntry[] {
         throw new Error('Refused startup must not report settings')
+      },
+      get(): never {
+        throw new Error('Refused startup must not read settings')
       },
     }
     expect(await f.open(snapshot)).toEqual({

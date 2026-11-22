@@ -54,6 +54,7 @@ import {
   openAiConfirmedBlockers,
   openAiHoldFacts,
   openAiLimitAxes,
+  openAiResetWait,
   openAiTerminalFacts,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
@@ -121,6 +122,7 @@ export interface PiLimitPolicy {
   /** Runtime execution is opt-in; callers without it can observe decisions only. */
   execute?: boolean
   canWait?: boolean
+  waitForReset?: boolean
   effectiveModel?: string
   wake?: PiWake
 }
@@ -315,6 +317,12 @@ function terminalFacts<A extends RouteAttempt>(
       ctx.limitPolicy?.canWait === false
         ? 0
         : ctx.storage?.routing?.maxSameAccountWait,
+    // Pi's Codex stream serves the conversation; Pi does not send request-purpose metadata.
+    waitForReset: openAiResetWait(
+      ctx.limitPolicy?.waitForReset,
+      true,
+      ctx.sessionId,
+    ),
     activity,
     currentAccountKey: candidates.find(
       (candidate) =>
@@ -379,7 +387,7 @@ function terminalResult<A extends RouteAttempt>(
   key?: AccountKey,
   attempt?: RouteAttempt,
 ): PiRouteResult<A> {
-  const facts = baseFacts(ctx)
+  const facts = { ...baseFacts(ctx), wake: ctx.limitPolicy?.wake?.facts }
   const decision = decideOpenAiTerminal(facts, terminalFacts(ctx, key, attempt))
   ctx.limitPolicy?.onDecision?.(decision, facts)
   const result = policyResult(ctx, decision, attempt?.signal)

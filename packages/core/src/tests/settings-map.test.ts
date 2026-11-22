@@ -288,10 +288,16 @@ describe('settings map setting-table parity', () => {
     })
   }
 
-  it('covers every declared setting, with floors composed as one host-tagged list', () => {
+  it('covers every legacy setting, with floors composed as one host-tagged list', () => {
     expect(
       new Set([...rows.map((row) => row.setting), 'killswitch_account_floors']),
-    ).toEqual(new Set(Object.keys(openaiSettings.settings)))
+    ).toEqual(
+      new Set(
+        Object.entries(openaiSettings.settings)
+          .filter(([, setting]) => setting.legacy.length > 0)
+          .map(([name]) => name),
+      ),
+    )
     const legacy = [
       source('opencode', {
         killswitch: {

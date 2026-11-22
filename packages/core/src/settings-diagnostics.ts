@@ -142,7 +142,7 @@ export function settingsDecisionLine(
 
 export interface SettingsDiagnosticsOptions {
   configPath: string
-  snapshot?: Pick<SettingsSnapshot, 'refresh' | 'report'>
+  snapshot?: Pick<SettingsSnapshot, 'refresh' | 'report' | 'get'>
   log: { warn(message: string): unknown }
 }
 
@@ -195,8 +195,10 @@ export async function buildSettingsDiagnostics({
     }
     throw error
   }
+  const resetWaitLine = () =>
+    `wait_for_reset: ${authority.decision === 'shared' && (snapshot?.get('wait_for_reset') ?? false)}`
   if (authority.decision === 'separate')
-    return { lines: [SETTINGS_DIAGNOSTICS_TEXT.separate] }
+    return { lines: [SETTINGS_DIAGNOSTICS_TEXT.separate, resetWaitLine()] }
 
   const completion =
     authority.decision === 'shared'
@@ -227,6 +229,7 @@ export async function buildSettingsDiagnostics({
     await snapshot?.refresh()
     lines.push(...(snapshot?.report().map(settingsReportLine) ?? []))
   }
+  lines.push(resetWaitLine())
   return { lines }
 }
 

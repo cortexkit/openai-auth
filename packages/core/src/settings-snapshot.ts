@@ -16,6 +16,7 @@ export type OpenAiSettingsHandle = SettingsHandle<Declaration>
 
 /** Transport preferences aren't fields of the legacy account-store type. */
 export type SettingsView = AccountStorage & {
+  waitForReset: boolean
   dumpDir: string
   dumpMaxBytes: number
   webSockets: boolean
@@ -120,6 +121,7 @@ function preferences(values: SnapshotValues, host: SnapshotHost): SettingsView {
         values.max_same_account_wait
       ],
     },
+    waitForReset: values.wait_for_reset,
     fallbackOn: values.fallback_on,
     refresh: {
       enabled: values.refresh_enabled,

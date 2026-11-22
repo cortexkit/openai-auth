@@ -46,6 +46,7 @@ import {
   type PolicyFacts,
   readMaxSameAccountWait,
   sameAccount,
+  type WaitCheckpoint,
 } from '@cortexkit/common-auth/limits'
 import type {
   AccountHeadersResult,
@@ -62,6 +63,7 @@ import type {
 import {
   DEFAULT_MAX_RECORDS,
   MAX_RETRY_HOLD_MS,
+  MAX_TERMINAL_HOLD_MS,
   OpenCode2AuthError,
 } from '@cortexkit/common-auth/opencode2'
 import {
@@ -91,6 +93,7 @@ import {
   openAiConfirmedBlockers,
   openAiHoldFacts,
   openAiRateLimitCommand,
+  openAiResetWait,
   openAiSignalWindows,
   openAiTerminalFacts,
   parseJwtClaims,
@@ -673,6 +676,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // The installer passes a hold's reset checkpoint only to the next request,
   // not to a later refusal. Keep the consumed wait until a new user prompt.
   const heldTurns = new Map<string, string>()
+  const resetWaits = new WeakSet<WaitCheckpoint>()
   const waitCounts = new Map<string, number>()
   // The prompt hook marks a turn before model selection, where the wire body
   // is not available yet. Only the primary request consumes that marker.
@@ -1401,7 +1405,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         OPENAI_HOST_RETRY_LIMIT -
         (input.hostAttempt ?? OPENAI_HOST_RETRY_LIMIT),
     }
-    const terminalFacts = () => {
+    const waitForReset = openAiResetWait(
+      storage.waitForReset,
+      primary,
+      input.sessionID,
+    )
+    const terminalFacts = (
+      sameAccountWait = setting,
+      optIn?: typeof waitForReset,
+    ) => {
       const owner = limits?.owner()
       return openAiTerminalFacts({
         accounts: candidates.flatMap((candidate) => {
@@ -1438,7 +1450,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }),
         now: at,
         effectiveModel: input.modelID,
-        maxSameAccountWait: setting,
+        maxSameAccountWait: sameAccountWait,
+        waitForReset: optIn,
         activity,
         currentAccountKey: activityKey,
         provenance: owner?.provenance,
@@ -1474,8 +1487,31 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           },
         }
       }
-      // This check must precede the chooser's temporary all-marked escape.
-      // A single account always keeps the host's original delayed retry.
+      if (waitForReset && !candidates.some((candidate) => candidate.ready)) {
+        // With the ordinary cap off in this decision, only a proven full
+        // reset can produce a terminal hold.
+        const reset = decideOpenAiTerminal(
+          facts,
+          terminalFacts(0, waitForReset),
+        )
+        if (
+          reset.action === 'hold' &&
+          reset.waitKind === 'terminal' &&
+          reset.delayMs <= MAX_TERMINAL_HOLD_MS
+        ) {
+          resetWaits.add(reset.checkpoint)
+          return {
+            hold: {
+              delayMs: reset.delayMs,
+              target: reset.target,
+              checkpoint: reset.checkpoint,
+              kind: 'terminal',
+            },
+          }
+        }
+      }
+      // The ordinary terminal path precedes the chooser's all-marked escape.
+      // Without a full reset hold, a single account keeps the host's delay.
       const others = targets.filter((target) => target.id !== previousId)
       const terminal =
         previous.confirmedBlockers?.some((window) => window.confirmed) &&
@@ -1534,9 +1570,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
     }
     let wakeAccount: string | undefined
+    const resetWake =
+      input.phase === 'request' &&
+      input.wake?.checkpoint &&
+      resetWaits.delete(input.wake.checkpoint)
+        ? input.wake
+        : undefined
     if (
       input.phase === 'request' &&
       input.wake?.checkpoint &&
+      !resetWake &&
       previous &&
       (input.hostAttempt ?? OPENAI_HOST_RETRY_LIMIT) <
         OPENAI_HOST_RETRY_LIMIT &&
@@ -1581,6 +1624,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       if (decision?.action === 'retain')
         wakeAccount = previous.account.accountId
     }
+    const resetUnavailable = new Set<string>()
+    if (resetWake?.checkpoint) {
+      const key = resetWake.checkpoint.accountKey
+      for (const target of targets) resetUnavailable.add(target.id)
+      for (const candidate of candidates) {
+        if (!candidate.ready) continue
+        if (candidate.account.accountId === key.accountId) {
+          if (!sameAccount(candidate.account, key) || at < resetWake.target)
+            continue
+          wakeAccount = key.accountId
+        }
+        resetUnavailable.delete(candidate.account.accountId)
+      }
+    }
     const excluded = new Set<string>(
       input.rerouteFrom ? [input.rerouteFrom.accountId] : [],
     )
@@ -1612,7 +1669,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     try {
       while (!placementBlocked) {
-        const skip = new Set([...excluded, ...refused])
+        const skip = new Set([...excluded, ...refused, ...resetUnavailable])
         accountId = undefined
         admissionTiers?.clear()
         plannedPin = undefined
@@ -1681,6 +1738,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         )
         accountId ??= continued
         if (accountId === undefined || refused.has(accountId)) {
+          if (resetWake) break
           // With no alternative, keep the refused account for the host's own
           // delayed retry. common-auth's OpenCode 2 installer consumes this choice
           // without asking the adapter to choose twice.
@@ -1796,6 +1854,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         accountId === undefined &&
         vaultMode &&
         vault &&
+        !resetWake &&
         (targets.length === 0 || refused.size > 0)
       ) {
         const cause: VaultModeRefusal =
@@ -1848,17 +1907,18 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       if (
         accountId === undefined &&
         input.phase === 'request' &&
-        candidates.length > 0 &&
-        candidates.every((candidate) => !candidate.admitted) &&
-        candidates.some(
-          (candidate) =>
-            routing.killswitch.get(candidate.account.accountId) === false ||
-            candidate.confirmedBlockers?.length,
-        )
+        (resetWake ||
+          (candidates.length > 0 &&
+            candidates.every((candidate) => !candidate.admitted) &&
+            candidates.some(
+              (candidate) =>
+                routing.killswitch.get(candidate.account.accountId) === false ||
+                candidate.confirmedBlockers?.length,
+            )))
       ) {
         const decision = decideOpenAiTerminal(
           { ...facts, now: at, clockNow: at, candidates },
-          terminalFacts(),
+          terminalFacts(setting, waitForReset),
         )
         const wire = buildOpenAiQuotaRefusal({
           decision,

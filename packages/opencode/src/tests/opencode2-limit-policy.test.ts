@@ -252,6 +252,77 @@ function fixture(
 }
 
 describe('OpenCode 2 shared limit policy', () => {
+  test.each([
+    { scenario: 'cross-account wake', select: 'b' },
+    { scenario: 'alternate ready on wake', select: 'a' },
+    { scenario: 'none ready on wake', select: undefined },
+  ])('wait_for_reset OC2: $scenario', async ({ select }) => {
+    const f = fixture(['a', 'b'], 0)
+    Object.assign(f.storage, { waitForReset: true })
+    f.mark('b', 7_200_123)
+    const choice = await f.retry(10_800_000)
+    // B frees first: ceil(7,200.123s) plus 17s of jitter for "ses_1".
+    expect(choice).toEqual({
+      hold: {
+        kind: 'terminal',
+        delayMs: 7_218_000,
+        target: T0 + 7_218_000,
+        checkpoint: {
+          accountKey: f.accountKey('b'),
+          decidedAt: T0,
+          blockers: [{ window: 'account', resetAt: T0 + 7_200_123 }],
+        },
+      },
+    })
+    if (!choice || typeof choice === 'string' || !('hold' in choice))
+      throw new Error('expected terminal hold')
+    f.tick(7_218_000)
+    if (select !== 'b') f.mark('b', 12_000_000)
+    if (select !== 'a') f.mark('a', 10_800_000)
+    const result = f.openai.adapter.chooseAccount(
+      f.input({
+        phase: 'request',
+        wake: { ...choice.hold, target: choice.hold.target! },
+      }),
+    )
+    if (select) expect(await result).toBe(select)
+    else
+      await expect(result).rejects.toThrow(
+        'Every OpenAI account is paused by OpenAI for now.',
+      )
+  })
+
+  test.each([
+    { scenario: 'title', enabled: true, kind: 'title', routing: false },
+    {
+      scenario: 'routing active',
+      enabled: true,
+      kind: 'primary',
+      routing: true,
+    },
+    { scenario: 'disabled', enabled: false, kind: 'primary', routing: false },
+  ] as const)(
+    'wait_for_reset OC2 does not override off: $scenario',
+    async ({ enabled, kind, routing }) => {
+      if (routing) recordWaits()
+      const f = fixture(['a', 'b'], 0)
+      Object.assign(f.storage, { waitForReset: enabled })
+      f.mark('b', 7_200_123)
+      expect(await f.retry(10_800_000, { kind })).toEqual({ hostRetry: 'veto' })
+    },
+  )
+
+  test('wait_for_reset OC2 single account waits only with a host retry left', async () => {
+    const f = fixture(['a'], 0)
+    Object.assign(f.storage, { waitForReset: true })
+    expect(await f.retry(7_200_000, { hostAttempt: 10 })).not.toHaveProperty(
+      'hold',
+    )
+    expect(await f.retry(7_200_000)).toMatchObject({
+      hold: { kind: 'terminal', delayMs: 7_217_000 },
+    })
+  })
+
   test.each(['hold', 'terminal'] as const)(
     '%s wait reports start and checkpoint wake end',
     async (kind) => {

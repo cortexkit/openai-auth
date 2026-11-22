@@ -613,6 +613,65 @@ describe('OC1 all-blockers hold bounds', () => {
 })
 
 describe('OC1 pre-send terminal wire', () => {
+  test.each([
+    {
+      scenario: 'primary',
+      enabled: true,
+      primary: true,
+      routing: false,
+      status: 429,
+      retryAfter: '10808',
+    },
+    {
+      scenario: 'title',
+      enabled: true,
+      primary: false,
+      routing: false,
+      status: 412,
+      retryAfter: null,
+    },
+    {
+      scenario: 'routing active',
+      enabled: true,
+      primary: true,
+      routing: true,
+      status: 412,
+      retryAfter: null,
+    },
+    {
+      scenario: 'disabled',
+      enabled: false,
+      primary: true,
+      routing: false,
+      status: 412,
+      retryAfter: null,
+    },
+  ])(
+    'wait_for_reset OC1 wire: $scenario',
+    async ({ enabled, primary, routing, status, retryAfter }) => {
+      const f = fixture()
+      f.ctx.primary = primary
+      f.ctx.waitForReset = enabled
+      f.ctx.storage!.routing!.maxSameAccountWait = 0
+      f.ctx.storage!.killswitch = { enabled: true }
+      // B frees first: 3h and a fraction, rounded up, plus 7s for "session".
+      f.rows[0]!.quota = quota(100, T0 + 2 * 3600_000, T0, T0 + 4 * 86_400_000)
+      f.rows[1]!.quota = quota(100, T0 + 3 * 3600_000 + 123)
+      const key = Symbol.for('cortexkit.routing')
+      const original = Object.getOwnPropertyDescriptor(globalThis, key)
+      if (routing) Reflect.set(globalThis, key, () => ({}))
+      try {
+        const response = (await f.serve()).response
+        expect(response.status).toBe(status)
+        expect(response.headers.get('retry-after')).toBe(retryAfter)
+        expect(f.sent).toEqual([])
+      } finally {
+        if (original) Object.defineProperty(globalThis, key, original)
+        else Reflect.deleteProperty(globalThis, key)
+      }
+    },
+  )
+
   test('fresh provider mark uses the pinned 90-second retry and rounded reset text', async () => {
     const f = fixture('main-first', 1)
     f.marks.set('main', T0 + 90_000)

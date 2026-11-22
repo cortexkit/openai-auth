@@ -27,6 +27,7 @@ describe('settings declaration', () => {
     ).toEqual({
       routing_mode: 'main-first',
       max_same_account_wait: '15m',
+      wait_for_reset: false,
       fallback_on: [401, 403, 429],
       refresh_enabled: true,
       refresh_before_expiry_minutes: 240,
@@ -65,6 +66,7 @@ describe('settings declaration', () => {
     const both = [
       'routing_mode',
       'max_same_account_wait',
+      'wait_for_reset',
       'fallback_on',
       'refresh_before_expiry_minutes',
       'quota_enabled',
@@ -85,6 +87,7 @@ describe('settings declaration', () => {
     const readers = {
       routing_mode: 'OpenCode 1, OpenCode 2 and Pi',
       max_same_account_wait: 'OpenCode 1, OpenCode 2 and Pi',
+      wait_for_reset: 'OpenCode 1, OpenCode 2 and Pi',
       fallback_on: 'OpenCode 1 and Pi; not read by OpenCode 2',
       refresh_enabled: 'OpenCode 1 legacy fallback refresh only',
       refresh_before_expiry_minutes: 'OpenCode 1, OpenCode 2 and Pi',

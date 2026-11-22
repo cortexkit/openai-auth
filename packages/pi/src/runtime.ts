@@ -133,6 +133,7 @@ type StreamSimple = (
 ) => AssistantMessageEventStream
 
 type RefreshAllQuotaResults = RefreshAllQuotaResult[]
+type PiRequestSettings = AccountStorage & { waitForReset?: boolean }
 
 export interface PiOpenAIRuntimeDeps {
   /** Sends one attempt of a request: pi-ai's Codex stream. */
@@ -143,7 +144,7 @@ export interface PiOpenAIRuntimeDeps {
   installWebSocket?: () => () => void
   paths?: () => AccountPaths
   /** Shared with the menu when startup chose shared preferences; omitted while the account config remains authoritative. */
-  settings?: { view(store?: AccountStorage | null): AccountStorage }
+  settings?: { view(store?: AccountStorage | null): PiRequestSettings }
   /** Used for quota polls and token refreshes; read at call time by default. */
   fetchImpl?: typeof fetch
   now?: () => number
@@ -482,7 +483,7 @@ export class PiOpenAIRuntime {
   }
 
   /** Memory only; a settings view never decides whether an account store exists. */
-  private settings(storage: AccountStorage | null): AccountStorage | null {
+  private settings(storage: AccountStorage | null): PiRequestSettings | null {
     // Without a shared snapshot the store itself is the settings, exactly as
     // before, including null for a missing store.
     return this.deps.settings ? this.deps.settings.view(storage) : storage
@@ -730,7 +731,11 @@ export class PiOpenAIRuntime {
           if (options?.signal?.aborted) return
           if (attempt.kind === 'policy') {
             const decision = attempt.decision
-            if (decision.action === 'refuse' || waited || !setWorkingMessage) {
+            if (
+              decision.action === 'refuse' ||
+              waited ||
+              (!setWorkingMessage && decision.waitKind !== 'terminal')
+            ) {
               const refusal = buildOpenAiQuotaRefusal({
                 decision,
                 host: 'pi',
@@ -760,13 +765,13 @@ export class PiOpenAIRuntime {
                 decision.delayMs,
                 {
                   signal: options?.signal,
-                  setWorkingMessage,
+                  setWorkingMessage: setWorkingMessage ?? (() => {}),
                 },
               )
             } finally {
               // A failed wait helper must not leave Pi's working indicator behind.
               try {
-                setWorkingMessage()
+                setWorkingMessage?.()
               } catch {}
             }
             if (result === 'aborted' || options?.signal?.aborted) {
@@ -878,6 +883,7 @@ export class PiOpenAIRuntime {
         limitPolicy: {
           execute: true,
           canWait: execution.canWait,
+          waitForReset: settings?.waitForReset,
           wake: execution.wake,
           effectiveModel: model.id,
           activity: () =>

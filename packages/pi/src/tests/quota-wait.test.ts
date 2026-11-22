@@ -1,14 +1,24 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { LimitDecision, PolicyFacts } from '@cortexkit/common-auth/limits'
+import {
+  type LimitDecision,
+  type PolicyFacts,
+  waitForPi,
+} from '@cortexkit/common-auth/limits'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openSettings } from '@cortexkit/common-auth/settings'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   mutateAccounts,
 } from '@cortexkit/openai-auth-core/internal'
+import { openaiSettings } from '@cortexkit/openai-auth-core/settings-definition'
+import {
+  createSettingsSnapshot,
+  type SettingsSnapshot,
+} from '@cortexkit/openai-auth-core/settings-snapshot'
 import {
   type Api,
   type AssistantMessageEvent,
@@ -66,6 +76,7 @@ let reply: (token: string) => Response
 let runtime: PiOpenAIRuntime
 let messages: Array<string | undefined>
 let decisions: Array<{ decision: LimitDecision; facts: PolicyFacts }>
+let settings: SettingsSnapshot | undefined
 const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input)
   const token =
@@ -118,8 +129,31 @@ afterEach(async () => {
   else Reflect.deleteProperty(globalThis, routingKey)
   await runtime?.pool.dispose()
   await runtime?.vault.dispose()
+  settings?.dispose()
+  settings = undefined
   rmSync(dir, { recursive: true, force: true })
 })
+
+async function resetWaitSettings(enabled: boolean) {
+  const file = join(dir, 'settings.jsonc')
+  writeFileSync(
+    file,
+    JSON.stringify({
+      wait_for_reset: { default: false, pi: enabled },
+      max_same_account_wait: 'off',
+    }),
+  )
+  settings = await createSettingsSnapshot({
+    handle: openSettings(openaiSettings, {
+      file,
+      separateInstall: false,
+      log: { info() {}, warn() {} },
+    }),
+    host: 'pi',
+    file,
+  })
+  return settings
+}
 
 async function start(overrides: Partial<PiOpenAIRuntimeDeps> = {}, ui = true) {
   runtime = new PiOpenAIRuntime({
@@ -206,6 +240,66 @@ async function addB() {
 }
 
 describe('Pi bounded quota waits', () => {
+  test.each([
+    {
+      scenario: 'headless opt-in',
+      enabled: true,
+      routing: false,
+      waits: [7_216_000],
+    },
+    { scenario: 'routing active', enabled: true, routing: true, waits: [] },
+    { scenario: 'disabled', enabled: false, routing: false, waits: [] },
+  ])('wait_for_reset Pi: $scenario', async ({ enabled, routing, waits }) => {
+    if (routing) Reflect.set(globalThis, routingKey, () => ({}))
+    reset = T0 + 7_200_000
+    const observed: number[] = []
+    await start(
+      {
+        settings: await resetWaitSettings(enabled),
+        waitForPi: async (delay) => {
+          observed.push(delay)
+          now += delay
+          // A fresh reading confirms the account is still exhausted after waking.
+          reset = now + 3_600_000
+          await runtime.main.pollNow()
+          return 'elapsed'
+        },
+      },
+      false,
+    )
+    limit()
+    expect(text(await send({ sessionId: 'reset-session' }))).toContain(
+      'Every OpenAI account has used up its quota.',
+    )
+    expect(observed).toEqual([...waits])
+    expect(sends).toEqual([MAIN])
+    if (waits.length) expect(decisions.at(-1)?.decision.action).toBe('refuse')
+  })
+
+  test('wait_for_reset Pi headless abort cancels the actual wait', async () => {
+    const controller = new AbortController()
+    const waits: number[] = []
+    reset = T0 + 7_200_000
+    await start(
+      {
+        settings: await resetWaitSettings(true),
+        waitForPi: (delay, options) => {
+          waits.push(delay)
+          const pending = waitForPi(delay, options)
+          controller.abort()
+          return pending
+        },
+      },
+      false,
+    )
+    limit()
+    expect(
+      await send({ sessionId: 'reset-session', signal: controller.signal }),
+    ).toEqual([])
+    expect(waits).toEqual([7_216_000])
+    expect(sends).toEqual([MAIN])
+  })
+
   test.each(['no accessor', 'short wait'])(
     'countdown %s creates no wait report id',
     async (scenario) => {
