@@ -146,6 +146,8 @@ test.each([
         modelId: 'gpt-5.5',
         hold_wait_max_s: 0,
         refusals: true,
+        waits_for_capacity: true,
+        request_id: expect.any(String),
         warm_credential: 'credential-b',
         candidates: {
           view_digest: expect.any(String),
@@ -175,6 +177,10 @@ test.each([
 
 function accountAsks(env: Awaited<ReturnType<typeof placementRequest>>) {
   return env.accountFor.mock.calls.map(([ask]) => ask)
+}
+
+function placementId(ask: unknown): string | undefined {
+  return (ask as { request_id?: string } | undefined)?.request_id
 }
 
 test('turn placement: refusal on turn two sends nothing and keeps the recorded account', async () => {
@@ -361,8 +367,12 @@ test.each(['primary', 'title', 'compaction', 'generate'] as const)(
       }
       expect(first.candidates.accounts).toHaveLength(2)
       expect(first).not.toHaveProperty('mode')
+      expect(placementId(env.accountFor.mock.calls[1]?.[0])).not.toBe(
+        placementId(first),
+      )
       expect(env.accountFor.mock.calls[1]?.[0]).toEqual({
         ...first,
+        request_id: expect.any(String),
         candidates: {
           view_digest: expect.any(String),
           accounts: [
@@ -476,6 +486,109 @@ test('aborting the HTTP request during the first placement wait stops before ano
   }
 })
 
+test('capacity placement re-asks with the same id, reports account_free, and uses a fresh id next turn', async () => {
+  const start = Date.now()
+  let now = start
+  const report = mock((_payload: Record<string, unknown>) => {})
+  const env = await placementRequest(
+    [
+      { refused: { code: 'concurrency_full', resets_at_ms: start + 6000 } },
+      { account_id: 'account-b' },
+      { account_id: 'account-a' },
+    ],
+    { now: () => now, report },
+  )
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    expect(wait.delay).toBe(6000)
+    expect(env.accountFor).toHaveBeenCalledTimes(1)
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+    const firstId = placementId(accountAsks(env)[0])
+    expect(typeof firstId).toBe('string')
+    expect(accountAsks(env)[0]).toHaveProperty('waits_for_capacity', true)
+    expect(report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'wait',
+        phase: 'start',
+        reason: 'account_free',
+        next_ms: start + 6000,
+        wait_id: expect.any(String),
+      }),
+    )
+    now += wait.delay
+    wait.wake()
+    expect(await sent).toBe('Bearer vault:b-token')
+    const waits = report.mock.calls
+      .map(([payload]) => payload)
+      .filter((value) => value.kind === 'wait')
+    expect(waits).toHaveLength(2)
+    expect(waits[1]).toEqual({ ...waits[0], phase: 'end', outcome: 'resumed' })
+    expect(accountAsks(env)[1]).toEqual(accountAsks(env)[0])
+    env.openai.beginTurn(env.request.sessionID)
+    expect(await env.send()).toBe('Bearer vault:a-token')
+    const nextId = placementId(accountAsks(env)[2])
+    expect(typeof nextId).toBe('string')
+    expect(nextId).not.toBe(firstId)
+  } finally {
+    await env.dispose()
+  }
+})
+
+test('capacity placement stops and reports cancellation on HTTP abort', async () => {
+  const now = Date.now()
+  const report = mock((_payload: Record<string, unknown>) => {})
+  const env = await placementRequest(
+    [{ refused: { code: 'concurrency_full', resets_at_ms: now + 6000 } }],
+    { now: () => now, report },
+  )
+  try {
+    const sent = env.send()
+    await env.waitBeforeSend(sent)
+    env.controller.abort()
+    await expect(sent).rejects.toHaveProperty('name', 'AbortError')
+    expect(report).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'wait',
+        phase: 'end',
+        reason: 'account_free',
+        outcome: 'cancelled',
+      }),
+    )
+    expect(env.accountFor).toHaveBeenCalledTimes(1)
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+  } finally {
+    await env.dispose()
+  }
+})
+
+test('capacity placement does not use a credential that changed while waiting', async () => {
+  const now = Date.now()
+  const env = await placementRequest(
+    [
+      { refused: { code: 'concurrency_full', resets_at_ms: now + 6000 } },
+      { account_id: 'account-b' },
+    ],
+    { now: () => now },
+  )
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    env.routes[1]!.credentialId = 'replacement'
+    wait.wake()
+    await expect(sent).rejects.toMatchObject({
+      kind: 'no-account',
+      message: VAULT_MODE_REFUSALS['vault-refused'],
+    })
+    expect(env.authorized).toEqual([])
+    expect(env.providerFetch).not.toHaveBeenCalled()
+  } finally {
+    await env.dispose()
+  }
+})
+
 test('OpenCode 2 follows its recorded ordered account without asking again', async () => {
   const calls: unknown[] = []
   Reflect.set(globalThis, key, () => ({
@@ -493,6 +606,8 @@ test('OpenCode 2 follows its recorded ordered account without asking again', asy
       modelId: 'gpt-6',
       hold_wait_max_s: 0,
       refusals: true,
+      waits_for_capacity: true,
+      request_id: expect.any(String),
       candidates: {
         view_digest: expect.any(String),
         accounts: [
@@ -519,6 +634,8 @@ test('OpenCode 2 cold sticky choice does not hint a provisional pin', async () =
       modelId: 'gpt-6',
       hold_wait_max_s: 0,
       refusals: true,
+      waits_for_capacity: true,
+      request_id: expect.any(String),
       candidates: expect.objectContaining({ view_digest: expect.any(String) }),
     },
   ])

@@ -2,6 +2,7 @@ import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   type AskRoutingInput,
   askRouting,
+  askRoutingUntilCapacity,
   type RoutingRefusal,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
@@ -122,6 +123,7 @@ export async function chooseVaultRouting(input: {
   continuation?: { previousId: string; exhausted: VaultRoutingExhausted }
   wait?: RoutingWaitInput
   warmAccountId?: string
+  capacityWait?: Parameters<typeof askRoutingUntilCapacity>[1]
 }): Promise<string | RoutingRefusal | { holdMs: number } | undefined> {
   const { request, sessionId, continuation } = input
   if (
@@ -196,7 +198,12 @@ export async function chooseVaultRouting(input: {
         exhausted: continuation.exhausted,
         requestId: crypto.randomUUID(),
       })
-    : await askRouting(ask)
+    : input.capacityWait
+      ? await askRoutingUntilCapacity(
+          { ...ask, requestId: crypto.randomUUID() },
+          input.capacityWait,
+        )
+      : await askRouting(ask)
   if (!answer || 'refused' in answer) return answer
   if (answer.candidate.id !== continuation?.previousId)
     return answer.candidate.id

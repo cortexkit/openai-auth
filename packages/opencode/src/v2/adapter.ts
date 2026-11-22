@@ -1134,6 +1134,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             break
           }
           const activity = limits?.activity.get(input.sessionID)
+          let capacityWaited = false
           const answer = await chooseVaultRouting({
             vaultMode,
             fresh: true,
@@ -1148,7 +1149,49 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 activity && limits?.accountKey(activity.accountKey.accountId),
               maxSameAccountWait: storage?.routing?.maxSameAccountWait,
             },
+            capacityWait: {
+              signal: input.signal,
+              now,
+              sleep: async (delayMs, signal) => {
+                capacityWaited = true
+                const end = startWait(input, 'account_free', now(), delayMs)
+                try {
+                  // Platform timers fire early on delays longer than 2^31-1 ms.
+                  let remaining = delayMs
+                  do {
+                    const next = Math.min(2_147_483_647, remaining)
+                    await waitForRoutingRetry(next, signal)
+                    remaining -= next
+                  } while (remaining > 0)
+                  end?.('resumed')
+                } catch (error) {
+                  end?.(signal?.aborted ? 'cancelled' : 'abandoned')
+                  throw error
+                }
+              },
+            },
           })
+          if (capacityWaited) {
+            at = now()
+            targets = currentTargets(storage, at, vaultMode)
+            if (typeof answer === 'string') {
+              // A route offered before a capacity wait may no longer be eligible.
+              const offered = eligible.find((route) => route.id === answer)
+              const live = vault?.routes().find((route) => route.id === answer)
+              if (
+                !offered ||
+                !live ||
+                live.identity !== offered.identity ||
+                live.credentialId !== offered.credentialId ||
+                poolKillswitchVerdicts([live], floorSettings, at).get(
+                  answer,
+                ) === false
+              )
+                throw vaultRefusal()
+              routedTarget = { ...live, quota: live.quota }
+              break
+            }
+          }
           if (typeof answer === 'string') account = answer
           else if (answer) {
             const delayMs = !retried
