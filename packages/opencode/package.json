@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
-  "version": "1.20.2",
+  "version": "1.20.3",
   "license": "MIT",
   "type": "module",
   "repository": {
