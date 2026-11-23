@@ -1,4 +1,5 @@
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
+import { RESPONSES_LITE_HEADER } from './codex-lite'
+import { isRecord } from './util/record'
 
 // Codex marks Responses Lite per transport. WebSocket requests carry a
 // request-scoped client_metadata key; HTTP requests carry a header instead.
@@ -50,7 +51,7 @@ export function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
   headers.set('accept', 'text/event-stream')
   headers.set('content-type', 'application/json')
   if (hasWebSocketResponsesLiteMetadata(init.body)) {
-    headers.set('x-openai-internal-codex-responses-lite', 'true')
+    headers.set(RESPONSES_LITE_HEADER, 'true')
   }
   return {
     ...init,

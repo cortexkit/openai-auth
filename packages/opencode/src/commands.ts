@@ -42,6 +42,8 @@ import {
   type AccountPaths,
   type beginAccountLogin,
   cacheKeepSettings,
+  formatDumpBytes,
+  getDumpDirectorySize,
   type loadAccounts,
   type OpenAiVault,
   type QuotaManager,
@@ -61,7 +63,6 @@ import type { SettingsSnapshot } from '@cortexkit/openai-auth-core/settings-snap
 import { getSettings, isRequestDumpEnabled, refreshSettings } from './config'
 import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
 import { legacyRefreshLocks } from './core/pool-migration'
-import { formatDumpBytes, getDumpDirectorySize } from './dump-size'
 import { createLogger } from './logger'
 import { pushNotification } from './rpc/notifications'
 

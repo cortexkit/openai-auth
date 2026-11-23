@@ -1,5 +1,5 @@
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from './logger'
+import { isRecord } from './util/record'
 
 const log = createLogger('transport')
 
@@ -16,7 +16,7 @@ function category(value: unknown): string {
 export function logInputTransformations(
   response: unknown,
   transport: 'http' | 'websocket',
-  host: 'opencode1' | 'opencode2',
+  host: 'opencode1' | 'opencode2' | 'pi',
 ): boolean {
   if (!isRecord(response)) return false
   const transformations = response.input_transformations

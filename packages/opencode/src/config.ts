@@ -11,7 +11,13 @@
 import { readFileSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import {
+  type AccountStorage,
+  DEFAULT_DUMP_MAX_BYTES,
+  parseBooleanOverride,
+  resolveCodexEndpoint,
+  resolveResponsesLite,
+} from '@cortexkit/openai-auth-core/internal'
 import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
 import { settingsIdentity } from '@cortexkit/openai-auth-core/settings-install'
 import {
@@ -21,9 +27,10 @@ import {
 } from '@cortexkit/openai-auth-core/settings-snapshot'
 import { createLogger } from './logger'
 
-export const DEFAULT_CODEX_API_ENDPOINT =
-  'https://chatgpt.com/backend-api/codex/responses'
-export const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
+export {
+  DEFAULT_CODEX_API_ENDPOINT,
+  DEFAULT_DUMP_MAX_BYTES,
+} from '@cortexkit/openai-auth-core/internal'
 
 const log = createLogger('config')
 let warnedDumpMaxBytes = false
@@ -61,11 +68,9 @@ const CONFIG_FILE_NAME = 'openai-auth.json'
 const ENV = {
   webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
-  responsesLite: 'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
   dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
   dumpMaxBytes: 'OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES',
-  codexApiEndpoint: 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
   stateFile: 'OPENCODE_OPENAI_AUTH_STATE_FILE',
   configDir: 'OPENCODE_CONFIG_DIR',
@@ -190,27 +195,13 @@ function settingsConfig(configPath: string): OpenAIAuthConfig {
   return sharedSnapshot(configPath)?.view() ?? unreadSettingsView('opencode')
 }
 
-/** Parse an env var as a boolean. undefined => not set (defer to config). */
-function envBool(name: string): boolean | undefined {
-  const raw = process.env[name]
-  if (raw === undefined) return undefined
-  const v = raw.trim().toLowerCase()
-  if (v === '1' || v === 'true' || v === 'yes' || v === 'on') {
-    return true
-  }
-  if (v === '' || v === '0' || v === 'false' || v === 'no' || v === 'off') {
-    return false
-  }
-  return undefined
-}
-
 /** env (if explicitly set) overrides config (if set) overrides default. */
 function resolveBool(
   envName: string,
   configValue: boolean | undefined,
   def: boolean,
 ): boolean {
-  const fromEnv = envBool(envName)
+  const fromEnv = parseBooleanOverride(process.env[envName])
   if (fromEnv !== undefined) return fromEnv
   if (typeof configValue === 'boolean') return configValue
   return def
@@ -251,7 +242,7 @@ let dumpCache:
 
 /** Observe other processes' dump toggles without rereading unchanged config files. */
 export function isRequestDumpEnabled(configPath = getConfigPath()): boolean {
-  const override = envBool(ENV.dump)
+  const override = parseBooleanOverride(process.env[ENV.dump])
   if (override !== undefined) return override
   if (getSettingsDecision(configPath) === 'shared')
     return resolveBool(
@@ -294,7 +285,7 @@ function resolve(configPath: string): ResolvedSettings {
   return {
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
-    responsesLite: resolveBool(ENV.responsesLite, config.responsesLite, false),
+    responsesLite: resolveResponsesLite(config.responsesLite),
     dump: resolveBool(ENV.dump, configDumpEnabled(config), false),
     dumpDir:
       process.env[ENV.dumpDir]?.trim() ||
@@ -302,12 +293,7 @@ function resolve(configPath: string): ResolvedSettings {
         ? config.dumpDir.trim()
         : join(tmpdir(), 'opencode-openai-auth-dumps')),
     dumpMaxBytes: resolveDumpMaxBytes(config.dumpMaxBytes),
-    codexApiEndpoint:
-      process.env[ENV.codexApiEndpoint]?.trim() ||
-      (typeof config.codexApiEndpoint === 'string' &&
-      config.codexApiEndpoint.trim()
-        ? config.codexApiEndpoint.trim()
-        : DEFAULT_CODEX_API_ENDPOINT),
+    codexApiEndpoint: resolveCodexEndpoint(config.codexApiEndpoint),
   }
 }
 

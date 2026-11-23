@@ -2,9 +2,9 @@ import { Buffer } from 'node:buffer'
 import { resolve } from 'node:path'
 import {
   type AccountPaths,
+  CACHE_KEEP_CAPS,
   shouldCaptureSessionCache,
 } from '@cortexkit/openai-auth-core/internal'
-import { CACHE_KEEP_CAPS } from '../core/cachekeep'
 
 /** A completed conversation, ready for the HTTP replay adapter to capture. */
 export interface FrameMirrorCapture {

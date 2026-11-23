@@ -15,18 +15,26 @@ import {
 import { writeSettings } from '@cortexkit/openai-auth-core'
 import {
   type AccountStorage,
+  acquireBackgroundRefreshLock,
   acquireRefreshFileLock,
+  BackgroundQuotaRefresh,
   beginAccountLogin,
   buildRefreshOperationError,
   buildUserAgent,
+  type CodexSessionMetadata,
   cacheKeepSettings,
+  codexOAuthModelLimit,
+  codexOAuthModelListed,
+  codexOAuthModelVariantSource,
   codexRefreshFn,
+  createCacheKeepManager,
   errorMessage,
   extractAccountId,
   extractAccountIdFromClaims,
   type FallbackAccount,
   FallbackAccountManager,
   formatRefreshBackoffMessage,
+  getCacheKeepWindow,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
   isCompleteQuotaHeaderFrame,
@@ -46,12 +54,15 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  OPENAI_AGENT_HEADER,
+  type OpenAICacheKeepManager,
   type OpenAiLimitsOwner,
   type OpenAiLimitsRequest,
   type OpenAiVault,
   openAiRateLimitCommand,
   parseJwtClaims,
   poolLimitsNamespace,
+  prepareCodexRequest,
   type QuotaEntry,
   QuotaManager,
   type RefreshAllQuotaResult,
@@ -61,6 +72,8 @@ import {
   redactCredentialResponse,
   refreshAllQuota,
   refreshBackoffActive,
+  refreshPoolInBackground,
+  refreshQuotaInBackground,
   reportSessionCacheResponse,
   resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
@@ -69,6 +82,7 @@ import {
   type TokenResponse,
   TombstoneRefreshError,
   ttlForModel,
+  uuidV7,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
   vaultStateDir,
@@ -82,20 +96,7 @@ import type {
   PluginInput,
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
-import {
-  applyMidConversationEffort,
-  rewriteResponsesLiteBody,
-} from './codex-effort'
-import {
-  codexOAuthModelLimit,
-  codexOAuthModelListed,
-  codexOAuthModelVariantSource,
-} from './codex-models'
-import {
-  type CodexSessionMetadata,
-  OPENAI_AGENT_HEADER,
-  prepareCodexRequest,
-} from './codex-request'
+import { applyMidConversationEffort } from './codex-effort'
 import {
   codexSessionsSettled,
   loadCodexSessions,
@@ -115,19 +116,7 @@ import {
   registerSettingsSnapshot,
 } from './config'
 import { getAccountPaths, getCodexSessionsPath } from './core/account-paths'
-import {
-  acquireBackgroundRefreshLock,
-  BackgroundQuotaRefresh,
-  refreshPoolInBackground,
-  refreshQuotaInBackground,
-} from './core/background-quota-refresh'
-import {
-  buildKeepwarmCapture,
-  createCacheKeepManager,
-  getCacheKeepWindow,
-  type OpenAICacheKeepManager,
-  routedAccountForSession,
-} from './core/cachekeep'
+import { buildKeepwarmCapture, routedAccountForSession } from './core/cachekeep'
 import { createCurrentStorageReader } from './core/current-storage'
 import {
   classifyMainAuthSlot,
@@ -208,7 +197,7 @@ export {
   CODEX_USER_AGENT,
   CODEX_VERSION,
   RESPONSES_LITE_MODELS,
-} from './codex-request'
+} from '@cortexkit/openai-auth-core/internal'
 
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
@@ -259,19 +248,18 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
 import { observeHttpCompletion } from './ws'
 import { OpenAIWebSocketPool } from './ws-pool'
 
-export { rewriteResponsesLiteBody } from './codex-effort'
 export {
   ALLOWED_MODELS,
   codexOAuthModelLimit,
   codexOAuthModelListed,
   codexOAuthModelVariantSource,
   DISALLOWED_MODELS,
-} from './codex-models'
+  rewriteResponsesLiteBody,
+} from '@cortexkit/openai-auth-core/internal'
 export {
   AuthPersistError,
   buildResetRedemptionDeps,
@@ -2680,7 +2668,6 @@ export async function CodexAuthPlugin(
               ? new URL(codexApiEndpoint)
               : parsed
           const prepared = prepareCodexRequest({
-            rewriteLite: rewriteResponsesLiteBody,
             applyEffort: applyMidConversationEffort,
             init: {
               ...init,

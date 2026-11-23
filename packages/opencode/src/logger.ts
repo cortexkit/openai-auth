@@ -1,11 +1,8 @@
 /**
  * OpenCode's log destination.
  *
- * The logger itself lives in the shared core so both hosts get the same
- * redaction rules. What stays here is the part that is specific to this host:
- * which file the lines go to, which level floor applies, and when the buffer is
- * drained at process exit. Those are the only three things that read this
- * host's environment variables, and the core reads none.
+ * Core handles redaction and shutdown. OpenCode chooses the log file and
+ * environment level floor.
  *
  * The init runs at module load rather than from one call site because every
  * entry point in this package — the plugin loader, the RPC server, the separate
@@ -17,13 +14,13 @@
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  flushLogs,
-  initLogger,
   type Level,
-  setLogLevel,
+  parseLogLevel,
+  setupLogger,
 } from '@cortexkit/openai-auth-core/tui-support'
 
 export {
+  applySettingsLogLevel,
   createLogger,
   flushForTest,
   flushLogs,
@@ -32,8 +29,6 @@ export {
   redactStrings,
   setLogLevel,
 } from '@cortexkit/openai-auth-core/tui-support'
-
-const LEVELS: readonly Level[] = ['error', 'warn', 'info', 'debug', 'trace']
 
 export function getLogFile(): string {
   return (
@@ -45,39 +40,7 @@ export function getLogFile(): string {
 }
 
 export function getEnvLogLevel(): Level | undefined {
-  const env = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL as Level | undefined
-  return env && LEVELS.includes(env) ? env : undefined
+  return parseLogLevel(process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL)
 }
 
-/**
- * An absent saved level leaves the logger alone at startup. A later settings
- * refresh must instead remove any saved/menu override, including one installed
- * through setLogLevel: reinitialising the logger would leave that override set.
- */
-export function applySettingsLogLevel(
-  level: Level | 'default',
-  phase: 'startup' | 'refresh',
-): void {
-  if (level !== 'default') setLogLevel(level)
-  else if (phase === 'refresh') setLogLevel(undefined)
-}
-
-initLogger({ file: getLogFile, level: getEnvLogLevel })
-
-// Under `bun test` the buffer is drained explicitly by the tests that assert on
-// it, and registering process-wide shutdown handlers per test file is noise.
-if (process.env.NODE_ENV !== 'test') {
-  // Windows drains through async private-file IO, which cannot finish in `exit`.
-  // Run once so closing the sink does not repeatedly re-arm `beforeExit`.
-  process.once('beforeExit', async () => {
-    try {
-      await flushLogs()
-    } catch {
-      process.emitWarning(
-        'OpenAI auth could not flush its log file at shutdown',
-      )
-    }
-  })
-  // POSIX flushing is synchronous, so explicit process.exit() can still drain it.
-  if (process.platform !== 'win32') process.on('exit', () => flushLogs())
-}
+setupLogger({ file: getLogFile, level: getEnvLogLevel })

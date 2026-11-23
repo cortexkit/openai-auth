@@ -4,11 +4,11 @@
 import {
   errorMessage,
   isRecord,
+  logInputTransformations,
   normalizeWsFrame,
 } from '@cortexkit/openai-auth-core/internal'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from './dump'
-import { logInputTransformations } from './input-transformations'
 import { createLogger } from './logger'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'

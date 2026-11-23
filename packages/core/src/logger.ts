@@ -12,6 +12,9 @@ import {
   type InitLoggerOptions as CommonInitLoggerOptions,
   initLogger as commonInitLogger,
   createRedactor,
+  flushLogs,
+  type Level,
+  setLogLevel,
 } from '@cortexkit/common-auth/logger'
 
 export {
@@ -59,4 +62,43 @@ export type InitLoggerOptions = Pick<CommonInitLoggerOptions, 'file' | 'level'>
  */
 export function initLogger(options: InitLoggerOptions): void {
   commonInitLogger({ ...options, extraSecretKeys: isOpenaiIdentityKey })
+}
+
+const LEVELS: readonly Level[] = ['error', 'warn', 'info', 'debug', 'trace']
+
+export function parseLogLevel(value: string | undefined): Level | undefined {
+  const level = value as Level | undefined
+  return level && LEVELS.includes(level) ? level : undefined
+}
+
+/** A refresh back to defaults clears the override; an absent startup level does not. */
+export function applySettingsLogLevel(
+  level: Level | 'default',
+  phase: 'startup' | 'refresh',
+): void {
+  if (level !== 'default') setLogLevel(level)
+  else if (phase === 'refresh') setLogLevel(undefined)
+}
+
+let shutdownHookInstalled = false
+
+/** Initialize a host's log destination and arrange for buffered writes to drain. */
+export function setupLogger(options: InitLoggerOptions): void {
+  initLogger(options)
+  // Tests that assert on the log drain it explicitly.
+  if (shutdownHookInstalled || process.env.NODE_ENV === 'test') return
+  shutdownHookInstalled = true
+  // Windows drains through async private-file IO, which cannot finish in `exit`.
+  // Run once so closing the sink does not repeatedly re-arm `beforeExit`.
+  process.once('beforeExit', async () => {
+    try {
+      await flushLogs()
+    } catch {
+      process.emitWarning(
+        'OpenAI auth could not flush its log file at shutdown',
+      )
+    }
+  })
+  // POSIX flushing is synchronous, so explicit process.exit() can still drain it.
+  if (process.platform !== 'win32') process.on('exit', () => flushLogs())
 }

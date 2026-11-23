@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto'
-import { isRecord, stableStringify } from '@cortexkit/openai-auth-core/internal'
-import { orderCodexBody } from './codex-body'
-import { sanitizeHttpFallbackInit } from './codex-http'
+import {
+  isRecord,
+  orderCodexBody,
+  sanitizeHttpFallbackInit,
+  stableStringify,
+  uuidV7,
+} from '@cortexkit/openai-auth-core/internal'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import {
@@ -10,7 +14,6 @@ import {
   canonicalPrefixLength,
   retainedInput,
 } from './util/canonical-input'
-import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
 
 export const TITLE_HEADER = 'x-opencode-title'
@@ -1188,7 +1191,7 @@ function hasContinuationPrefix(
 export {
   hasWebSocketResponsesLiteMetadata,
   sanitizeHttpFallbackBody,
-} from './codex-http'
+} from '@cortexkit/openai-auth-core/internal'
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   init: T | undefined,
@@ -1219,5 +1222,8 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   }
 }
 
-export { CODEX_BODY_KEY_ORDER, orderCodexBody } from './codex-body'
+export {
+  CODEX_BODY_KEY_ORDER,
+  orderCodexBody,
+} from '@cortexkit/openai-auth-core/internal'
 export * as OpenAIWebSocketPool from './ws-pool'

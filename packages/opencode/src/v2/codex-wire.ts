@@ -5,26 +5,18 @@
 // frame's `client_metadata`, never in a handshake header.
 
 import {
-  restoreReplayedCallStatus,
-  supportsMidConversationEffort,
-} from '@cortexkit/openai-auth-core/internal'
-import {
-  CODEX_USER_AGENT,
-  CODEX_VERSION,
   type CodexRequestRuntime,
   type CodexSessionMetadata,
-  prepareCodexRequest,
-  RESPONSES_LITE_MODELS,
-} from '../codex-request'
-import { rewriteResponsesLiteBody } from '../index'
-import { uuidV7 } from '../util/uuid-v7'
-import type { CodexSessionStore } from './codex-sessions'
-import type { FrameMirrorCapture } from './frame-mirror'
-import {
   type FrameTurn,
   FrameTurnState,
   frameRequestMetadata,
-} from './frame-turn'
+  prepareCodexRequest,
+  restoreReplayedCallStatus,
+  supportsMidConversationEffort,
+  uuidV7,
+} from '@cortexkit/openai-auth-core/internal'
+import type { CodexSessionStore } from './codex-sessions'
+import type { FrameMirrorCapture } from './frame-mirror'
 
 const INSTALLATION_KEY = Symbol.for(
   '@cortexkit/openai-auth/opencode2/codex-installation',
@@ -106,15 +98,11 @@ export class CodexHttpState {
   }
 }
 
-/** The Codex client identity, sent with every request of the provider. */
-export const CODEX_CLIENT_HEADERS: Readonly<Record<string, string>> = {
-  version: CODEX_VERSION,
-  'user-agent': CODEX_USER_AGENT,
-  originator: 'codex_exec',
-}
-
-/** The header OpenCode 1 sends on an HTTP request in the Lite shape. */
-export const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite'
+export {
+  CODEX_CLIENT_HEADERS,
+  RESPONSES_LITE_HEADER,
+  responsesLiteHttpBody,
+} from '@cortexkit/openai-auth-core/internal'
 
 /** At most this many sessions keep their pinned first effort; the oldest goes first. */
 const MAX_PINNED_SESSIONS = 1024
@@ -260,27 +248,6 @@ export class MidConversationEffort {
   }
 }
 
-/**
- * The Responses Lite request shape (`rewriteResponsesLiteBody`, opt-in with
- * the `responsesLite` setting) for a model marked Lite, applied to an HTTP
- * body in place. Returns whether the body was rewritten; the caller then
- * adds `RESPONSES_LITE_HEADER`.
- *
- * Not applied to WebSocket frames: the Lite shape moves `tools` and
- * `instructions` into input items and strips image `detail` from the input,
- * which takes away and changes what the host put in the frame. The host
- * chains turns from its own request as it was before the frame rewrite, so
- * the server would hold a conversation the host's next incremental frame no
- * longer lines up with. A Lite model on WebSocket is sent in the standard
- * shape, which the backend serves as well.
- */
-export function responsesLiteHttpBody(body: Record<string, unknown>): boolean {
-  if (typeof body.model !== 'string' || !RESPONSES_LITE_MODELS.has(body.model))
-    return false
-  rewriteResponsesLiteBody(body)
-  return true
-}
-
 function parseObject(text: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(text)
@@ -318,7 +285,6 @@ export async function rewriteCodexHttpRequest(
   if (body) delete body.max_output_tokens
   const headers = new Headers(request.headers)
   const prepared = prepareCodexRequest({
-    rewriteLite: rewriteResponsesLiteBody,
     init: {
       body: body
         ? JSON.stringify(body)
@@ -373,7 +339,6 @@ export function codexReplayRequest(
     skipTurnUpdate: true,
     preserveInstructions: true,
     responsesLite: false,
-    rewriteLite: () => {},
   })
   const endpoint = new URL(url)
   if (endpoint.protocol === 'wss:') endpoint.protocol = 'https:'
@@ -438,7 +403,7 @@ function frameInputMatches(host: unknown, sent: unknown): boolean {
  * for GPT-6.2 or later. The host's next continuation sends only new items;
  * the server keeps the restored calls without any change to their count or
  * order. If anything else changed `input`, the host's input goes out instead.
- * No Lite rewrite: see `responsesLiteHttpBody`.
+ * Lite changes the host's input, so it is not applied to a frame the host may chain from.
  */
 export function rewriteCodexFrame(
   frame: string,
@@ -457,7 +422,6 @@ export function rewriteCodexFrame(
   // Codex does not accept output caps.
   delete body.max_output_tokens
   const prepared = prepareCodexRequest({
-    rewriteLite: () => {},
     init: { body: JSON.stringify(body) },
     // The socket's handshake headers were fixed when it opened, and the host
     // reuses a socket only while they stay the same. The builder's header

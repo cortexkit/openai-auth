@@ -18,7 +18,11 @@
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import type { RefreshFileLock } from '@cortexkit/common-auth/fs'
-import type { CodexSessionMetadata } from '../codex-request'
+import {
+  type CodexSessionMetadata,
+  FrameTurnState,
+  uuidV7,
+} from '@cortexkit/openai-auth-core/internal'
 import {
   acquireCodexSessionsLock,
   CODEX_SESSIONS_LOCK_WAIT_MS,
@@ -30,8 +34,6 @@ import {
   getCodexSessionsPath,
   OPENCODE2_CODEX_SESSIONS_FILE,
 } from '../core/account-paths'
-import { uuidV7 } from '../util/uuid-v7'
-import { FrameTurnState } from './frame-turn'
 
 /** OpenCode 2's file, next to OpenCode 1's `openai-auth-sessions.json`. */
 export { OPENCODE2_CODEX_SESSIONS_FILE }

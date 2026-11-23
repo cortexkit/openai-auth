@@ -1,16 +1,15 @@
 // The OpenAI models a ChatGPT login is offered on OpenCode 2, and their
 // context windows: the same allow and deny lists and caps the OpenCode 1
-// models hook applies (`codexOAuthModelListed`, `codexOAuthModelLimit` in the
-// plugin entry), applied through OpenCode 2's model transform. Terra also
+// models hook imports from core, applied through OpenCode 2's model transform. Terra also
 // inherits the host's Sol variants, retaining Terra's own definitions by id.
 
-import type { Plugin } from '@opencode/plugin'
-import type { Registration } from '@opencode/plugin/promise/registration'
 import {
   codexOAuthModelLimit,
   codexOAuthModelListed,
   codexOAuthModelVariantSource,
-} from '../index'
+} from '@cortexkit/openai-auth-core/internal'
+import type { Plugin } from '@opencode/plugin'
+import type { Registration } from '@opencode/plugin/promise/registration'
 import { OPENAI_PROVIDER_ID } from './adapter'
 
 /** The model fields the rules read and write. */

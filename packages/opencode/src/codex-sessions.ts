@@ -21,9 +21,11 @@ import {
   acquireRefreshFileLock,
   type RefreshFileLock,
 } from '@cortexkit/common-auth/fs'
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
-import type { CodexSessionMetadata } from './codex-request'
-import { uuidV7 } from './util/uuid-v7'
+import {
+  type CodexSessionMetadata,
+  isRecord,
+  uuidV7,
+} from '@cortexkit/openai-auth-core/internal'
 
 /** The lock every writer of a sessions file holds, named after that file. */
 export const CODEX_SESSIONS_LOCK_NAME = 'sessions'
