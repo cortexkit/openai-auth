@@ -35,6 +35,25 @@ const firstUser = {
   timestamp: 1,
 } as const
 const context: Context = { systemPrompt, messages: [firstUser] }
+const effortModel = { ...model, id: 'gpt-6.2-sol' }
+const secondUser = {
+  role: 'user',
+  content: 'Name another.',
+  timestamp: 2,
+} as const
+const thirdUser = {
+  role: 'user',
+  content: 'Name one more.',
+  timestamp: 3,
+} as const
+const userItem = (text: string) => ({
+  role: 'user',
+  content: [{ type: 'input_text', text }],
+})
+const effortUpdate = (effort: string) => ({
+  type: 'configuration_update',
+  reasoning: { effort },
+})
 
 function developerMessage(text: string, id?: string) {
   return {
@@ -118,7 +137,10 @@ afterEach(async () => {
 })
 
 async function httpBody(
-  options?: Pick<SimpleStreamOptions, 'onPayload' | 'sessionId'>,
+  options?: Pick<
+    SimpleStreamOptions,
+    'cacheRetention' | 'onPayload' | 'reasoning' | 'sessionId'
+  >,
   requestModel = model,
   requestContext = context,
 ) {
@@ -248,6 +270,54 @@ test('Codex HTTP sends system instructions as the leading developer message', as
   ])
 })
 
+test('Pi pins gpt-6.2-sol HTTP effort and replays each update at its original user message', async () => {
+  const helper = (reasoning: 'high' | 'medium') =>
+    httpBody({ sessionId, reasoning, cacheRetention: 'none' }, effortModel)
+  await helper('high')
+  const opening = await httpBody({ sessionId, reasoning: 'low' }, effortModel)
+  const summary = await helper('medium')
+  const changed = await httpBody(
+    { sessionId, reasoning: 'high' },
+    effortModel,
+    {
+      systemPrompt,
+      messages: [firstUser, secondUser],
+    },
+  )
+  const next = await httpBody({ sessionId, reasoning: 'low' }, effortModel, {
+    systemPrompt,
+    messages: [firstUser, secondUser, thirdUser],
+  })
+  expect([opening, changed, next].map((body) => body.reasoning)).toEqual([
+    { effort: 'low', summary: 'auto' },
+    { effort: 'low', summary: 'auto' },
+    { effort: 'low', summary: 'auto' },
+  ])
+  const openingInput = opening.input as unknown[]
+  const changedInput = changed.input as unknown[]
+  const nextInput = next.input as unknown[]
+  expect(JSON.stringify(changedInput.slice(0, -2))).toBe(
+    JSON.stringify(openingInput),
+  )
+  expect(changedInput.slice(-2)).toEqual([
+    effortUpdate('high'),
+    userItem(secondUser.content),
+  ])
+  expect(JSON.stringify(nextInput.slice(0, -2))).toBe(
+    JSON.stringify(changedInput),
+  )
+  expect(nextInput.slice(-2)).toEqual([
+    effortUpdate('low'),
+    userItem(thirdUser.content),
+  ])
+  expect(summary).not.toHaveProperty('prompt_cache_key')
+  expect(summary.reasoning).toEqual({ effort: 'medium', summary: 'auto' })
+  expect(summary.input).toEqual([
+    developerMessage(systemPrompt),
+    userItem(firstUser.content),
+  ])
+})
+
 test('Codex HTTP omits the base instructions id without a Pi session id', async () => {
   const body = await httpBody()
   expect(body).not.toHaveProperty('prompt_cache_key')
@@ -325,7 +395,7 @@ test('Codex transforms in-place onPayload edits without mutating the SDK body', 
   expect(sdkBody?.input).toHaveLength(1)
 })
 
-test('Codex cached WebSocket sends the developer message once and only new input on turn two', async () => {
+async function captureWebSocketFrames(run: (url: string) => Promise<void>) {
   const frames: Record<string, unknown>[] = []
   let connections = 0
   const server = Bun.serve({
@@ -347,61 +417,119 @@ test('Codex cached WebSocket sends the developer message once and only new input
     },
   })
   try {
-    const socketModel = { ...model, baseUrl: server.url.href }
-    const options: SimpleStreamOptions = {
-      apiKey,
-      transport: 'websocket-cached',
-      sessionId,
-      fetch: mockFetch(async () => {
-        throw new Error('Expected to send over the WebSocket')
-      }),
-    }
-    const first = await runtime.stream(socketModel, context, options).result()
-    expect(first.errorMessage).toBeUndefined()
-    expect(first.responseId).toBe('resp_1')
-    const secondUser = {
-      role: 'user',
-      content: 'Name another.',
-      timestamp: 2,
-    } as const
-    const second = await runtime
-      .stream(
-        socketModel,
-        {
-          systemPrompt,
-          messages: [firstUser, first, secondUser],
-        },
-        options,
-      )
-      .result()
-    expect(second.errorMessage).toBeUndefined()
-    expect(second.responseId).toBe('resp_2')
-
-    expect(connections).toBe(1)
-    expect(frames).toHaveLength(2)
-    const [full, delta] = frames
-    expect(full?.type).toBe('response.create')
-    expect(full?.prompt_cache_key).toBe(sessionId)
-    expect(full).not.toHaveProperty('instructions')
-    expect(full).not.toHaveProperty('previous_response_id')
-    expect(full?.input).toEqual([
-      developerMessage(systemPrompt, systemId),
-      {
-        role: 'user',
-        content: [{ type: 'input_text', text: firstUser.content }],
-      },
-    ])
-    expect(delta?.type).toBe('response.create')
-    expect(delta?.prompt_cache_key).toBe(sessionId)
-    expect(delta).not.toHaveProperty('instructions')
-    expect(delta?.previous_response_id).toBe('resp_1')
-    expect(delta?.input).toEqual([
-      {
-        role: 'user',
-        content: [{ type: 'input_text', text: secondUser.content }],
-      },
-    ])
+    await run(server.url.href)
+    return { frames, connections }
   } finally {
     await server.stop(true)
   }
+}
+
+test('Codex cached WebSocket sends the developer message once and only new input on turn two', async () => {
+  const { frames, connections } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const socketModel = { ...model, baseUrl }
+      const options: SimpleStreamOptions = {
+        apiKey,
+        transport: 'websocket-cached',
+        sessionId,
+        fetch: mockFetch(async () => {
+          throw new Error('Expected to send over the WebSocket')
+        }),
+      }
+      const first = await runtime.stream(socketModel, context, options).result()
+      expect(first.errorMessage).toBeUndefined()
+      expect(first.responseId).toBe('resp_1')
+      const second = await runtime
+        .stream(
+          socketModel,
+          {
+            systemPrompt,
+            messages: [firstUser, first, secondUser],
+          },
+          options,
+        )
+        .result()
+      expect(second.errorMessage).toBeUndefined()
+      expect(second.responseId).toBe('resp_2')
+    },
+  )
+
+  expect(connections).toBe(1)
+  expect(frames).toHaveLength(2)
+  const [full, delta] = frames
+  expect(full?.type).toBe('response.create')
+  expect(full?.prompt_cache_key).toBe(sessionId)
+  expect(full).not.toHaveProperty('instructions')
+  expect(full).not.toHaveProperty('previous_response_id')
+  expect(full?.input).toEqual([
+    developerMessage(systemPrompt, systemId),
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: firstUser.content }],
+    },
+  ])
+  expect(delta?.type).toBe('response.create')
+  expect(delta?.prompt_cache_key).toBe(sessionId)
+  expect(delta).not.toHaveProperty('instructions')
+  expect(delta?.previous_response_id).toBe('resp_1')
+  expect(delta?.input).toEqual([
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: secondUser.content }],
+    },
+  ])
+})
+
+test('Pi keeps gpt-6.2-sol WebSocket turns chained after injecting an effort update', async () => {
+  const payloads: unknown[][] = []
+  const { frames, connections } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const socketModel = { ...effortModel, baseUrl }
+      const options: SimpleStreamOptions = {
+        apiKey,
+        transport: 'websocket-cached',
+        sessionId,
+        fetch: mockFetch(async () => {
+          throw new Error('Expected to send over the WebSocket')
+        }),
+        onPayload(raw) {
+          payloads.push((raw as { input: unknown[] }).input)
+        },
+      }
+      const messages = [firstUser, secondUser, thirdUser]
+      const history: Context['messages'] = []
+      for (const [i, message] of messages.entries()) {
+        history.push(message)
+        const result = await runtime
+          .stream(
+            socketModel,
+            { systemPrompt, messages: [...history] },
+            {
+              ...options,
+              reasoning: i === 0 ? 'low' : 'high',
+            },
+          )
+          .result()
+        expect(result.errorMessage).toBeUndefined()
+        expect(result.responseId).toBe(`resp_${i + 1}`)
+        history.push(result)
+      }
+    },
+  )
+
+  expect(connections).toBe(1)
+  expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+    undefined,
+    'resp_1',
+    'resp_2',
+  ])
+  expect(frames.map((frame) => frame.reasoning)).toEqual(
+    Array(3).fill({ effort: 'low', summary: 'auto' }),
+  )
+  expect(frames.map((frame) => frame.input)).toEqual([
+    [developerMessage(systemPrompt, systemId), userItem(firstUser.content)],
+    [effortUpdate('high'), userItem(secondUser.content)],
+    [userItem(thirdUser.content)],
+  ])
+  expect(payloads.map((input) => input.length)).toEqual([1, 3, 5])
 })

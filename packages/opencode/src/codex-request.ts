@@ -1,4 +1,6 @@
 import {
+  type CodexEffortState,
+  isMessageWithRole,
   isRecord,
   moveInstructionsToDeveloperMessage,
   restoreReplayedCallStatus,
@@ -43,16 +45,13 @@ export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aar
 const CODEX_SANDBOX = 'seccomp'
 export const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'
 
-export interface CodexSessionMetadata {
+export interface CodexSessionMetadata extends CodexEffortState {
   threadID: string
   turnID: string
   windowID: string
   turnStartedAt?: number
   input?: unknown[]
   canonicalInput?: CanonicalInput
-  /** Keep the opening effort fixed while later changes travel as input items. */
-  pinnedEffort?: string
-  effortUpdates?: Array<{ anchor: number; fingerprint: string; effort: string }>
 }
 
 export interface CodexRequestRuntime {
@@ -72,14 +71,6 @@ function parseJsonObject(input: unknown) {
   } catch {
     return undefined
   }
-}
-
-export function isMessageWithRole(item: unknown, role: string) {
-  return (
-    isRecord(item) &&
-    (item.type === 'message' || 'role' in item) &&
-    item.role === role
-  )
 }
 
 function startsHttpUserTurn(

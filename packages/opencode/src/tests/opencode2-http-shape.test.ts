@@ -91,6 +91,40 @@ async function send(
 }
 
 describe('OpenCode 2 HTTP shape', () => {
+  it('pins gpt-6.2-sol HTTP effort and keeps the prefix through a tool continuation', async () => {
+    const host = await start()
+    const first = user('one')
+    const previous = {
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'hi' }],
+    }
+    const second = user('two')
+    const output = { type: 'function_call_output', call_id: 'c1', output: 'ok' }
+    const dispatch = async (effort: string, input: unknown[]) =>
+      (
+        await send(host, { model: 'gpt-6.2-sol', input, reasoning: { effort } })
+      ).json()
+    const opening = await dispatch('low', [first])
+    const changed = await dispatch('high', [first, previous, second])
+    const continued = await dispatch('high', [first, previous, second, output])
+    expect(
+      [opening, changed, continued].map((body) => body.reasoning.effort),
+    ).toEqual(['low', 'low', 'low'])
+    expect(changed.input).toEqual([
+      first,
+      previous,
+      { type: 'configuration_update', reasoning: { effort: 'high' } },
+      second,
+    ])
+    expect(JSON.stringify(changed.input.slice(0, 1))).toBe(
+      JSON.stringify(opening.input),
+    )
+    expect(JSON.stringify(continued.input.slice(0, -1))).toBe(
+      JSON.stringify(changed.input),
+    )
+    expect(continued.input.at(-1)).toEqual(output)
+  })
+
   it('restores replayed call status on GPT-6.2 HTTP without changing GPT-6.1 input', async () => {
     const host = await start()
     const call = {

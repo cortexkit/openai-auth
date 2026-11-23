@@ -3117,6 +3117,7 @@ describe('integration: active fallback routing', () => {
 
   async function captureEffortHistory(
     requests: Array<{ effort: string; input: unknown[]; agent?: string }>,
+    model = 'gpt-6.1-sol',
   ) {
     seedEmptyAccountStorage()
     const originalFetch = globalThis.fetch
@@ -3159,7 +3160,7 @@ describe('integration: active fallback routing', () => {
           method: 'POST',
           headers: requestHeaders,
           body: JSON.stringify({
-            model: 'gpt-6.1-sol',
+            model,
             reasoning: { effort: request.effort },
             input: request.input,
           }),
@@ -3260,6 +3261,37 @@ describe('integration: active fallback routing', () => {
       reasoning: { effort: 'high' },
     })
     expect(final[5]).toEqual(effortUser('turn 2'))
+  })
+
+  test('gpt-6.2-sol pins effort and replays the update without changing earlier input bytes', async () => {
+    const one = effortUser('one')
+    const two = effortUser('two')
+    const three = effortUser('three')
+    const { sent } = await captureEffortHistory(
+      [
+        { effort: 'low', input: [one] },
+        { effort: 'high', input: [one, two] },
+        { effort: 'high', input: [one, two, three] },
+      ],
+      'gpt-6.2-sol',
+    )
+    const [opening, changed, next] = sent
+    expect(sent.map((body) => body.reasoning.effort)).toEqual([
+      'low',
+      'low',
+      'low',
+    ])
+    expect(changed!.input).toEqual([
+      one,
+      { type: 'configuration_update', reasoning: { effort: 'high' } },
+      two,
+    ])
+    expect(JSON.stringify(changed!.input.slice(0, -2))).toBe(
+      JSON.stringify(opening!.input),
+    )
+    expect(JSON.stringify(next!.input.slice(0, -1))).toBe(
+      JSON.stringify(changed!.input),
+    )
   })
 
   test.each(['shorter', 'different'])(

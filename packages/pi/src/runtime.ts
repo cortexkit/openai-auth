@@ -40,7 +40,9 @@ import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
+  applyMidConversationEffort,
   buildOpenAiQuotaRefusal,
+  type CodexEffortState,
   classifyOpenAiLimitBody,
   codexRefreshFn,
   createLogger,
@@ -124,6 +126,7 @@ export const FIRST_READING_WAIT_MS = FIRST_QUOTA_READING_WAIT_MS
 
 /** Longest a request waits for a lock-free re-read of the account settings. */
 const STORAGE_READ_BUDGET_MS = 500
+const MAX_EFFORT_SESSIONS = 1024
 const routingLog = createLogger('routing')
 
 type StreamSimple = (
@@ -237,6 +240,7 @@ export class PiOpenAIRuntime {
   readonly pool: PiPoolSource
   readonly vault: OpenAiVault
   readonly activity = createSessionActivityStore()
+  private readonly effortBySession = new Map<string, CodexEffortState>()
   /** Captured from a live Pi context; absent in headless hosts. */
   setWorkingMessage: ((message?: string) => void) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
@@ -945,6 +949,18 @@ export class PiOpenAIRuntime {
     return { kind: 'sent', ...result.attempt, decision: result.decision }
   }
 
+  private applyEffort(body: Record<string, unknown>, sessionId: string) {
+    const previous = this.effortBySession.get(sessionId)
+    const state = previous ?? {}
+    applyMidConversationEffort(body, state)
+    if (previous || state.pinnedEffort === undefined) return
+    this.effortBySession.set(sessionId, state)
+    if (this.effortBySession.size > MAX_EFFORT_SESSIONS) {
+      const oldest = this.effortBySession.keys().next().value
+      if (oldest !== undefined) this.effortBySession.delete(oldest)
+    }
+  }
+
   /**
    * Sends the request once with `token` and waits for its first event. An
    * attempt whose first event is an error has ended without streaming
@@ -1003,6 +1019,10 @@ export class PiOpenAIRuntime {
     let inner: AssistantMessageEventStream
     try {
       const send = options?.fetch ?? globalThis.fetch
+      // Pi's compaction and summary calls can carry the routing session id,
+      // but disable caching. They must not pin or change conversation effort.
+      const effortSessionId =
+        options?.cacheRetention === 'none' ? undefined : options?.sessionId
       inner = this.deps.streamSimple(model, context, {
         ...options,
         apiKey: token,
@@ -1013,6 +1033,7 @@ export class PiOpenAIRuntime {
           if (!isRecord(source)) return source
           const input = restoreReplayedCallStatus(source.input, source.model)
           if (
+            !effortSessionId &&
             input === source.input &&
             (typeof source.instructions !== 'string' ||
               source.instructions.length === 0)
@@ -1020,6 +1041,7 @@ export class PiOpenAIRuntime {
             return source
           const body = { ...source }
           if (input !== source.input) body.input = input
+          if (effortSessionId) this.applyEffort(body, effortSessionId)
           moveInstructionsToDeveloperMessage(body)
           return body
         },

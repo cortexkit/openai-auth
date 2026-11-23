@@ -1,4 +1,4 @@
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
+import { isRecord } from './record'
 
 export function stableStringify(value: unknown): string {
   return JSON.stringify(stable(value)) ?? 'undefined'

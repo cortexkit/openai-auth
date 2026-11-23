@@ -46,7 +46,7 @@ try {
     fileURLToPath(new URL('.cpu-bench-dump.ts', dir))
   )
   const { stableStringify } = await import(
-    '../packages/opencode/src/util/stable-json.ts'
+    '../packages/core/src/util/stable-json.ts'
   )
   const tools = Array.from({ length: 30 }, (_, i) => ({
     type: 'function',

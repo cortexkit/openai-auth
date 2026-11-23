@@ -75,7 +75,7 @@ On Pi, `openai-auth.json` lives in Pi's agent folder (`PI_CODING_AGENT_DIR`, els
 
 `prepareCodexRequest` (`packages/opencode/src/codex-request.ts`) makes a request look like it came from the official Codex CLI: Codex headers and client version (`CODEX_VERSION`), a UUIDv7 thread id per host session and turn id per user turn, turn metadata, and Codex's body key order. The thread id doubles as the prompt-cache key, so `codex-sessions.ts` stores it per session (thread ids only, never a token) and a restart keeps the cache.
 
-- **Reasoning effort:** for the models in `MID_CONVERSATION_EFFORT_MODELS`, the request keeps the effort the session opened with, and a later change travels as a `configuration_update` input item before the new user turn. A changed request-level effort would invalidate the cached prefix.
+- **Reasoning effort:** on OpenCode 1, OpenCode 2 and Pi, GPT-6 and later requests keep the effort the session opened with, and a later change travels as a `configuration_update` input item before the new user turn. A changed request-level effort would invalidate the cached prefix. Title, compaction and summary requests do not participate.
 - **Responses Lite:** a compact request shape for the models the backend marks Lite (`RESPONSES_LITE_MODELS`). It's off unless the `responsesLite` setting is on.
 - **Models:** `codexOAuthModelListed` and `codexOAuthModelLimit` in `packages/opencode/src/codex-models.ts` decide which models a ChatGPT login is offered and their context windows. OpenCode 2 applies the same rules through `v2/models.ts`. Pi registers its own fixed model list.
 

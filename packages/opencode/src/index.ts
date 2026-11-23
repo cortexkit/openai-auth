@@ -264,10 +264,7 @@ import { PackageVersion } from './version'
 import { observeHttpCompletion } from './ws'
 import { OpenAIWebSocketPool } from './ws-pool'
 
-export {
-  MID_CONVERSATION_EFFORT_MODELS,
-  rewriteResponsesLiteBody,
-} from './codex-effort'
+export { rewriteResponsesLiteBody } from './codex-effort'
 export {
   ALLOWED_MODELS,
   codexOAuthModelLimit,

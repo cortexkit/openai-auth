@@ -14,10 +14,10 @@
 // count. No message size changes its size.
 
 import { createHash } from 'node:crypto'
-import {
-  type CodexRequestRuntime,
-  type CodexSessionMetadata,
-  isMessageWithRole,
+import { isMessageWithRole } from '@cortexkit/openai-auth-core/internal'
+import type {
+  CodexRequestRuntime,
+  CodexSessionMetadata,
 } from '../codex-request'
 import { uuidV7 } from '../util/uuid-v7'
 

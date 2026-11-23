@@ -334,6 +334,42 @@ describe('WebSocket frame shaping', () => {
     expect(sent.reasoning).toEqual({ effort: 'low' })
   })
 
+  it('pins gpt-6.2-sol WebSocket effort without changing the prefix or chained tool input', () => {
+    const effort = codexState()
+    const send = (value: string, input: unknown[], previous?: string) =>
+      JSON.parse(
+        rewriteCodexFrame(
+          JSON.stringify(
+            hostFrame(input, {
+              model: 'gpt-6.2-sol',
+              reasoning: { effort: value },
+              ...(previous && { previous_response_id: previous }),
+            }),
+          ),
+          SESSION,
+          effort,
+        ) ?? 'null',
+      )
+    const first = user('one')
+    const second = user('two')
+    const previous = assistant('hi')
+    const opening = send('low', [first])
+    effort.http.frameTurns.completed(SESSION.sessionID)
+    const changed = send('high', [first, previous, second])
+    effort.http.frameTurns.completed(SESSION.sessionID)
+    const toolInput = [output('c1')]
+    const continued = send('high', toolInput, 'r2')
+    expect(
+      [opening, changed, continued].map((body) => body.reasoning.effort),
+    ).toEqual(['low', 'low', 'low'])
+    expect(changed.input).toEqual([first, previous, update('high'), second])
+    expect(JSON.stringify(changed.input.slice(0, 1))).toBe(
+      JSON.stringify(opening.input),
+    )
+    expect(continued.previous_response_id).toBe('r2')
+    expect(JSON.stringify(continued.input)).toBe(JSON.stringify(toolInput))
+  })
+
   it("sends the host's input when a shaping step changes it beyond the effort rule", () => {
     // An effort rule that drops and reorders items stands for any shaping
     // step that would edit input.

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
+import { isRecord, stableStringify } from '@cortexkit/openai-auth-core/internal'
 import { orderCodexBody } from './codex-body'
 import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
@@ -10,7 +10,6 @@ import {
   canonicalPrefixLength,
   retainedInput,
 } from './util/canonical-input'
-import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
 

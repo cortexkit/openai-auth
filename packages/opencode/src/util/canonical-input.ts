@@ -1,4 +1,4 @@
-import { stableStringify } from './stable-json'
+import { stableStringify } from '@cortexkit/openai-auth-core/internal'
 
 // The canonical texts of a request's input are kept until the next request
 // (once per HTTP session or WebSocket pool entry) only below these sizes.

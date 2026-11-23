@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test'
+import { stableStringify } from '@cortexkit/openai-auth-core/internal'
 import {
   canonicalInput,
   canonicalPrefixLength,
   retainedInput,
 } from '../util/canonical-input'
-import { stableStringify } from '../util/stable-json'
 
 const history = () => [
   {

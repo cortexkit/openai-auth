@@ -4,7 +4,10 @@
 // socket reuse by handshake headers, so a frame's turn metadata travels in the
 // frame's `client_metadata`, never in a handshake header.
 
-import { restoreReplayedCallStatus } from '@cortexkit/openai-auth-core/internal'
+import {
+  restoreReplayedCallStatus,
+  supportsMidConversationEffort,
+} from '@cortexkit/openai-auth-core/internal'
 import {
   CODEX_USER_AGENT,
   CODEX_VERSION,
@@ -13,10 +16,7 @@ import {
   prepareCodexRequest,
   RESPONSES_LITE_MODELS,
 } from '../codex-request'
-import {
-  MID_CONVERSATION_EFFORT_MODELS,
-  rewriteResponsesLiteBody,
-} from '../index'
+import { rewriteResponsesLiteBody } from '../index'
 import { uuidV7 } from '../util/uuid-v7'
 import type { CodexSessionStore } from './codex-sessions'
 import type { FrameMirrorCapture } from './frame-mirror'
@@ -153,11 +153,8 @@ const isConfigurationUpdate = (item: unknown) =>
 export type WireForm = 'http' | 'ws'
 
 /**
- * OpenCode 1's mid-conversation effort rule (`applyMidConversationEffort`),
- * for the models where a `configuration_update` item is known to change
- * effort (`MID_CONVERSATION_EFFORT_MODELS`) and the host does not carry the
- * change itself (`HOST_EFFORT_UPDATE_MODEL`): `gpt-6.1-sol`, which only
- * 2.0.21 needs it for.
+ * Keep mid-conversation effort changes on supported GPT-6 and later models
+ * in the input, except when the host already carries the change itself.
  *
  * The backend keys its prompt cache on the request-level
  * `reasoning.effort`, so a session that changes effort part-way would have
@@ -210,7 +207,7 @@ export class MidConversationEffort {
   ): boolean {
     if (scope.kind !== 'primary') return false
     const model = typeof body.model === 'string' ? body.model : ''
-    if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return false
+    if (!supportsMidConversationEffort(model)) return false
     if (HOST_EFFORT_UPDATE_MODEL.test(model)) return false
     const reasoning = isRecord(body.reasoning) ? body.reasoning : undefined
     const effort =
@@ -238,6 +235,8 @@ export class MidConversationEffort {
       return true
     }
     body.reasoning = { ...reasoning, effort: pinned }
+    // A full resend after a new user turn moves the single item to the newest
+    // user message, so the tail after the old change point is read uncached.
     if (!isConfigurationUpdate(input[at - 1]))
       input.splice(at, 0, {
         type: 'configuration_update',
