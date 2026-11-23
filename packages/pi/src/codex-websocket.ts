@@ -27,7 +27,7 @@ const cachedSockets = new Map<string, PiRawCodexWebSocket>()
 function cacheKey({ sessionId, token }: WebSocketAttempt): string | undefined {
   if (!sessionId) return
   // pi-ai keys the cache by the original session ID and the nested JWT claim,
-  // not by the clamped prompt_cache_key or the plugin's routing account ID.
+  // not by the prompt_cache_key sent on the wire or the plugin's routing account ID.
   const accountId =
     parseJwtClaims(token)?.['https://api.openai.com/auth']?.chatgpt_account_id
   if (typeof accountId === 'string' && accountId)
