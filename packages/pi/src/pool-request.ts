@@ -620,7 +620,11 @@ async function routeOrdered<A extends RouteAttempt>(
   const plan = planOrdered({
     ...routing,
     placement,
-    mainId: ctx.mainId,
+    // A sticky fallback keeps vault roster order, not the vault's main preference.
+    mainId:
+      ctx.mode === 'sticky-balanced' && ctx.mainId !== undefined
+        ? null
+        : ctx.mainId,
   })
   if (plan.kind === 'block') {
     ctx.log?.debug('pool admission blocked the request', {

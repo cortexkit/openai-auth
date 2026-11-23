@@ -51,6 +51,7 @@ import {
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   isRecord,
+  isVaultHosted,
   limitAccountKey,
   loadAccounts,
   normalizeQuotaHeaders,
@@ -58,6 +59,7 @@ import {
   type OAuthQuotaSnapshot,
   OpenAiVault,
   poolLimitsNamespace,
+  quotaSnapshotPassesPolicy,
   type RefreshAllQuotaResult,
   type RoutingMode,
   recordSessionCompletion,
@@ -234,13 +236,17 @@ export function errorEvent(
   }
 }
 
+type PiBlock = PoolBlock | { reason: 'quota-minimum'; resetAtMs?: never }
+
 /** The error message Pi shows for a request no account may serve. */
-export function blockedMessage(block: PoolBlock): string {
+export function blockedMessage(block: PiBlock): string {
   const reset =
     block.resetAtMs !== undefined
       ? ` It resets at ${new Date(block.resetAtMs).toISOString()}.`
       : ''
   switch (block.reason) {
+    case 'quota-minimum':
+      return 'No OpenAI account meets the configured minimum remaining quota.'
     case 'quota-unknown':
       return `No OpenAI account has a quota reading yet; one is being taken now. Try again in ${POOL_QUOTA_UNKNOWN_RETRY_SECONDS} seconds.`
     case 'quota-exhausted':
@@ -397,7 +403,7 @@ export class PiOpenAIRuntime {
   syncVaultSlot(refresh?: () => unknown, explicit = false): Promise<void> {
     return this.withSlot(async () => {
       await this.reconcileSlot(explicit)
-      if (this.slotNeedsRefresh && refresh) {
+      if (!isVaultHosted() && this.slotNeedsRefresh && refresh) {
         await refresh()
         this.slotNeedsRefresh = false
       }
@@ -425,13 +431,17 @@ export class PiOpenAIRuntime {
   }
 
   private async reconcileSlot(explicit = false): Promise<void> {
-    const mode = (await this.readAuthority()) !== 'local'
+    const authority = await this.readAuthority()
+    // The hosted provider uses an in-memory key, never Pi's auth.json slot.
+    if (authority === 'host') return
+    const mode = authority !== 'local'
     // Background ticks only read enrollment. An explicit sync or an unknown
     // slot state must reconcile under the helper's lock even in the same mode.
     if (mode === this.slotVaultMode && !explicit) return
     const previousMode = this.slotVaultMode
     this.slotVaultMode = undefined
     const before = await this.vaultSlot().inspect()
+    if (isVaultHosted()) return
     if (mode) await this.vaultSlot().enterVault()
     else await this.vaultSlot().exitVault()
     this.slotNeedsRefresh =
@@ -441,7 +451,9 @@ export class PiOpenAIRuntime {
       this.slotNeedsRefresh
     // Another process can change enrollment while the slot helper waits for
     // its auth.json lock. Reconcile that change after the locked update finishes.
-    const currentMode = (await this.readAuthority()) !== 'local'
+    const currentAuthority = await this.readAuthority()
+    if (currentAuthority === 'host') return
+    const currentMode = currentAuthority !== 'local'
     if (currentMode !== mode) {
       if (currentMode) await this.vaultSlot().enterVault()
       else await this.vaultSlot().exitVault()
@@ -698,8 +710,10 @@ export class PiOpenAIRuntime {
         let wake: PiWake | undefined
         for (;;) {
           if (options?.signal?.aborted) return
+          const authority = await this.readAuthority()
           if (
-            (await this.readAuthority()) !== 'local' &&
+            authority !== 'host' &&
+            authority !== 'local' &&
             options?.apiKey !== VAULT_PLACEHOLDER_KEY
           ) {
             outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
@@ -809,7 +823,7 @@ export class PiOpenAIRuntime {
     execution: { canWait: boolean; wake?: PiWake; billingAttempt?: number },
   ): Promise<
     | ({ kind: 'sent'; decision?: LimitDecision } & StreamAttempt)
-    | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
+    | { kind: 'blocked'; block: PiBlock; refusal?: VaultModeRefusal }
     | Extract<
         Awaited<ReturnType<typeof routePiRequest<StreamAttempt>>>,
         { kind: 'policy' }
@@ -830,20 +844,26 @@ export class PiOpenAIRuntime {
     } else {
       if (!execution.wake) this.main.observeToken(options?.apiKey)
       await this.pool.current()
-      // Token refreshes of pool rows run in the background, so no request
-      // waits on the pool store's locks; a row whose token ran out sits out
-      // until its refresh lands.
-      void this.pool.refreshDueTokens(this.pool.peek().rows, settings)
+      await this.pool.prepareTokens(this.pool.peek().rows, settings)
     }
     const mode: RoutingMode = settings?.routing?.mode ?? 'main-first'
     let vaultRefused = false
     let candidates = 0
+    let quotaFiltered = false
     const run = () =>
       routePiRequest<StreamAttempt>({
         accounts: () => {
           const accounts = this.accounts(settings)
           candidates = accounts.length
-          return accounts
+          const now = this.now()
+          const eligible = accounts.filter((account) => {
+            if (!account.vault) return true
+            const reading = windowsFromQuotaMap(account.quota)
+            // Leave unread routes visible so admission can request a poll.
+            return !reading || quotaSnapshotPassesPolicy(reading, settings, now)
+          })
+          quotaFiltered = eligible.length < candidates
+          return eligible
         },
         storage: settings,
         mode,
@@ -919,6 +939,8 @@ export class PiOpenAIRuntime {
             ? 'vault-refused'
             : vaultModeNoRouteCause(this.vault),
         }
+      if (quotaFiltered && result.block.reason === 'no-credential')
+        return { ...result, block: { reason: 'quota-minimum' } }
       if (vaultMode && result.block.reason === 'no-credential')
         return { ...result, refusal: 'vault-empty' }
       return result

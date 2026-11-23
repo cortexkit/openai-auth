@@ -12,6 +12,7 @@ import { openPoolStore, type PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   mutateAccounts,
+  normalizeQuotaHeaders,
   type RoutingMode,
   saveAccounts,
 } from '@cortexkit/openai-auth-core/internal'
@@ -897,56 +898,95 @@ describe('Pi requests on the account pool', () => {
     expect(getPiStickyRouting('session-1')).toBeDefined()
   })
 
-  test('an expired pool token is refreshed through the store, and the request never waits for it', async () => {
-    const expired = jwt('acct-alpha', 'old')
-    const fresh = jwt('acct-alpha', 'new')
-    rmSync(paths.configPath)
-    rmSync(paths.statePath)
-    await addRow('alpha', expired, 'acct-alpha', Date.now() - 1_000)
-    await addRow('beta', BETA_TOKEN, 'acct-beta')
-    let refreshes = 0
-    let releaseRefresh!: () => void
-    const refreshGate = new Promise<void>((resolve) => {
-      releaseRefresh = resolve
-    })
-    tokenHandler = async () => {
-      refreshes++
-      await refreshGate
-      return Response.json({
-        access_token: fresh,
-        refresh_token: 'refresh-alpha-2',
-        expires_in: 864_000,
+  test.each(['expired', 'missing', 'still-valid'] as const)(
+    'a %s fallback token uses the correct refresh timing before routing',
+    async (state) => {
+      const old = jwt('acct-alpha', 'old')
+      const fresh = jwt('acct-alpha', 'new')
+      rmSync(paths.configPath)
+      rmSync(paths.statePath)
+      await addRow(
+        'alpha',
+        state === 'missing' ? '' : old,
+        'acct-alpha',
+        Date.now() + (state === 'expired' ? -1_000 : 5 * 60_000),
+      )
+      await addRow('beta', BETA_TOKEN, 'acct-beta')
+      await mutateAccounts((current) => {
+        current.refresh = { refreshBeforeExpiryMinutes: 30 }
+        return current
+      }, paths)
+      let refreshes = 0
+      const started = Promise.withResolvers<void>()
+      let releaseRefresh!: () => void
+      const refreshGate = new Promise<void>((resolve) => {
+        releaseRefresh = resolve
       })
-    }
-    const runtime = makeRuntime()
-    // Every account's first quota reading lands before the first request;
-    // that request is what starts alpha's refresh.
-    await ready(runtime)
-    await setMode('fallback-first')
+      tokenHandler = async () => {
+        refreshes++
+        started.resolve()
+        await refreshGate
+        return Response.json({
+          access_token: fresh,
+          refresh_token: 'refresh-alpha-2',
+          expires_in: 864_000,
+        })
+      }
+      const runtime = makeRuntime()
+      await ready(runtime)
+      await setMode('fallback-first')
+      if (state === 'missing') {
+        // The row already has a usage reading from when it held an access token.
+        runtime.pool.recordSnapshot(
+          'alpha',
+          {
+            ...normalizeQuotaHeaders(
+              new Headers({
+                'x-codex-primary-used-percent': '10',
+                'x-codex-primary-window-minutes': '300',
+              }),
+            ),
+          },
+          old,
+          true,
+        )
+        await runtime.pool.settled()
+      }
 
-    // Alpha's refresh is held at the token endpoint, so this request is
-    // served by beta without waiting for it.
-    const first = await send(runtime)
-    expect(first[0]?.type).toBe('start')
-    expect(codexTokens()).toEqual([BETA_TOKEN])
+      const first = send(runtime)
+      let sentWhileRefreshing: boolean
+      try {
+        await started.promise
+        sentWhileRefreshing = await Promise.race([
+          first.then(() => true),
+          Bun.sleep(50).then(() => false),
+        ])
+      } finally {
+        releaseRefresh()
+      }
+      expect((await first)[0]?.type).toBe('start')
+      await runtime.pool.settled()
+      expect(sentWhileRefreshing).toBe(state === 'still-valid')
+      expect(codexTokens()).toEqual([state === 'still-valid' ? old : fresh])
+      expect(refreshes).toBe(1)
+      const load = await store().read()
+      const alpha =
+        load.status === 'ready'
+          ? load.rows.find((row) => row.id === 'alpha')
+          : undefined
+      expect(alpha?.credential).toMatchObject({
+        type: 'oauth',
+        access: fresh,
+        refresh: 'refresh-alpha-2',
+      })
 
-    releaseRefresh()
-    await runtime.pool.settled()
-    expect(refreshes).toBe(1)
-    const load = await store().read()
-    const alpha =
-      load.status === 'ready'
-        ? load.rows.find((row) => row.id === 'alpha')
-        : undefined
-    expect(alpha?.credential).toMatchObject({
-      type: 'oauth',
-      access: fresh,
-      refresh: 'refresh-alpha-2',
-    })
-
-    await send(runtime)
-    expect(codexTokens()).toEqual([BETA_TOKEN, fresh])
-  })
+      await send(runtime)
+      expect(codexTokens()).toEqual([
+        state === 'still-valid' ? old : fresh,
+        fresh,
+      ])
+    },
+  )
 
   test('quota from a response lands on the row that served it', async () => {
     const runtime = makeRuntime()

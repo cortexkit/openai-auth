@@ -9,7 +9,10 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
+import {
+  OpenAiVault,
+  vaultStateDir,
+} from '@cortexkit/openai-auth-core/internal'
 import {
   createAgentSession,
   ModelRuntime,
@@ -140,13 +143,6 @@ test('Pi 1.4.0 startup swaps the enrolled slot before auth resolution and the fi
       { mode: 0o600 },
     )
     writeFileSync(pluginAuthPath, pluginAuthBefore, { mode: 0o600 })
-    const stateDir = vaultStateDir(process.env.PI_OPENAI_AUTH_STATE_FILE)
-    mkdirSync(stateDir, { mode: 0o700 })
-    writeFileSync(
-      vaultPaths(stateDir, 'pi').tokenPath,
-      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
     writeFileSync(
       join(piAgentDir, 'settings.json'),
       JSON.stringify({
@@ -236,6 +232,21 @@ export default async function(pi) {
       }
       return new Response('unexpected', { status: 500 })
     }) as typeof fetch
+    // Complete the approval outside the Pi menu, then start a new session
+    // against the persisted enrollment.
+    const enrollment = new OpenAiVault({
+      host: 'pi',
+      stateDir: vaultStateDir(process.env.PI_OPENAI_AUTH_STATE_FILE),
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    })
+    try {
+      expect((await enrollment.connectStep()).state).toBe('pending')
+      daemon.approve('request-1')
+      expect((await enrollment.connectStep()).state).toBe('approved')
+    } finally {
+      await enrollment.dispose()
+    }
     const created = await createAgentSession({
       cwd: dir,
       agentDir: piAgentDir,

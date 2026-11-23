@@ -15,6 +15,11 @@ Requires Pi 1.0.1 or newer. See [Install](https://github.com/cortexkit/openai-au
 - [Commands](https://github.com/cortexkit/openai-auth/blob/main/docs/commands.md#pi)
 - [Claustrum vault](https://github.com/cortexkit/openai-auth/blob/main/docs/vault.md#pi-in-vault-mode)
 
+When Thalamus starts Pi, the plugin leaves the saved Pi login untouched and uses
+the vault. If Pi does not expose its in-memory credential override, a saved
+expired login may prevent Pi from reaching the plugin. Pi 1.5.2 was verified
+with the override.
+
 ## License
 
 MIT

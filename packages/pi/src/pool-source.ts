@@ -555,12 +555,13 @@ export class PiPoolSource {
   /**
    * Starts a refresh, through the store, of every candidate row whose token
    * is missing, run out or inside the refresh window; rows in a refresh
-   * backoff are left alone. Resolves once those refreshes have ended, which
-   * the request path never waits for. Never rejects.
+   * backoff are left alone. Requests wait only for rows without a usable
+   * token; a still-valid token refreshes in the background. Never rejects.
    */
-  refreshDueTokens(
+  prepareTokens(
     rows: readonly PoolRow[],
     settings: AccountStorage | null,
+    { waitForAll = false } = {},
   ): Promise<void> {
     if (this.setAside()) return Promise.resolve()
     const now = this.now()
@@ -571,11 +572,20 @@ export class PiPoolSource {
       const token = oauthAccess(row)
       if (!token) continue
       const left = (token.expires ?? 0) - now
-      const due = !token.access || !token.expires || left <= windowMs
+      const usable = this.usableToken(row, now)
+      const due = !usable || left <= windowMs
       if (!due || this.refreshBackedOff(row, now)) continue
-      runs.push(this.refresh(row.id))
+      const refreshed = this.refresh(row.id)
+      if (waitForAll || !usable) runs.push(refreshed)
     }
     return Promise.all(runs).then(() => {})
+  }
+
+  refreshDueTokens(
+    rows: readonly PoolRow[],
+    settings: AccountStorage | null,
+  ): Promise<void> {
+    return this.prepareTokens(rows, settings, { waitForAll: true })
   }
 
   /** True while a failed refresh of this row's current refresh token may not be retried. */

@@ -1,4 +1,7 @@
-import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
+import {
+  type AccountPaths,
+  isVaultHosted,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Api, Model } from '@earendil-works/pi-ai'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 // Imported from `/compat` rather than the deep `/api/openai-codex-responses`
@@ -25,7 +28,7 @@ import { PI_CODEX_BASE_URL } from './codex-wire.ts'
 import { registerCommands } from './commands.ts'
 import { PiOpenAIRuntime, type PiOpenAIRuntimeDeps } from './runtime.ts'
 import { preparePiSettingsStartup } from './settings-startup.ts'
-import { VAULT_PLACEHOLDER_KEY } from './vault-slot.ts'
+import { installHostedVaultKey, VAULT_PLACEHOLDER_KEY } from './vault-slot.ts'
 
 export { installRawCodexWebSocket } from './codex-websocket.ts'
 
@@ -130,7 +133,9 @@ export function registerPiProvider(
     name: 'OpenAI Codex (CortexKit)',
     // Pi's built-in Codex provider is OAuth-only. This enables its api_key
     // resolver for the vault slot without replacing Pi's OAuth login method.
-    ...(runtime.vaultMode() ? { apiKey: VAULT_PLACEHOLDER_KEY } : {}),
+    ...(isVaultHosted() || runtime.vaultMode()
+      ? { apiKey: VAULT_PLACEHOLDER_KEY }
+      : {}),
     models: openAICodexModels(),
     streamSimple: (model: Model<Api>, context, options) =>
       runtime.stream(model, context, options),
@@ -219,6 +224,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
           : undefined
       void runtime.start()
       try {
+        if (isVaultHosted()) {
+          await installHostedVaultKey(ctx.modelRegistry)
+          return
+        }
         await syncSlot()
       } catch {
         notify(

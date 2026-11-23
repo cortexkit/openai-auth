@@ -109,12 +109,12 @@ function sseOk(): Response {
   })
 }
 
-function whamOk(): Response {
+function whamOk(usedPercent = 10): Response {
   const resetAt = Math.floor((Date.now() + 7_200_000) / 1000)
   return Response.json({
     rate_limit: {
       primary_window: {
-        used_percent: 10,
+        used_percent: usedPercent,
         limit_window_seconds: 18_000,
         reset_at: resetAt,
       },
@@ -305,9 +305,11 @@ function poolFiles(): string[] {
 }
 
 describe('Pi in vault mode', () => {
-  test('host without a relay fails closed, hides enrollment actions and clears the placeholder when hosting ends', async () => {
+  test('host without a relay fails closed and leaves the native login untouched', async () => {
     await addExpiredLocalRow()
     writeNativeLogin()
+    const authPath = join(dir, 'auth.json')
+    const authBefore = readFileSync(authPath, 'utf8')
     const before = poolFiles()
     process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
     const target = vault()
@@ -315,16 +317,17 @@ describe('Pi in vault mode', () => {
     try {
       await runtime.syncVaultSlot()
       expect(await runtime.readAuthority()).toBe('host')
-      expect(
-        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))[
-          'openai-codex'
-        ],
-      ).toEqual({ type: 'api_key', key: VAULT_PLACEHOLDER_KEY })
+      expect(readFileSync(authPath, 'utf8')).toBe(authBefore)
       await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
       await runtime.commandSupport().refreshAllQuota()
-      expect(errorOf(await send(runtime))).toBe(
-        VAULT_MODE_REFUSALS['vault-unreachable'],
-      )
+      const result = await runtime
+        .stream(MODEL, CONTEXT, {
+          apiKey: NATIVE_ACCESS,
+          transport: 'sse',
+          fetch: fakeFetch,
+        })
+        .result()
+      expect(result.errorMessage).toBe(VAULT_MODE_REFUSALS['vault-unreachable'])
       expect(codexTokens).toEqual([])
       expect(whamTokens).toEqual([])
       expect(refreshes).toBe(0)
@@ -340,11 +343,7 @@ describe('Pi in vault mode', () => {
       )
       delete process.env.CORTEXKIT_VAULT_HOST
       await runtime.syncVaultSlot()
-      expect(
-        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))[
-          'openai-codex'
-        ],
-      ).toBeUndefined()
+      expect(readFileSync(authPath, 'utf8')).toBe(authBefore)
     } finally {
       await target.dispose()
     }
@@ -395,6 +394,104 @@ describe('Pi in vault mode', () => {
       }
     })
   }
+
+  test('vault quota minimum skips a below-floor route and reports a quota block when none qualify', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'chatgpt:openai': vaultLogin('chatgpt-low'),
+        'chatgpt:openai:work': vaultLogin('chatgpt-high'),
+      },
+    })
+    enroll()
+    const target = vault({
+      fetchImpl: () =>
+        (async (_input, init) =>
+          whamOk(
+            new Headers(init?.headers).get('authorization') ===
+              `Bearer ${chatgptAccessToken('chatgpt-low')}`
+              ? 75
+              : 25,
+          )) as typeof fetch,
+    })
+    const runtime = runtimeWith(target)
+    const setMinimum = (primary: number) =>
+      mutateAccounts((current) => {
+        current.quota = { enabled: true, minimumRemaining: { primary } }
+        return current
+      }, paths)
+    try {
+      await setMinimum(50)
+      await target.refresh()
+      await target.pollStale(0)
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-high')])
+
+      await setMinimum(90)
+      expect(errorOf(await send(runtime))).toBe(
+        'No OpenAI account meets the configured minimum remaining quota.',
+      )
+      expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-high')])
+    } finally {
+      await target.dispose()
+    }
+  })
+
+  test('an unread vault route still gets its first reading with a configured quota minimum', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'chatgpt:openai': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    await mutateAccounts((current) => {
+      current.quota = {
+        enabled: true,
+        failClosedOnUnknownQuota: true,
+        minimumRemaining: { primary: 50 },
+      }
+      return current
+    }, paths)
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      expect(target.routes()[0]?.quota).toBeUndefined()
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(whamTokens).toEqual([VAULT_ACCESS])
+      expect(codexTokens).toEqual([VAULT_ACCESS])
+    } finally {
+      await target.dispose()
+    }
+  })
+
+  test('vault sticky-to-ordered fallback uses roster order instead of preferring vault main', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'chatgpt:openai': vaultLogin('chatgpt-default'),
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+      },
+    })
+    enroll()
+    await setMode('sticky-balanced')
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      const routes = target.routes.bind(target)
+      spyOn(target, 'routes').mockImplementation(() => routes().reverse())
+      expect(target.routes().map((route) => route.credentialId)).toEqual([
+        'chatgpt:openai:work',
+        'chatgpt:openai',
+      ])
+      // Without a session id Pi cannot place a pin and must use ordered routing.
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-work')])
+    } finally {
+      await target.dispose()
+    }
+  })
 
   test('alias-only vault placements keep Ordered order and never serve the local main', async () => {
     daemon = await startMockDaemon({
@@ -1019,20 +1116,42 @@ describe("Pi's real model runtime in vault mode", () => {
 describe('Pi vault slot lifecycle', () => {
   test('connect then disconnect discards the original Pi sign-in and explains it is not restored', async () => {
     writeNativeLogin()
-    enroll()
+    const connected = Promise.withResolvers<string>()
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
     const target = vault()
     const runtime = runtimeWith(target)
     const authPath = join(dir, 'auth.json')
     const stashPath = join(stateDir, 'pi-openai-codex-login.json')
     try {
-      const view = await createPiMenu(runtime.commandSupport()).open({
+      const menu = createPiMenu(runtime.commandSupport(), {
+        afterApply: () => runtime.syncVaultSlot(undefined, true),
+        vaultWait: {
+          pollIntervalMs: 1,
+          sleep: async () => daemon?.approve('request-1'),
+        },
+      })
+      const connect = await menu.apply(
+        { command: 'openai', sectionId: 'vault', actionId: 'connect' },
+        { notify: (message) => connected.resolve(message) },
+      )
+      expect(connect.ok).toBe(true)
+      expect(await connected.promise).toContain('Connected: the vault approved')
+      expect(
+        JSON.parse(readFileSync(authPath, 'utf8'))['openai-codex'],
+      ).toEqual({
+        type: 'api_key',
+        key: VAULT_PLACEHOLDER_KEY,
+      })
+      const view = await menu.open({
         notify() {},
       })
       const disconnect = view.menu.sections
         .find((section) => section.id === 'vault')
         ?.actions.find((action) => action.id === 'disconnect')
       expect(disconnect?.confirm?.message).toContain('is not restored')
-      await runtime.syncVaultSlot()
       const keptCopyWhileConnected = existsSync(stashPath)
       const result = await createPiMenu(runtime.commandSupport()).apply(
         {
