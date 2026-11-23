@@ -177,8 +177,10 @@ async function start(overrides: Partial<PiOpenAIRuntimeDeps> = {}, ui = true) {
   runtime.main.observeToken(MAIN)
   await runtime.main.pending()
 }
-async function send(options: SimpleStreamOptions = {}) {
-  const events: AssistantMessageEvent[] = []
+async function send(
+  options: SimpleStreamOptions = {},
+  events: AssistantMessageEvent[] = [],
+) {
   for await (const event of runtime.stream(
     MODEL,
     { messages: [{ role: 'user', content: 'hi', timestamp: 0 }] },
@@ -709,7 +711,7 @@ describe('Pi bounded quota waits', () => {
     })
   }
 
-  test('OA-60 published head drains its late quota error without rerouting or waiting', async () => {
+  test('OA-60 published text delta drains its late quota error without rerouting or waiting', async () => {
     await addB()
     let waits = 0
     await start({
@@ -722,12 +724,79 @@ describe('Pi bounded quota waits', () => {
       ok(
         'data: {"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"late quota limit"}}}',
       )
-    const events = await send({ sessionId: 'published' })
-    expect(events[0]?.type).toBe('start')
-    expect(events.at(-1)?.type).toBe('error')
+    const events: AssistantMessageEvent[] = []
+    let beforeDelta: string[] | undefined
+    let beforeFailure: string[] | undefined
+    await send(
+      {
+        sessionId: 'published',
+        async onProviderStreamEvent(frame) {
+          if (!frame || typeof frame !== 'object' || !('type' in frame)) return
+          // Pause the provider so Pi can consume everything published so far.
+          await new Promise<void>((resolve) => setImmediate(resolve))
+          if (frame.type === 'response.output_text.delta')
+            beforeDelta = events.map((event) => event.type)
+          if (frame.type === 'response.failed')
+            beforeFailure = events.map((event) => event.type)
+        },
+      },
+      events,
+    )
+    expect(beforeDelta).toEqual([])
+    expect(beforeFailure).toEqual([
+      'start',
+      'text_start',
+      'text_delta',
+      'text_end',
+    ])
+    expect(events[2]).toMatchObject({ type: 'text_delta', delta: 'hello' })
+    expect(events.at(-1)).toMatchObject({ type: 'error' })
+    expect(text(events)).toContain('late quota limit')
     expect(sends).toEqual([MAIN])
     expect(waits).toBe(0)
     expect(decisions).toEqual([])
     expect(runtime.activity.get('published')).toBeUndefined()
+  })
+
+  test('a clean terminal event releases empty blocks in order without earlier publication', async () => {
+    await start()
+    reply = () =>
+      new Response(
+        [
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs","summary":[]}}',
+          'data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":""}',
+          'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs","summary":[]}}',
+          'data: {"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}',
+          '',
+        ].join('\n\n'),
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    const events: AssistantMessageEvent[] = []
+    let beforeDone: string[] | undefined
+    await send(
+      {
+        async onProviderStreamEvent(frame) {
+          if (
+            !frame ||
+            typeof frame !== 'object' ||
+            !('type' in frame) ||
+            frame.type !== 'response.completed'
+          )
+            return
+          await new Promise<void>((resolve) => setImmediate(resolve))
+          beforeDone = events.map((event) => event.type)
+        },
+      },
+      events,
+    )
+    expect(beforeDone).toEqual([])
+    expect(events.map((event) => event.type)).toEqual([
+      'start',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_end',
+      'done',
+    ])
+    expect(sends).toEqual([MAIN])
   })
 })

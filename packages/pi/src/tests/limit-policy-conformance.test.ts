@@ -48,7 +48,7 @@ afterEach(async () => {
 
 async function fixture(
   status: number,
-  head: 'error' | 'start' | 'throw',
+  head: 'error' | 'start' | 'held' | 'text' | 'tool' | 'throw',
   floors?: {
     primary: number
     secondary: number
@@ -101,6 +101,38 @@ async function fixture(
       const failed =
         token === MAIN &&
         !(hold && (recovered || (hold.cache && attempts.length === 1)))
+      const event = errorEvent(
+        model,
+        failed ? 'original A event' : 'selected B event',
+      )
+      if (event.type !== 'error')
+        throw new Error('error fixture must contain an assistant message')
+      if (failed && head === 'held') {
+        const partial = event.error
+        partial.content = [
+          { type: 'text', text: '' },
+          { type: 'thinking', thinking: '' },
+        ]
+        stream.push({ type: 'start', partial })
+        stream.push({ type: 'text_start', contentIndex: 0, partial })
+        stream.push({ type: 'text_delta', delta: '', contentIndex: 0, partial })
+        stream.push({ type: 'text_end', content: '', contentIndex: 0, partial })
+        stream.push({ type: 'thinking_start', contentIndex: 1, partial })
+        stream.push({
+          type: 'thinking_delta',
+          delta: '',
+          contentIndex: 1,
+          partial,
+        })
+        stream.push({
+          type: 'thinking_end',
+          content: '',
+          contentIndex: 1,
+          partial,
+        })
+        // Let the runtime consume the entire lifecycle prefix before it can see the status.
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
       await options?.onResponse?.(
         {
           status: failed ? status : 200,
@@ -120,14 +152,27 @@ async function fixture(
         },
         model,
       )
-      const event = errorEvent(
-        model,
-        failed ? 'original A event' : 'selected B event',
-      )
-      if (event.type !== 'error')
-        throw new Error('error fixture must contain an assistant message')
-      if (failed && head === 'error') stream.push(event)
-      else {
+      if (failed && head !== 'start') {
+        const partial = event.error
+        if (head === 'text') {
+          partial.content = [{ type: 'text', text: 'A text' }]
+          stream.push({ type: 'start', partial })
+          stream.push({ type: 'text_start', contentIndex: 0, partial })
+          stream.push({
+            type: 'text_delta',
+            contentIndex: 0,
+            delta: 'A text',
+            partial,
+          })
+        } else if (head === 'tool') {
+          partial.content = [
+            { type: 'toolCall', id: 'call_a', name: 'test', arguments: {} },
+          ]
+          stream.push({ type: 'start', partial })
+          stream.push({ type: 'toolcall_start', contentIndex: 0, partial })
+        }
+        stream.push(event)
+      } else {
         stream.push({ type: 'start', partial: event.error })
         stream.push({
           type: 'done',
@@ -273,6 +318,62 @@ describe('Pi limit-policy conformance', () => {
       })
     }
   }
+
+  test('OA-57 ordered 429 after only empty events moves without publishing them', async () => {
+    const f = await fixture(429, 'held')
+    const events = await f.send()
+    expect(f.attempts).toEqual([MAIN, B])
+    expect(f.waits).toEqual([])
+    expect(events.map((event) => event.type)).toEqual(['start', 'done'])
+    expect(JSON.stringify(events)).not.toContain('original A event')
+    expect(JSON.stringify(events)).toContain('selected B event')
+  })
+
+  test('OA-57 fitting-cache companion holds after only empty events without publishing them', async () => {
+    const f = await fixture(429, 'held', undefined, {
+      cache: true,
+      secondary: 120_000,
+    })
+    await f.send()
+    const events = await f.send()
+    expect(f.attempts).toEqual([MAIN, MAIN, MAIN])
+    expect(f.waits).toEqual([120_000])
+    expect(events.map((event) => event.type)).toEqual(['start', 'done'])
+    expect(JSON.stringify(events)).not.toContain('original A event')
+  })
+
+  test('OA-60 a text delta takes precedence over a captured 429', async () => {
+    const f = await fixture(429, 'text')
+    const events = await f.send()
+    expect(f.attempts).toEqual([MAIN])
+    expect(f.waits).toEqual([])
+    expect(events.map((event) => event.type)).toEqual([
+      'start',
+      'text_start',
+      'text_delta',
+      'error',
+    ])
+    expect(events[2]).toMatchObject({ delta: 'A text' })
+  })
+
+  test('OA-60 toolcall_start takes precedence over a captured 429', async () => {
+    const f = await fixture(429, 'tool')
+    const events = await f.send()
+    expect(f.attempts).toEqual([MAIN])
+    expect(f.waits).toEqual([])
+    expect(events.map((event) => event.type)).toEqual([
+      'start',
+      'toolcall_start',
+      'error',
+    ])
+    expect(events[1]).toMatchObject({
+      partial: {
+        content: [
+          { type: 'toolCall', id: 'call_a', name: 'test', arguments: {} },
+        ],
+      },
+    })
+  })
 
   test('OA-57 synchronous setup throw has no captured status and cannot advance', async () => {
     const f = await fixture(429, 'throw')

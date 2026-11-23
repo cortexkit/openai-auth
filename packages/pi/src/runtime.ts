@@ -168,10 +168,29 @@ const VAULT_TOKENS_KEPT = 64
 
 /** An attempt as the router sees it, with the events it produced so far. */
 interface StreamAttempt extends RouteAttempt {
-  /** The first event (when there was one), held until the attempt is chosen. */
-  head: AssistantMessageEvent | undefined
+  /** The events through the first output or terminal event, held until selection. */
+  buffered: AssistantMessageEvent[]
   /** The rest of the attempt's events, when it is streaming. */
   rest: AsyncIterator<AssistantMessageEvent> | undefined
+}
+
+function isPiOutput(event: AssistantMessageEvent): boolean {
+  // pi-ai mutates partial in place. Use the event's own text instead of reading
+  // later content through an earlier lifecycle event.
+  switch (event.type) {
+    case 'text_delta':
+    case 'thinking_delta':
+      return event.delta.length > 0
+    case 'text_end':
+    case 'thinking_end':
+      return event.content.length > 0
+    case 'toolcall_start':
+    case 'toolcall_delta':
+    case 'toolcall_end':
+      return true
+    default:
+      return false
+  }
 }
 
 function emptyUsage(): AssistantMessage['usage'] {
@@ -799,7 +818,7 @@ export class PiOpenAIRuntime {
           }
           endWait?.('resumed')
           endWait = undefined
-          if (attempt.head) outer.push(attempt.head)
+          for (const event of attempt.buffered) outer.push(event)
           if (attempt.rest) {
             for (;;) {
               const next = await attempt.rest.next()
@@ -962,9 +981,8 @@ export class PiOpenAIRuntime {
   }
 
   /**
-   * Sends the request once with `token` and waits for its first event. An
-   * attempt whose first event is an error has ended without streaming
-   * anything, so the router may try another account.
+   * Sends the request once with `token` and waits for output or termination.
+   * Lifecycle events alone do not commit the attempt to a serving account.
    */
   private async attempt(
     model: Model<Api>,
@@ -1136,17 +1154,20 @@ export class PiOpenAIRuntime {
     } catch (error) {
       billing?.end(false, false, status)
       return {
-        head: errorEvent(model, redactCredentialError(error, token).message),
+        buffered: [
+          errorEvent(model, redactCredentialError(error, token).message),
+        ],
         rest: undefined,
       }
     }
     const runtime = this
+    let outputStarted = false
     const iterator = (async function* () {
       let stopped = false
       let failed = false
-      let outputStarted = false
       try {
         for await (const event of inner) {
+          outputStarted ||= isPiOutput(event)
           if (event.type === 'done') stopped = true
           if (billing) {
             if (event.type === 'done')
@@ -1154,19 +1175,9 @@ export class PiOpenAIRuntime {
             else if (event.type === 'error') {
               billing.piResponseId(event.error.responseId)
               if (event.reason !== 'aborted') billing.event({ type: 'error' })
-              // A first error is consumed by routing, which may discard the iterator.
+              // Routing may discard an unpublished error without draining the iterator.
               billing.end(outputStarted, false, status)
-            } else if (
-              [
-                'text_start',
-                'text_delta',
-                'thinking_start',
-                'thinking_delta',
-                'toolcall_start',
-                'toolcall_delta',
-              ].includes(event.type)
-            )
-              outputStarted = true
+            }
           }
           if (event.type === 'error') {
             failed = true
@@ -1198,15 +1209,31 @@ export class PiOpenAIRuntime {
         billing?.end(outputStarted, stopped && !failed, status)
       }
     })()
-    const first = await iterator.next()
-    const head = first.done ? undefined : first.value
+    const buffered: AssistantMessageEvent[] = []
+    let rest: StreamAttempt['rest']
+    for (;;) {
+      const next = await iterator.next()
+      if (next.done) {
+        buffered.length = 0
+        break
+      }
+      const event = next.value
+      buffered.push(event)
+      if (event.type === 'error') break
+      if (outputStarted || event.type === 'done') {
+        rest = iterator
+        break
+      }
+    }
     return {
-      ...(status !== undefined ? { status } : {}),
+      // The observed status still reaches billing. Neither the account router
+      // nor vault credential recovery may use it to replay an output attempt.
+      ...(status !== undefined && !outputStarted ? { status } : {}),
       ...(accountKey ? { accountKey } : {}),
-      ...(signal ? { signal } : {}),
+      ...(signal && !outputStarted ? { signal } : {}),
       ...(reading ? { reading } : {}),
-      head,
-      rest: first.done || head?.type === 'error' ? undefined : iterator,
+      buffered,
+      rest,
     }
   }
 

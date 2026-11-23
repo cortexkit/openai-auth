@@ -1825,6 +1825,7 @@ for (const { outcome, plan, warming } of [
   { outcome: 'error', plan: undefined, warming: { on: false } },
   { outcome: 'error-id', plan: undefined, warming: { on: false } },
   { outcome: 'aborted', plan: undefined, warming: { on: false } },
+  { outcome: 'aborted-after-output', plan: undefined, warming: { on: false } },
 ] as const) {
   test.each(['main-first', 'sticky-balanced'] as const)(
     `billing Pi %s injected vault stream ${outcome} plan ${plan ?? 'none'} reports once with Pi session id`,
@@ -1857,19 +1858,27 @@ for (const { outcome, plan, warming } of [
           const stream = createAssistantMessageEventStream()
           const error = errorEvent(model, 'provider failed')
           if (error.type !== 'error') throw new Error('expected error fixture')
-          if (
-            outcome === 'error' ||
-            outcome === 'error-id' ||
-            outcome === 'aborted'
-          ) {
-            if (outcome === 'aborted')
+          const aborted =
+            outcome === 'aborted' || outcome === 'aborted-after-output'
+          if (outcome === 'error' || outcome === 'error-id' || aborted) {
+            if (aborted) {
+              stream.push({ type: 'start', partial: error.error })
               stream.push({
                 type: 'text_start',
                 contentIndex: 0,
                 partial: error.error,
               })
+              const delta = outcome === 'aborted-after-output' ? 'reply' : ''
+              error.error.content = [{ type: 'text', text: delta }]
+              stream.push({
+                type: 'text_delta',
+                contentIndex: 0,
+                delta,
+                partial: error.error,
+              })
+            }
             stream.push(
-              outcome === 'aborted'
+              aborted
                 ? { ...error, reason: 'aborted' }
                 : outcome === 'error-id'
                   ? {
@@ -1925,7 +1934,7 @@ for (const { outcome, plan, warming } of [
             outcome:
               outcome === 'completed'
                 ? 'completed'
-                : outcome === 'aborted'
+                : outcome === 'aborted-after-output'
                   ? 'cut'
                   : 'failed',
             attempt: 1,
