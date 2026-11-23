@@ -97,7 +97,9 @@ const PREPARE_SETTLE_MS = 25_000
  * The held-open cleanup cases use it too: they run the move up to three times
  * over the same files and wait out a 500 ms sharing-violation budget, and on
  * one windows-2022 run (21 Nov 2026) took 1.6, 2.5 and 5.0 s while the same
- * job on windows-latest passed.
+ * job on windows-latest passed. The two-config-folder case moves two full
+ * layouts: 0.48-0.91 s on six windows-2022 and windows-latest runs, then
+ * 5.4 s once on windows-latest (23 Nov 2026) while its neighbours stayed normal.
  * Don't raise this further without measuring where the time goes.
  */
 const CREDENTIAL_CASE_TIMEOUT_MS = 20_000
@@ -1328,32 +1330,38 @@ describe('paths the move must not touch', () => {
     expect(present(configDir(), oldLayout())).toEqual(oldLayout())
   })
 
-  it('two config folders never share a runtime folder', async () => {
-    const first = join(root, 'first-config')
-    const second = join(root, 'second-config')
-    seed(first, oldLayout('first'))
-    seed(second, oldLayout('second'))
+  it(
+    'two config folders never share a runtime folder',
+    async () => {
+      const first = join(root, 'first-config')
+      const second = join(root, 'second-config')
+      seed(first, oldLayout('first'))
+      seed(second, oldLayout('second'))
 
-    process.env.OPENCODE_CONFIG_DIR = first
-    expect(await prepare()).toBe('state-home')
-    const firstDir = runtimeDir()
+      process.env.OPENCODE_CONFIG_DIR = first
+      expect(await prepare()).toBe('state-home')
+      const firstDir = runtimeDir()
 
-    resetProcess()
-    process.env.OPENCODE_CONFIG_DIR = second
-    expect(await prepare()).toBe('state-home')
-    const secondDir = runtimeDir()
+      resetProcess()
+      process.env.OPENCODE_CONFIG_DIR = second
+      expect(await prepare()).toBe('state-home')
+      const secondDir = runtimeDir()
 
-    expect(secondDir).not.toBe(firstDir)
-    expect(present(firstDir, oldLayout('first'))).toEqual(oldLayout('first'))
-    expect(present(secondDir, oldLayout('second'))).toEqual(oldLayout('second'))
-    for (const [dir, config] of [
-      [firstDir, first],
-      [secondDir, second],
-    ] as const)
-      expect(
-        JSON.parse(readFileSync(join(dir, 'config-dir.json'), 'utf8')),
-      ).toEqual({ version: 1, configDir: config })
-  })
+      expect(secondDir).not.toBe(firstDir)
+      expect(present(firstDir, oldLayout('first'))).toEqual(oldLayout('first'))
+      expect(present(secondDir, oldLayout('second'))).toEqual(
+        oldLayout('second'),
+      )
+      for (const [dir, config] of [
+        [firstDir, first],
+        [secondDir, second],
+      ] as const)
+        expect(
+          JSON.parse(readFileSync(join(dir, 'config-dir.json'), 'utf8')),
+        ).toEqual({ version: 1, configDir: config })
+    },
+    CREDENTIAL_CASE_TIMEOUT_MS,
+  )
 })
 
 /** The vault mode an older version reads from OpenCode's config folder. */
