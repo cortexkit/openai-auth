@@ -262,7 +262,11 @@ export async function installPoolHooks<Q, A extends OpenAIAttemptData>(
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
   // constructs the final Request. Async-local storage carries that handle to
   // this hook's final snapshot without sharing a latest attempt across requests.
-  type HookObservation = { attempt?: Attempt<A>; signal?: AbortSignal }
+  type HookObservation = {
+    attempt?: Attempt<A>
+    signal?: AbortSignal
+    transportSelection: boolean
+  }
   const observing = new AsyncLocalStorage<HookObservation>()
   // Receive/retry hooks have no request object to identify the send they answer.
   // They answer the last handshake or send for this session, so remember its
@@ -316,7 +320,10 @@ export async function installPoolHooks<Q, A extends OpenAIAttemptData>(
             // The WebSocket handshake exposes no abort signal, so a placement
             // retry there can only rely on its bounded delay.
             const signal = request?.request.signal
-            const observation: HookObservation = { signal }
+            const observation: HookObservation = {
+              signal,
+              transportSelection: Boolean(request || handshake),
+            }
             if (handshake)
               sockets.delete(`${handshake.sessionID}:${handshake.kind}`)
             try {
@@ -512,6 +519,14 @@ export async function installPoolHooks<Q, A extends OpenAIAttemptData>(
         // The installer does not pass the HTTP request's signal to selection.
         const choice = { ...input, signal: observing.getStore()?.signal }
         return adapter.chooseAccount(choice)
+      },
+      dropChoice: (input) => {
+        const choice = {
+          ...input,
+          duringTransportSelection:
+            observing.getStore()?.transportSelection === true,
+        }
+        return adapter.dropChoice?.(choice)
       },
       answeredBy: async (input) => {
         const answered = await adapter.answeredBy?.(input)

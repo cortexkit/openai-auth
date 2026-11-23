@@ -38,7 +38,10 @@
 // attempt is reported to the vault against that record version.
 
 import { randomUUID } from 'node:crypto'
-import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
+import {
+  type ClaustrumScopedAttempt,
+  decideScopedRetryAfter401,
+} from '@cortexkit/common-auth/claustrum'
 import {
   createRequestHistory,
   type LimitCandidate,
@@ -173,6 +176,7 @@ export const DEFAULT_LIMIT_MARK_MS = 60_000
 
 /** The WebSocket handshake supplies no request signal to cancel a capacity wait. */
 const CAPACITY_WAIT_WITHOUT_SIGNAL_MS = 600_000
+const VAULT_HTTP_401 = 'vault_http_401'
 
 /**
  * The size every request counts for in sticky placement. OpenCode 2 hands
@@ -692,11 +696,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       end: NonNullable<ReturnType<typeof startVaultRoutingWait>>
     }
   >()
+  type EndWait = NonNullable<ReturnType<typeof startVaultRoutingWait>>
+  const activeWaits = new Map<string, Set<EndWait>>()
+  const routingHoldEnds = new WeakMap<LimitSignal, EndWait>()
+  const routingWakeEnds = new WeakMap<WaitCheckpoint, EndWait>()
+  const clearedRoutingHolds = new WeakSet<WaitCheckpoint>()
   const startWait = (
     input: ChooseAccountInput,
     reason: 'account_limit' | 'account_free' | 'quota_reading',
     at: number,
     delayMs: number,
+    onEnd?: EndWait,
   ) => {
     if (!hasVaultRoutingAccessor()) return undefined
     const attempt = (waitCounts.get(input.sessionID) ?? 0) + 1
@@ -709,10 +719,21 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         : { nextMs: at + delayMs }),
       attempt,
     })
-    if (end) waitCounts.set(input.sessionID, attempt)
-    return end
+    if (!end) return undefined
+    waitCounts.set(input.sessionID, attempt)
+    const waits = activeWaits.get(input.sessionID) ?? new Set<EndWait>()
+    activeWaits.set(input.sessionID, waits)
+    const finish: EndWait = (outcome) => {
+      if (!waits.delete(finish)) return
+      if (waits.size === 0) activeWaits.delete(input.sessionID)
+      end(outcome)
+      onEnd?.(outcome)
+    }
+    waits.add(finish)
+    return finish
   }
   const clearTurn = (sessionId: string) => {
+    for (const end of activeWaits.get(sessionId) ?? []) end('abandoned')
     waitCounts.delete(sessionId)
     for (const key of pendingWaits.keys())
       if (JSON.parse(key)[0] === sessionId) pendingWaits.delete(key)
@@ -797,6 +818,27 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   }
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
+  // The installer carries the exact response marker into the retry hook, which
+  // otherwise has no request or attempt handle. The marker is not a quota signal.
+  const authMarkers = new WeakMap<Attempt<OpenAIAttemptData>, LimitSignal>()
+  const seen401s = new WeakSet<Attempt<OpenAIAttemptData>>()
+  const terminal401s = new WeakSet<Attempt<OpenAIAttemptData>>()
+  // HTTP attempt-end runs before the host asks whether to retry. Keep a
+  // successful rotation only as long as that installer-owned marker survives.
+  const rotatedReceipts = new WeakMap<
+    LimitSignal,
+    { receipt: ClaustrumScopedAttempt; freeQuota: boolean; signal: AbortSignal }
+  >()
+  const authRetries = new Map<
+    string,
+    {
+      marker: LimitSignal
+      receipt: ClaustrumScopedAttempt
+      freeQuota: boolean
+      signal: AbortSignal
+    }
+  >()
+  const retriedWithRotation = new WeakSet<OpenAIAttemptData>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
   const sessionAccounts = deps.sessionAccounts ?? new SessionAccounts()
@@ -1020,6 +1062,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const chooseAccount = async (
     input: ChooseAccountInput & { signal?: AbortSignal },
   ): Promise<ChooseAccountResult> => {
+    if (input.rerouteFrom?.limit.reason === VAULT_HTTP_401)
+      return { hostRetry: 'veto' }
     let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
     const storage = getResolvedSettingsView(
@@ -1071,9 +1115,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     let at = now()
     let targets = currentTargets(storage, at, vaultMode)
     const checkpoint = input.wake?.checkpoint
+    if (checkpoint && clearedRoutingHolds.has(checkpoint)) throw vaultRefusal()
     const wake = checkpoint && routingWakes.get(checkpoint)
     if (wake && checkpoint) {
       routingWakes.delete(checkpoint)
+      routingWakeEnds.get(checkpoint)?.('resumed')
       const accountId = checkpoint.accountKey.accountId
       const receipt =
         vaultMode &&
@@ -1228,8 +1274,27 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 ? vaultRoutingPlacementRetryMs(answer)
                 : undefined
               if (delayMs === undefined) throw routingRefusal()
-              await waitForRoutingRetry(delayMs, capacitySignal)
-              capacitySignal?.throwIfAborted()
+              const cleared = new AbortController()
+              const signal = capacitySignal
+                ? AbortSignal.any([capacitySignal, cleared.signal])
+                : cleared.signal
+              const end = startWait(
+                input,
+                'account_free',
+                now(),
+                delayMs,
+                (outcome) => {
+                  if (outcome === 'abandoned') cleared.abort(routingRefusal())
+                },
+              )
+              try {
+                await waitForRoutingRetry(delayMs, signal)
+                signal.throwIfAborted()
+                end?.('resumed')
+              } catch (error) {
+                end?.(input.signal?.aborted ? 'cancelled' : 'abandoned')
+                throw error
+              }
               at = now()
               targets = currentTargets(storage, at, vaultMode)
               continue
@@ -1335,6 +1400,24 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           blockers: [],
         }
         routingWakes.set(checkpoint, receipt)
+        const end = startWait(
+          input,
+          'account_limit',
+          checkpoint.decidedAt,
+          delayMs,
+          (outcome) => {
+            routingHoldEnds.delete(signal)
+            routingWakeEnds.delete(checkpoint)
+            if (outcome !== 'resumed') {
+              routingWakes.delete(checkpoint)
+              clearedRoutingHolds.add(checkpoint)
+            }
+          },
+        )
+        if (end) {
+          routingHoldEnds.set(signal, end)
+          routingWakeEnds.set(checkpoint, end)
+        }
         return {
           hold: {
             delayMs,
@@ -2029,6 +2112,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const { accountId } = request
     interrupted.delete(requestKey(request))
     const choiceKey = receiptKey(request)
+    const authRetry = authRetries.get(choiceKey)
+    authRetries.delete(choiceKey)
     const keptChoice = keptChoices.get(choiceKey)
     keptChoices.delete(choiceKey)
     const commitChoice = () => {
@@ -2110,13 +2195,27 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         })
       }
       // In vault mode no pool row is sent with, so only the vault is asked.
-      const row =
-        vault && (await vault.authority()) !== 'local'
-          ? undefined
-          : source.peek().rows.find((candidate) => candidate.id === accountId)
+      const inVault = vault && (await vault.authority()) !== 'local'
+      if (authRetry) {
+        const route = inVault
+          ? vault.routes().find(({ id }) => id === accountId)
+          : undefined
+        if (
+          route?.kind !== 'oauth' ||
+          authRetry.signal.aborted ||
+          (route.credentialId !== undefined &&
+            route.credentialId !== authRetry.receipt.credentialId) ||
+          (route.identity !== undefined &&
+            route.identity !== authRetry.receipt.accountIdentity)
+        )
+          throw refuse()
+      }
+      const row = inVault
+        ? undefined
+        : source.peek().rows.find((candidate) => candidate.id === accountId)
       if (!row && vault) {
         const key = receiptKey(request)
-        const choice = receipts.get(key)
+        const choice = authRetry ?? receipts.get(key)
         const receipt = choice?.receipt ?? (await vault.authorize(accountId))
         receipts.delete(key)
         if (!receipt) {
@@ -2134,6 +2233,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           receipt,
           ...(choice?.freeQuota ? { freeQuota: true } : {}),
         }
+        if (authRetry) retriedWithRotation.add(data)
         await prepareFeedback(data)
         commitChoice()
         return {
@@ -2186,6 +2286,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   > = {
     providerID: OPENAI_PROVIDER_ID,
     async retrySameAccount(input) {
+      if (input.limit?.reason === VAULT_HTTP_401) {
+        const rotated = rotatedReceipts.get(input.limit)
+        rotatedReceipts.delete(input.limit)
+        if (!rotated || rotated.signal.aborted || input.continuation)
+          return undefined
+        authRetries.set(receiptKey(input), { ...rotated, marker: input.limit })
+        return { accountId: input.accountId }
+      }
       if (input.continuation !== 'interrupted-read') return undefined
       const previous = interrupted.get(requestKey(input))
       interrupted.delete(requestKey(input))
@@ -2255,8 +2363,22 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       return { accountId: input.accountId }
     },
-    dropSameAccountRetry() {},
-    dropChoice(input) {
+    dropSameAccountRetry(input) {
+      if (input.limit?.reason !== VAULT_HTTP_401) return
+      rotatedReceipts.delete(input.limit)
+      const key = receiptKey(input)
+      if (authRetries.get(key)?.marker === input.limit) authRetries.delete(key)
+    },
+    dropChoice(
+      input: Parameters<NonNullable<OpenCode2AuthAdapter['dropChoice']>>[0] & {
+        duringTransportSelection?: boolean
+      },
+    ) {
+      const signal = input.rerouteFrom?.limit
+      // The installer releases the old choice just before rechecking a hold's
+      // checkpoint. Only a release outside transport selection ends that wait.
+      if (signal && input.duringTransportSelection === false)
+        routingHoldEnds.get(signal)?.('cancelled')
       const key = receiptKey(input)
       dropRequestHandoff(key)
       keptChoices.get(key)?.drop()
@@ -2265,6 +2387,55 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     chooseAccount,
     accountHeaders,
+    async answeredBy({ request, response, attempt }) {
+      const data = attempt.data
+      if (
+        response.status !== 401 ||
+        seen401s.has(attempt) ||
+        attempt.transport !== 'http' ||
+        data?.kind !== 'vault' ||
+        request.headers.get('authorization') !==
+          `Bearer ${data.receipt.accessToken}`
+      )
+        return undefined
+      seen401s.add(attempt)
+      terminal401s.add(attempt)
+      if (
+        !vault ||
+        data.receipt.fromKeptReceipt ||
+        retriedWithRotation.has(data) ||
+        attemptsWithOutput.has(attempt) ||
+        request.signal.aborted
+      )
+        return undefined
+      const current = await vault.authorize(data.routeId, {
+        signal: request.signal,
+      })
+      if (
+        !request.signal.aborted &&
+        decideScopedRetryAfter401('opencode2-http', data.receipt, current, log)
+      ) {
+        const marker: LimitSignal = { status: 401, reason: VAULT_HTTP_401 }
+        rotatedReceipts.set(marker, {
+          receipt: current,
+          freeQuota: data.freeQuota === true,
+          signal: request.signal,
+        })
+        authMarkers.set(attempt, marker)
+        terminal401s.delete(attempt)
+      }
+      return undefined
+    },
+    rewriteResponse({ attempt, response }) {
+      if (!terminal401s.has(attempt)) return undefined
+      void response.body?.cancel().catch(() => {})
+      return Response.json(
+        { error: { message: NO_ACCOUNT_REFUSAL } },
+        { status: 401 },
+      )
+    },
+    responseRetry: ({ attempt }) =>
+      terminal401s.has(attempt) ? 'veto' : undefined,
     async rewriteRequest({ request, sessionID, kind, attempt }) {
       const url = deps.codexEndpoint
         ? codexRequestURL(request.url, deps.codexEndpoint())
@@ -2310,6 +2481,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     async limitFromResponse({ status, headers, body, attempt }) {
       if (status < 400) return undefined
+      if (status === 401 && attempt.data?.kind === 'vault')
+        return authMarkers.get(attempt)
       const receivedAt =
         attempt.data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&
@@ -2482,6 +2655,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return verdict
     },
     limitFromError(error: HostError, attempt) {
+      if (error.status === 401 && attempt.data?.kind === 'vault')
+        return undefined
       const parsed = parseJson(error.message)
       const at = now()
       const reading = quotaFor(
@@ -2551,11 +2726,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       return limit
     },
-    // A 401 on a send the vault authorized is reported to the vault against
-    // the record version in that send's receipt; no other status is
-    // reported. Only an HTTP response gives a status here: OpenCode 2 runs no
-    // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
+      authMarkers.delete(attempt)
       const record =
         attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()
           ? billing.get(attempt)
@@ -2599,7 +2771,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 },
           )
         }
-        state.owner?.afterProbe(state.probe, clean, Boolean(outcome.limit))
+        state.owner?.afterProbe(
+          state.probe,
+          clean,
+          Boolean(outcome.limit && outcome.limit.reason !== VAULT_HTTP_401),
+        )
       }
       if (
         data &&
@@ -2638,6 +2814,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&
         outcome.limit &&
+        outcome.limit.reason !== VAULT_HTTP_401 &&
         routingLimitBodies?.has(attempt) &&
         !routingLimitsHandled?.has(attempt)
       ) {
@@ -2697,10 +2874,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           ...response,
           failed: routingFailures.has(attempt),
         })
-      if (data?.kind !== 'vault' || outcome.status !== 401) return
-      log?.warn('a vault account answered 401; reporting it to the vault', {
-        accountId: attempt.accountId,
-      })
+      if (data?.kind !== 'vault' || !terminal401s.has(attempt)) return
+      // The vault consumer drops an outage-cached receipt without sending an
+      // authentication failure report to the vault.
       await vault?.reportFailure(data.receipt, 401)
     },
   }
@@ -2801,10 +2977,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
     },
     dispose: () => {
+      for (const waits of activeWaits.values())
+        for (const end of waits) end('abandoned')
       unplacedTurns.clear()
       heldTurns.clear()
       waitCounts.clear()
       pendingWaits.clear()
+      authRetries.clear()
       billingCounts.clear()
     },
     attach(installation) {
@@ -2814,6 +2993,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       // The installer waits for this listener before it asks the host to
       // retry, so the mark is in place when `chooseAccount` runs again.
       installation.on('limit', (event) => {
+        if (event.limit.reason === VAULT_HTTP_401) return
         markLimited(event.accountId, event.limit, event.handle)
         log?.debug('pool row refused the request', {
           accountId: event.accountId,

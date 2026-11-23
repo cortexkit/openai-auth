@@ -3,13 +3,12 @@
 // receipt; a 401 on a local pool account is the pool's own business. The vault
 // rotates a refreshable credential on every report it applies. The shared vault
 // consumer also refuses a report for a send it never authorized, so this check
-// is the first of two layers: without it the adapter would still log a false
-// "vault account answered 401" warning and re-read the vault's account list.
+// is the first of two layers and avoids reading the vault's roster for a local 401.
 //
 // The vault here is a stand-in that records every call the adapter makes to
 // it; the adapter runs behind the real installer on a fake OpenCode 2 host.
 
-import { describe, expect, it, spyOn } from 'bun:test'
+import { describe, expect, it, mock, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +16,7 @@ import {
   ClaustrumConsumer,
   type ClaustrumScopedAttempt,
 } from '@cortexkit/common-auth/claustrum'
+import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
   installOpenCode2Auth,
   placeholderSecret,
@@ -27,10 +27,16 @@ import {
   type AccountStorage,
   OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
+import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolView } from '../core/pool-account-source'
 import { createOpenAIAdapter, type PoolAccess } from '../v2/adapter'
 import { SessionPins } from '../v2/pins'
+import { installPoolHooks } from '../v2/setup'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
+import {
+  restoreRoutingAccessor,
+  routingKey,
+} from './fixtures/opencode2-routing'
 
 const PLACEHOLDER = placeholderSecret('openai')
 const HOUR = 3600_000
@@ -191,6 +197,228 @@ describe('vault failure reports on OpenCode 2', () => {
     ])
   })
 })
+
+async function recoveryFixture() {
+  const requestScope = scope('session-401')
+  const report = mock((_payload: unknown) => {})
+  Reflect.set(globalThis, routingKey, () => ({ report }))
+  let current: ClaustrumScopedAttempt | undefined = receipt()
+  const authorize = mock(async () => current)
+  const reportFailure = mock(
+    async (_receipt: ClaustrumScopedAttempt, _status: number) => {},
+  )
+  const enqueue = mock(() => {})
+  const dropSignal = mock(() => {})
+  const debug = mock(() => {})
+  const binding = {
+    account: { namespace: 'vault', accountId: VAULT_ROUTE, incarnation: '1' },
+  }
+  const registry = {}
+  const limits = {
+    activity: createSessionActivityStore(),
+    forRequest: async () => undefined,
+    bindings: () => [binding],
+    accountKey: (id: string) =>
+      id === VAULT_ROUTE ? binding.account : undefined,
+    marks: () => new Map(),
+    owner: () => ({
+      registry,
+      enqueue,
+      dropSignal,
+      observe: () => ({ binding, registry, baseRevision: 1 }),
+      afterProbe() {},
+    }),
+  } as unknown as OpenCodeLimitSource
+  const openai = createOpenAIAdapter({
+    source: poolSource,
+    storage: async () => ({
+      version: 1,
+      accounts: [],
+      routing: { mode: 'fallback-first' },
+    }),
+    pins: new SessionPins(),
+    limits,
+    log: { debug, warn() {} },
+    vault: {
+      routes: () => [
+        {
+          id: VAULT_ROUTE,
+          credentialId: VAULT_ROUTE,
+          kind: 'oauth',
+          identity: 'chatgpt-vault',
+          quota: healthyQuota(),
+        },
+      ],
+      identities: () => new Set(['chatgpt-vault']),
+      enrolled: () => true,
+      authority: async () => 'vault',
+      snapshot: () => undefined,
+      authorize,
+      reportFailure,
+      recordSnapshot: async () => {},
+      reportUsage() {},
+      requestReading() {},
+      grantReach: () => undefined,
+      name: 'openai-auth-opencode',
+    },
+  })
+  const host = fakeOpenCode2Host()
+  const installation = await installPoolHooks(host.ctx, openai.adapter, {
+    warn() {},
+  })
+  openai.attach(installation)
+  const dispatched: Request[] = []
+  return {
+    authorize,
+    reportFailure,
+    report,
+    enqueue,
+    dropSignal,
+    debug,
+    dispatched,
+    setReceipt(next: ClaustrumScopedAttempt | undefined) {
+      current = next
+    },
+    async send(label: string) {
+      const draft = await host.fire('http.request', {
+        ...requestScope,
+        request: new Request('https://codex.test/responses', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'gpt-5.5',
+            input: [{ role: 'user', content: label }],
+          }),
+          headers: { authorization: `Bearer ${PLACEHOLDER}` },
+        }),
+      })
+      dispatched.push(draft.request)
+      return draft.request
+    },
+    async answer(request: Request) {
+      const { response } = await host.fire('http.response', {
+        ...requestScope,
+        request,
+        // A misleading body must not promote a credential refusal to a quota mark.
+        response: Response.json(
+          {
+            error: { type: 'usage_limit_reached', message: 'private details' },
+          },
+          { status: 401 },
+        ),
+      })
+      return response
+    },
+    async retry(attempt: number, retry = false) {
+      const result = await host.fire('retry', {
+        ...requestScope,
+        attempt,
+        decision: retry ? { retry: true, delay: 1 } : { retry: false },
+        error: { type: 'api', status: 401, message: 'HTTP 401' },
+      })
+      return result.decision
+    },
+    async dispose() {
+      await installation.dispose()
+      openai.dispose()
+      restoreRoutingAccessor()
+    },
+  }
+}
+
+it('retries the attributable vault HTTP 401 once with a rotated receipt, even with another send in flight', async () => {
+  const env = await recoveryFixture()
+  try {
+    const first = await env.send('first')
+    env.setReceipt({
+      ...receipt(),
+      recordVersion: 8,
+      accessToken: 'overlapping-token',
+    })
+    const overlap = await env.send('overlap')
+    expect(overlap.headers.get('authorization')).toBe(
+      'Bearer overlapping-token',
+    )
+    // Version 8 is a rotation for the failed request, not for the newer in-flight send.
+    expect((await env.answer(first)).status).toBe(401)
+    expect(await env.retry(1)).toEqual({ retry: true, delay: 0 })
+    expect(env.authorize).toHaveBeenCalledTimes(3)
+    expect(env.reportFailure).not.toHaveBeenCalled()
+
+    const replay = await env.send('first')
+    expect(replay.headers.get('authorization')).toBe('Bearer overlapping-token')
+    expect(replay.headers.get('chatgpt-account-id')).toBe('chatgpt-vault')
+    expect(await replay.text()).toBe(await first.text())
+    expect(env.authorize).toHaveBeenCalledTimes(3)
+
+    env.setReceipt({
+      ...receipt(),
+      recordVersion: 9,
+      accessToken: 'third-token',
+    })
+    const terminal = await env.answer(replay)
+    expect(terminal.status).toBe(401)
+    expect(await terminal.json()).toEqual({
+      error: {
+        message: 'request refused: no account with a usable credential',
+      },
+    })
+    expect(await env.retry(2, true)).toEqual({ retry: false })
+    expect(env.authorize).toHaveBeenCalledTimes(3)
+    expect(env.dispatched).toEqual([first, overlap, replay])
+    expect(env.reportFailure.mock.calls).toEqual([
+      [expect.objectContaining({ recordVersion: 8 }), 401],
+    ])
+    expect(env.enqueue).not.toHaveBeenCalled()
+    expect(env.dropSignal).not.toHaveBeenCalled()
+    expect(env.debug).not.toHaveBeenCalledWith(
+      'pool row refused the request',
+      expect.anything(),
+    )
+    const reports = env.report.mock.calls.map(([value]) => value)
+    expect(reports).toEqual([
+      expect.objectContaining({
+        kind: 'billing',
+        status: 401,
+        outcome: 'failed',
+      }),
+      expect.objectContaining({
+        kind: 'billing',
+        status: 401,
+        outcome: 'failed',
+      }),
+    ])
+  } finally {
+    await env.dispose()
+  }
+})
+
+it.each([
+  ['unchanged receipt', receipt()],
+  ['failed re-authorization', undefined],
+  [
+    'different login',
+    { ...receipt(), recordVersion: 8, credentialId: 'different-login' },
+  ],
+] as const)(
+  'vault HTTP 401 with %s is terminal and reports the sent receipt once',
+  async (_label, next) => {
+    const env = await recoveryFixture()
+    try {
+      const request = await env.send('no replay')
+      env.setReceipt(next)
+      const terminal = await env.answer(request)
+      expect(terminal.status).toBe(401)
+      expect(await env.retry(1, true)).toEqual({ retry: false })
+      expect(env.authorize).toHaveBeenCalledTimes(2)
+      expect(env.dispatched).toEqual([request])
+      expect(env.reportFailure.mock.calls).toEqual([
+        [expect.objectContaining({ recordVersion: 7 }), 401],
+      ])
+    } finally {
+      await env.dispose()
+    }
+  },
+)
 
 describe('OpenCode 2 reply usage', () => {
   async function setup() {

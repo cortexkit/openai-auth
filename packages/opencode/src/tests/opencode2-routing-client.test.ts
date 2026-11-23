@@ -490,6 +490,138 @@ test('aborting the HTTP request during the first placement wait stops before ano
   }
 })
 
+test.each(['resumed', 'cancelled', 'abandoned'] as const)(
+  'short placement-refusal retry pairs the wait when %s',
+  async (outcome) => {
+    const at = 1_900_000_000_000
+    const report = mock((_report: Record<string, unknown>) => {})
+    const env = await placementRequest(
+      [shortPlacementRefusal, { account_id: 'account-b' }],
+      { report, now: () => at },
+    )
+    try {
+      const sent = env.send()
+      const { wake } = await env.waitBeforeSend(sent)
+      const start = {
+        kind: 'wait',
+        phase: 'start',
+        reason: 'account_free',
+        next_ms: at + 3000,
+        wait_id: expect.any(String),
+        attempt: 1,
+        message: 'Waiting for an account to come free',
+      }
+      expect(report.mock.calls.map(([value]) => value)).toEqual([start])
+      if (outcome === 'resumed') {
+        wake()
+        expect(await sent).toBe('Bearer vault:b-token')
+      } else {
+        if (outcome === 'cancelled') env.controller.abort()
+        else env.openai.beginTurn(env.request.sessionID)
+        await expect(sent).rejects.toMatchObject(
+          outcome === 'cancelled'
+            ? { name: 'AbortError' }
+            : placementRefusalError,
+        )
+        wake()
+        expect(env.accountFor).toHaveBeenCalledTimes(1)
+        expect(env.providerFetch).not.toHaveBeenCalled()
+      }
+      expect(report.mock.calls.map(([value]) => value)).toEqual([
+        start,
+        { ...report.mock.calls[0]![0], phase: 'end', outcome },
+      ])
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+test.each(['resumed', 'cancelled', 'abandoned'] as const)(
+  'routing same-account hold pairs the wait when %s',
+  async (outcome) => {
+    let now = 1_900_000_000_000
+    const at = now
+    const reports: Record<string, unknown>[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => ({ account_id: 'account-b' }),
+      report: (report: Record<string, unknown>) => {
+        if (report.kind === 'wait') reports.push(report)
+      },
+    }))
+    const env = fixture(true, 'ordered', () => now)
+    const host = fakeOpenCode2Host()
+    const installation = await installPoolHooks(host.ctx, env.openai.adapter, {
+      warn() {},
+    })
+    env.openai.attach(installation)
+    const { sessionID } = env.request
+    const requestScope = scope(sessionID)
+    const send = () =>
+      host.fire('http.request', {
+        ...requestScope,
+        request: new Request('https://codex.test/responses', {
+          headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+        }),
+      })
+    try {
+      const { request } = await send()
+      const response = await host.fire('http.response', {
+        ...requestScope,
+        request,
+        response: new Response('{}', {
+          status: 403,
+          headers: { 'retry-after-ms': '3000' },
+        }),
+      })
+      await response.response.text()
+      const retry = await host.fire('retry', {
+        ...requestScope,
+        attempt: 1,
+        decision: { retry: false },
+        error: { type: 'api', status: 403, message: '{}' },
+      })
+      const decision: { retry: boolean; delay?: number } = retry.decision
+      expect(decision).toEqual({ retry: true, delay: 3000 })
+      expect(reports).toEqual([
+        {
+          kind: 'wait',
+          phase: 'start',
+          reason: 'account_limit',
+          next_ms: at + 3000,
+          wait_id: expect.any(String),
+          attempt: 1,
+          message: 'Waiting for the account limit to reset',
+        },
+      ])
+      if (outcome === 'resumed') {
+        now += 3000
+        expect((await send()).request.headers.get('authorization')).toBe(
+          'Bearer vault:b-token',
+        )
+        expect(env.authorized).toEqual(['vault:b', 'vault:b'])
+      } else {
+        if (outcome === 'cancelled')
+          await host.publish('session.status', {
+            sessionID,
+            status: { type: 'idle' },
+          })
+        else env.openai.beginTurn(sessionID)
+        expect(env.authorized).toEqual(['vault:b'])
+      }
+      expect(reports).toEqual([
+        reports[0]!,
+        { ...reports[0], phase: 'end', outcome },
+      ])
+      env.openai.beginTurn(sessionID)
+      expect(reports).toHaveLength(2)
+    } finally {
+      await installation.dispose()
+      env.openai.dispose()
+    }
+  },
+)
+
 test('capacity placement re-asks with the same id, reports account_free, and uses a fresh id next turn', async () => {
   const start = Date.now()
   let now = start
