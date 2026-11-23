@@ -60,6 +60,7 @@ import {
   type RoutingMode,
   type StickyPinPlacement,
   startVaultRoutingWait,
+  type VaultRoutingFeedback,
 } from '@cortexkit/openai-auth-core/internal'
 
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
@@ -112,6 +113,8 @@ export interface RouteAttempt {
   signal?: LimitSignal
   /** Response headers may arrive before the vault updates its quota reading. */
   reading?: OAuthQuotaSnapshot
+  /** Only an unpublished terminal failure may hand control to vault routing. */
+  vaultFeedback?: VaultRoutingFeedback
 }
 
 /** Internal policy interface used before Pi publishes the first stream event. */
@@ -132,6 +135,17 @@ export interface PiWake {
   identity?: string
   signal?: LimitSignal
 }
+
+export interface PiVaultRetry {
+  id: string
+  credentialId: string
+  identity: string | undefined
+  accountKey: AccountKey | undefined
+}
+
+type PiVaultDecision =
+  | { kind: 'vault-refused' }
+  | { kind: 'vault-retry'; target: PiVaultRetry; delayMs?: number }
 
 export type PiWaitDecision = Extract<
   LimitDecision,
@@ -164,6 +178,11 @@ export interface PiRouteContext<A extends RouteAttempt> {
    * vault refused to serve a vault account.
    */
   send(account: RouteAccount, tier?: AdmissionTier): Promise<A | undefined>
+  afterVaultLimit?(
+    account: RouteAccount,
+    feedback: VaultRoutingFeedback,
+    routing: PoolRoutingInput,
+  ): Promise<PiVaultDecision | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: StickyPinPlacement): { accountId: string } | undefined
   /**
@@ -185,6 +204,7 @@ export type PiRouteResult<A> =
       decision: PiWaitDecision | Extract<LimitDecision, { action: 'refuse' }>
       wake?: PiWake
     }
+  | PiVaultDecision
 
 /**
  * Pool rows that may serve beside Pi's login: enabled OAuth rows holding a
@@ -487,10 +507,60 @@ function routingInput<A extends RouteAttempt>(
   }
 }
 
+export function admitPiVaultRetry<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  target: PiVaultRetry,
+): { account: RouteAccount; tier: AdmissionTier } | undefined {
+  const account = ctx.accounts().find((value) => value.id === target.id)
+  if (
+    !account?.vault ||
+    account.identity !== target.identity ||
+    (target.accountKey &&
+      (!account.accountKey ||
+        !sameAccount(account.accountKey, target.accountKey)))
+  )
+    return
+  const plan = planOrdered({
+    ...routingInput(ctx, [account]),
+    placement: 'roster',
+    mainId: null,
+  })
+  const tier = plan.kind === 'send' && !plan.lastPath && plan.tiers[account.id]
+  if (tier) return { account, tier }
+}
+
+async function afterVaultLimit<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  account: RouteAccount,
+  attempt: A,
+): Promise<PiVaultDecision | undefined> {
+  if (attempt.vaultFeedback && ctx.afterVaultLimit)
+    return ctx.afterVaultLimit(
+      account,
+      attempt.vaultFeedback,
+      routingInput(ctx, ctx.accounts()),
+    )
+}
+
 /** Routes one request and sends it with the chosen account(s). */
 export async function routePiRequest<A extends RouteAttempt>(
   ctx: PiRouteContext<A>,
+  vaultRetry?: PiVaultRetry,
 ): Promise<PiRouteResult<A>> {
+  if (vaultRetry) {
+    const admitted = admitPiVaultRetry(ctx, vaultRetry)
+    if (!admitted) return { kind: 'vault-refused' }
+    const { account, tier } = admitted
+    const attempt = await ctx.send(account, tier)
+    if (!attempt) return { kind: 'vault-refused' }
+    return (
+      (await afterVaultLimit(ctx, account, attempt)) ?? {
+        kind: 'sent',
+        attempt,
+        accountId: account.id,
+      }
+    )
+  }
   let accounts = ctx.accounts()
   const firstReading = waitForFirstQuotaReading(
     routingInput(ctx, accounts),
@@ -560,6 +630,8 @@ export async function routePiRequest<A extends RouteAttempt>(
     ) {
       const attempt = await ctx.send(account)
       if (attempt) {
+        const routed = await afterVaultLimit(ctx, account, attempt)
+        if (routed) return routed
         const after = afterLimit(
           ctx,
           account,
@@ -672,6 +744,8 @@ async function routeOrdered<A extends RouteAttempt>(
       unsent.add(id)
       continue
     }
+    const routed = await afterVaultLimit(ctx, account, attempt)
+    if (routed) return routed
     last = { attempt, accountId: account.id }
     attempts.push({
       id: account.id,
@@ -808,6 +882,8 @@ async function routeSticky<A extends RouteAttempt>(
   if (!sendable(account)) return undefined
   let attempt = await ctx.send(account, tiers?.get(id))
   if (!attempt) return undefined
+  const routed = await afterVaultLimit(ctx, account, attempt)
+  if (routed) return routed
   let decision: LimitDecision | undefined
 
   if (
@@ -854,6 +930,8 @@ async function routeSticky<A extends RouteAttempt>(
           ? await ctx.send(replacement, tiers?.get(id))
           : undefined
         if (replacement && replaced) {
+          const routed = await afterVaultLimit(ctx, replacement, replaced)
+          if (routed) return routed
           attempt = replaced
           account = replacement
           decision = undefined

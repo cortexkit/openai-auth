@@ -33,7 +33,10 @@ import type {
   LimitSignal,
   PolicyFacts,
 } from '@cortexkit/common-auth/limits'
-import { waitForPi } from '@cortexkit/common-auth/limits'
+import {
+  MAX_SAME_ACCOUNT_HOLD_MS,
+  waitForPi,
+} from '@cortexkit/common-auth/limits'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -42,10 +45,12 @@ import {
   applyMidConversationEffort,
   buildOpenAiQuotaRefusal,
   type CodexEffortState,
+  chooseVaultRouting,
   classifyOpenAiLimitBody,
   codexRefreshFn,
   createLogger,
   createSessionActivityStore,
+  deferSessionCacheResponseTouch,
   extractAccountId,
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
@@ -66,14 +71,17 @@ import {
   redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
+  reportVaultRouting,
   reportVaultRoutingLimit,
   type SessionDispatch,
   sessionCacheKeepPlan,
   startVaultRoutingWait,
   ttlForModel,
   VAULT_REQUEST_ROSTER_WAIT_MS,
+  VAULT_ROUTING_REFUSAL_MESSAGE,
   VaultBillingAttempt,
   type VaultModeRefusal,
+  type VaultRoutingFeedback,
   vaultLimitsNamespace,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
@@ -85,6 +93,7 @@ import {
   windowsFromQuotaMap,
 } from '@cortexkit/openai-auth-core/pool-quota'
 import {
+  type AdmissionTier,
   CreditsServing,
   FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
@@ -114,6 +123,10 @@ import {
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import {
+  admitPiVaultRetry,
+  type PiRouteContext,
+  type PiRouteResult,
+  type PiVaultRetry,
   type PiWake,
   type RouteAccount,
   type RouteAttempt,
@@ -185,6 +198,18 @@ interface StreamAttempt extends RouteAttempt {
   buffered: AssistantMessageEvent[]
   /** The rest of the attempt's events, when it is streaming. */
   rest: AsyncIterator<AssistantMessageEvent> | undefined
+}
+
+interface PiRouteExecution {
+  canWait: boolean
+  wake?: PiWake
+  vaultRetry?: PiVaultRetry
+  attemptedVaultIds: Set<string>
+  billingAttempt?: number
+}
+
+function piRequestKind(options: SimpleStreamOptions | undefined) {
+  return options?.cacheRetention === 'none' ? 'generate' : 'primary'
 }
 
 function isPiOutput(event: AssistantMessageEvent): boolean {
@@ -710,11 +735,15 @@ export class PiOpenAIRuntime {
       let endWait: ReturnType<typeof startVaultRoutingWait>
       try {
         let waited = false
-        let wake: PiWake | undefined
+        const execution: PiRouteExecution = {
+          canWait: false,
+          attemptedVaultIds: new Set(),
+        }
         for (;;) {
           if (options?.signal?.aborted) return
           const authority = await this.readAuthority()
           if (
+            !execution.vaultRetry &&
             authority !== 'host' &&
             authority !== 'local' &&
             options?.apiKey !== VAULT_PLACEHOLDER_KEY
@@ -722,11 +751,14 @@ export class PiOpenAIRuntime {
             outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
             return
           }
-          const attempt = await this.route(model, context, options, {
-            canWait: !!setWorkingMessage && !waited,
-            wake,
-          })
+          execution.canWait = !!setWorkingMessage && !waited
+          const attempt = await this.route(model, context, options, execution)
           if (options?.signal?.aborted) return
+          if (attempt.kind === 'vault-refused') {
+            outer.push(errorEvent(model, VAULT_ROUTING_REFUSAL_MESSAGE))
+            return
+          }
+          let delayMs: number | undefined
           if (attempt.kind === 'policy') {
             const decision = attempt.decision
             if (
@@ -749,23 +781,30 @@ export class PiOpenAIRuntime {
               )
               return
             }
+            execution.wake = attempt.wake
+            delayMs = decision.delayMs
+          }
+          if (attempt.kind === 'vault-retry') {
+            execution.vaultRetry = attempt.target
+            execution.wake = undefined
+            delayMs = attempt.delayMs
+          }
+          if (delayMs !== undefined) {
+            endWait?.('resumed')
             waited = true
             const at = this.now()
             endWait = startVaultRoutingWait({
               sessionId: options?.sessionId,
               reason: 'account_limit',
               now: at,
-              nextMs: at + decision.delayMs,
+              nextMs: at + delayMs,
             })
             let result: 'elapsed' | 'aborted'
             try {
-              result = await (this.deps.waitForPi ?? waitForPi)(
-                decision.delayMs,
-                {
-                  signal: options?.signal,
-                  setWorkingMessage: setWorkingMessage ?? (() => {}),
-                },
-              )
+              result = await (this.deps.waitForPi ?? waitForPi)(delayMs, {
+                signal: options?.signal,
+                setWorkingMessage: setWorkingMessage ?? (() => {}),
+              })
             } finally {
               // A failed wait helper must not leave Pi's working indicator behind.
               try {
@@ -777,9 +816,10 @@ export class PiOpenAIRuntime {
               endWait = undefined
               return
             }
-            wake = attempt.wake
             continue
           }
+          if (attempt.kind === 'policy' || attempt.kind === 'vault-retry')
+            continue
           if (attempt.kind === 'blocked') {
             outer.push(
               errorEvent(
@@ -793,10 +833,11 @@ export class PiOpenAIRuntime {
           }
           endWait?.('resumed')
           endWait = undefined
-          for (const event of attempt.buffered) outer.push(event)
-          if (attempt.rest) {
+          const { buffered, rest } = attempt.attempt
+          for (const event of buffered) outer.push(event)
+          if (rest) {
             for (;;) {
-              const next = await attempt.rest.next()
+              const next = await rest.next()
               if (next.done) break
               outer.push(next.value)
             }
@@ -823,18 +864,22 @@ export class PiOpenAIRuntime {
     model: Model<Api>,
     context: Context,
     options: SimpleStreamOptions | undefined,
-    execution: { canWait: boolean; wake?: PiWake; billingAttempt?: number },
+    execution: PiRouteExecution,
   ): Promise<
-    | ({ kind: 'sent'; decision?: LimitDecision } & StreamAttempt)
+    | Exclude<PiRouteResult<StreamAttempt>, { kind: 'blocked' }>
     | { kind: 'blocked'; block: PiBlock; refusal?: VaultModeRefusal }
-    | Extract<
-        Awaited<ReturnType<typeof routePiRequest<StreamAttempt>>>,
-        { kind: 'policy' }
-      >
   > {
     const storage = await this.storage()
     const settings = this.settings(storage)
-    const vaultMode = (await this.readAuthority()) !== 'local'
+    const authority = await this.readAuthority()
+    const vaultMode = authority !== 'local'
+    const vaultRetry = execution.vaultRetry
+    if (
+      vaultRetry &&
+      ((authority !== 'host' && authority !== 'vault') ||
+        !hasVaultRoutingAccessor())
+    )
+      return { kind: 'vault-refused' }
     if (vaultMode) {
       // Vault mode: Pi's login (the key Pi hands over) and the pool are not
       // used. Before the vault's first account list there is nothing to
@@ -853,84 +898,167 @@ export class PiOpenAIRuntime {
     let vaultRefused = false
     let candidates = 0
     let quotaFiltered = false
-    const run = () =>
-      routePiRequest<StreamAttempt>({
-        accounts: () => {
-          const accounts = this.accounts(settings)
-          candidates = accounts.length
-          const now = this.now()
-          const eligible = accounts.filter((account) => {
-            if (!account.vault) return true
-            const reading = windowsFromQuotaMap(account.quota)
-            // Leave unread routes visible so admission can request a poll.
-            return !reading || quotaSnapshotPassesPolicy(reading, settings, now)
-          })
-          quotaFiltered = eligible.length < candidates
-          return eligible
-        },
-        storage: settings,
-        mode,
-        mainId: vaultMode ? vaultMainRouteId(this.vault.routes()) : undefined,
-        sessionId: options?.sessionId,
-        requestBytes: Buffer.byteLength(JSON.stringify(context), 'utf8'),
-        now: this.now,
-        refreshBackoff: (accounts) =>
-          this.pool.refreshBackoffFor(
-            accounts
-              .map((account) => this.poolRowById(account.id))
-              .filter((row): row is PoolRow => row !== undefined),
-          ),
-        requestPull: (id) => this.requestPull(id),
-        firstReadingWaitMs:
-          this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
-        captureAdmissionTier: hasVaultRoutingAccessor(),
-        limitPolicy: {
-          execute: true,
-          canWait: execution.canWait,
-          waitForReset: settings?.waitForReset,
-          wake: execution.wake,
-          effectiveModel: model.id,
-          activity: () =>
-            options?.sessionId
-              ? this.activity.get(options.sessionId)
-              : undefined,
-          onDecision: (decision, facts) =>
-            this.deps.onLimitDecision?.(decision, facts),
-        },
-        send: (account, tier) =>
-          options?.signal?.aborted
-            ? Promise.resolve(undefined)
-            : account.vault
-              ? this.vaultAttempt(
-                  model,
-                  context,
-                  options,
-                  account.id,
-                  execution,
-                  tier === 'free',
-                ).then((attempt) => {
-                  if (!attempt) vaultRefused = true
-                  return attempt
-                })
-              : account.token
-                ? this.attempt(
-                    model,
-                    context,
-                    options,
-                    account.id,
-                    account.token,
-                  )
-                : Promise.resolve(undefined),
-        placePin: placePiStickyPin,
-        creditsServing: this.creditsServing,
-        // Only the credits info line: this router's debug lines stay off.
-        log: {
-          debug: () => {},
-          info: (message, data) => routingLog.info(message, data),
-        },
-      })
-    const result = await run()
-    if (result.kind === 'policy') return result
+    const route: PiRouteContext<StreamAttempt> = {
+      accounts: () => {
+        const accounts = this.accounts(settings).filter(
+          (account) => !vaultMode || account.vault,
+        )
+        candidates = accounts.length
+        const now = this.now()
+        const eligible = accounts.filter((account) => {
+          if (!account.vault) return true
+          const reading = windowsFromQuotaMap(account.quota)
+          // Leave unread routes visible so admission can request a poll.
+          return !reading || quotaSnapshotPassesPolicy(reading, settings, now)
+        })
+        quotaFiltered = eligible.length < candidates
+        return eligible
+      },
+      storage: settings,
+      mode,
+      mainId: vaultMode ? vaultMainRouteId(this.vault.routes()) : undefined,
+      sessionId: options?.sessionId,
+      requestBytes: Buffer.byteLength(JSON.stringify(context), 'utf8'),
+      now: this.now,
+      refreshBackoff: (accounts) =>
+        this.pool.refreshBackoffFor(
+          accounts
+            .map((account) => this.poolRowById(account.id))
+            .filter((row): row is PoolRow => row !== undefined),
+        ),
+      requestPull: (id) => this.requestPull(id),
+      firstReadingWaitMs: this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
+      captureAdmissionTier: hasVaultRoutingAccessor(),
+      limitPolicy: {
+        execute: true,
+        canWait: execution.canWait,
+        waitForReset: settings?.waitForReset,
+        wake: execution.wake,
+        effectiveModel: model.id,
+        activity: () =>
+          options?.sessionId ? this.activity.get(options.sessionId) : undefined,
+        onDecision: (decision, facts) =>
+          this.deps.onLimitDecision?.(decision, facts),
+      },
+      send: (account, tier) =>
+        options?.signal?.aborted
+          ? Promise.resolve(undefined)
+          : account.vault
+            ? this.vaultAttempt(
+                model,
+                context,
+                options,
+                account.id,
+                execution,
+                tier === 'free',
+                vaultRetry &&
+                  (async (receipt) => {
+                    const authority = await this.readAuthority()
+                    return (
+                      (authority === 'host' || authority === 'vault') &&
+                      !options?.signal?.aborted &&
+                      receipt.credentialId === vaultRetry.credentialId &&
+                      receipt.accountIdentity === vaultRetry.identity &&
+                      admitPiVaultRetry(route, vaultRetry)?.tier
+                    )
+                  }),
+              ).then((attempt) => {
+                if (!attempt) vaultRefused = true
+                else execution.attemptedVaultIds.add(account.id)
+                return attempt
+              })
+            : account.token
+              ? this.attempt(model, context, options, account.id, account.token)
+              : Promise.resolve(undefined),
+      afterVaultLimit: async (account, feedback, routing) => {
+        const refused = { kind: 'vault-refused' } as const
+        if (options?.signal?.aborted) return refused
+        const retry = (target: PiVaultRetry, delayMs: number) =>
+          execution.canWait &&
+          delayMs >= 0 &&
+          delayMs <= MAX_SAME_ACCOUNT_HOLD_MS
+            ? { kind: 'vault-retry' as const, target, delayMs }
+            : refused
+        if (feedback.kind === 'backoff')
+          return retry(
+            {
+              id: account.id,
+              identity: feedback.accountIdentity,
+              credentialId: feedback.credentialId,
+              accountKey: account.accountKey,
+            },
+            Math.max(0, feedback.retryAtMs - this.now()),
+          )
+        const routes = this.vault.routes()
+        const accounts = route.accounts()
+        const sessionId = options?.sessionId
+        const answer = await chooseVaultRouting({
+          vaultMode,
+          fresh: false,
+          sessionId,
+          request: { modelId: model.id, kind: piRequestKind(options) },
+          routes,
+          routing,
+          eligibleIds: accounts
+            .filter(
+              (candidate) => !execution.attemptedVaultIds.has(candidate.id),
+            )
+            .map((candidate) => candidate.id),
+          continuation: {
+            previousId: account.id,
+            exhausted: feedback.exhausted,
+          },
+          wait: {
+            activity: sessionId ? this.activity.get(sessionId) : undefined,
+            accountKey: account.accountKey,
+            maxSameAccountWait: execution.canWait
+              ? settings?.routing?.maxSameAccountWait
+              : 0,
+          },
+        })
+        if (!answer) {
+          // Vault mode admits subscription logins, not paid keys. Without a
+          // routing answer Pi can still use its order for those logins.
+          const currentAuthority = await this.readAuthority()
+          if (currentAuthority !== 'host' && currentAuthority !== 'vault')
+            return refused
+          return undefined
+        }
+        if (typeof answer === 'string') {
+          const selected = routes.find((candidate) => candidate.id === answer)
+          if (!selected?.credentialId) return refused
+          return {
+            kind: 'vault-retry',
+            target: {
+              id: selected.id,
+              identity: selected.identity,
+              credentialId: selected.credentialId,
+              accountKey: accounts.find((candidate) => candidate.id === answer)
+                ?.accountKey,
+            },
+          }
+        }
+        if ('holdMs' in answer)
+          return retry(
+            {
+              id: account.id,
+              identity: feedback.exhausted.accountId,
+              credentialId: feedback.exhausted.credentialId,
+              accountKey: account.accountKey,
+            },
+            answer.holdMs,
+          )
+        return refused
+      },
+      placePin: placePiStickyPin,
+      creditsServing: this.creditsServing,
+      // Only the credits info line: this router's debug lines stay off.
+      log: {
+        debug: () => {},
+        info: (message, data) => routingLog.info(message, data),
+      },
+    }
+    const result = await routePiRequest(route, vaultRetry)
     if (result.kind === 'blocked') {
       // Vault mode never falls back to a local account: a request no vault
       // account could take is refused with a fixed text naming the cause.
@@ -948,7 +1076,7 @@ export class PiOpenAIRuntime {
         return { ...result, refusal: 'vault-empty' }
       return result
     }
-    return { kind: 'sent', ...result.attempt, decision: result.decision }
+    return result
   }
 
   private applyEffort(body: Record<string, unknown>, sessionId: string) {
@@ -977,18 +1105,21 @@ export class PiOpenAIRuntime {
     execution?: { billingAttempt?: number },
     freeQuota = false,
   ): Promise<StreamAttempt> {
+    const kind = piRequestKind(options)
+    const sessionId = options?.sessionId
+    const cacheSessionId = kind === 'primary' ? sessionId : undefined
     let billing: VaultBillingAttempt | undefined
     if (
       receipt?.credentialId &&
-      options?.sessionId &&
+      sessionId &&
       execution &&
       hasVaultRoutingAccessor()
     ) {
       execution.billingAttempt = (execution.billingAttempt ?? 0) + 1
       billing = new VaultBillingAttempt(
-        options.sessionId,
+        sessionId,
         receipt,
-        'primary',
+        kind,
         model.id,
         execution.billingAttempt,
         (sessionId) => {
@@ -1010,6 +1141,7 @@ export class PiOpenAIRuntime {
     let httpBody: string | undefined
     let headers: Headers | undefined
     let limit: { signal: LimitSignal; body: unknown } | undefined
+    let wsCompleted = false
     const status = () => limit?.signal.status ?? httpStatus
     const beginSend = () => {
       // pi-ai can retry a send or switch transports without ending its stream.
@@ -1017,6 +1149,7 @@ export class PiOpenAIRuntime {
       httpBody = undefined
       headers = undefined
       limit = undefined
+      wsCompleted = false
       reading = initialReading
     }
     const mergeReading = (snapshot: OAuthQuotaSnapshot | undefined) => {
@@ -1027,30 +1160,50 @@ export class PiOpenAIRuntime {
       }
       reading = { ...reading, ...snapshot }
     }
-    const reportLimit = () => {
+    let vaultFeedback: VaultRoutingFeedback | undefined
+    let failureReported = false
+    const reportFailure = () => {
       if (
+        failureReported ||
         !receipt ||
-        !hasVaultRoutingAccessor() ||
-        limit?.signal.kind !== 'quota-exhausted'
+        options?.signal?.aborted ||
+        !hasVaultRoutingAccessor()
       )
         return
-      const { signal, body } = limit
-      reportVaultRoutingLimit(
-        options?.sessionId,
-        receipt,
-        {
-          window: signal.reason,
-          resetAt: signal.windows.find(
-            (window) => window.confirmed && window.provenance === 'provider',
-          )?.resetAt,
-        },
-        { body, headers, quota: account?.quota, now: signal.observedAt },
-      )
+      failureReported = true
+      const responseStatus = status()
+      if (responseStatus !== 429 && responseStatus !== 403) return
+      if (responseStatus === 429 && limit?.signal.kind === 'quota-exhausted') {
+        const { signal, body } = limit
+        const exhausted = reportVaultRoutingLimit(
+          sessionId,
+          receipt,
+          {
+            window: signal.reason,
+            resetAt: signal.windows.find(
+              (window) => window.confirmed && window.provenance === 'provider',
+            )?.resetAt,
+          },
+          { body, headers, quota: account?.quota, now: signal.observedAt },
+        )
+        if (exhausted) {
+          vaultFeedback = { kind: 'exhausted', exhausted }
+          return
+        }
+      }
+      // The provider body has already gone through the limit classifier. An
+      // unproved window must not be promoted to exhaustion a second way.
+      vaultFeedback = reportVaultRouting(sessionId, receipt, {
+        status: responseStatus,
+        headers: headers ?? new Headers(),
+        now: this.now(),
+        backoff: true,
+      })
     }
     const dispatch: SessionDispatch | undefined =
-      accountKey && options?.sessionId
+      accountKey && cacheSessionId
         ? {
-            sessionId: options.sessionId,
+            sessionId: cacheSessionId,
             accountKey,
             dispatchedAt: this.now(),
             ttlMs: ttlForModel(JSON.stringify({ model: model.id })),
@@ -1067,8 +1220,7 @@ export class PiOpenAIRuntime {
       }
       // Pi's compaction and summary calls can carry the routing session id,
       // but disable caching. They must not pin or change conversation effort.
-      const effortSessionId =
-        options?.cacheRetention === 'none' ? undefined : options?.sessionId
+      const effortSessionId = cacheSessionId
       const useWebSocketShim =
         this.deps.installWebSocket && options?.transport !== 'sse'
       const streamOptions: SimpleStreamOptions = {
@@ -1145,6 +1297,12 @@ export class PiOpenAIRuntime {
           await options?.onResponse?.(response, responseModel)
         },
         onProviderStreamEvent: async (event, eventModel) => {
+          if (
+            httpStatus === undefined &&
+            isRecord(event) &&
+            event.type === 'response.completed'
+          )
+            wsCompleted = true
           // The bound WebSocket records quota before pi-ai dispatches this callback.
           if (httpStatus !== undefined || !useWebSocketShim)
             mergeReading(this.recordQuotaEvent(quotaDispatch, event))
@@ -1214,7 +1372,7 @@ export class PiOpenAIRuntime {
             failed = true
             // Only pi-ai's terminal result can make the wire observation a
             // routing outcome. A retry or fallback inside pi-ai may succeed.
-            if (event.reason !== 'aborted') reportLimit()
+            if (event.reason !== 'aborted') reportFailure()
             // Routing may discard an unpublished error without draining the iterator.
             billing?.end(outputStarted, false, status())
             // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
@@ -1225,20 +1383,37 @@ export class PiOpenAIRuntime {
           }
           yield event
         }
-        if (dispatch && stopped && !failed)
-          recordSessionCompletion(
-            runtime.activity,
-            dispatch,
-            runtime
-              .accounts(runtime.settings(runtime.storageCache?.storage ?? null))
-              .find((value) => value.id === accountId)?.accountKey,
-            {
-              kind: 'pi',
-              stop: 'stop',
-              aborted: options?.signal?.aborted ?? false,
-            },
-          )
+        if (stopped && !failed && !options?.signal?.aborted) {
+          if (dispatch)
+            recordSessionCompletion(
+              runtime.activity,
+              dispatch,
+              runtime
+                .accounts(
+                  runtime.settings(runtime.storageCache?.storage ?? null),
+                )
+                .find((value) => value.id === accountId)?.accountKey,
+              { kind: 'pi', stop: 'stop', aborted: false },
+            )
+          // Pi's terminal result comes after it finishes consuming the HTTP
+          // event stream. A socket must have delivered its completion frame.
+          const completedStatus = httpStatus ?? (wsCompleted ? 200 : undefined)
+          if (
+            completedStatus !== undefined &&
+            completedStatus >= 200 &&
+            completedStatus < 300
+          ) {
+            reportVaultRouting(sessionId, receipt, {
+              status: completedStatus,
+              headers: headers ?? new Headers(),
+            })
+            if (cacheSessionId && hasVaultRoutingAccessor())
+              deferSessionCacheResponseTouch(cacheSessionId, runtime.now())
+          }
+        }
       } catch (error) {
+        failed = true
+        reportFailure()
         billing?.end(outputStarted, false, status())
         yield errorEvent(
           model,
@@ -1275,6 +1450,7 @@ export class PiOpenAIRuntime {
       ...(httpStatus !== undefined && !outputStarted ? { httpStatus } : {}),
       ...(accountKey ? { accountKey } : {}),
       ...(limit && !outputStarted ? { signal: limit.signal } : {}),
+      ...(vaultFeedback && !outputStarted ? { vaultFeedback } : {}),
       ...(reading ? { reading } : {}),
       buffered,
       rest,
@@ -1294,11 +1470,22 @@ export class PiOpenAIRuntime {
     accountId: string,
     execution: { billingAttempt?: number },
     freeQuota = false,
+    revalidate?: (
+      receipt: QuotaReceipt,
+    ) => Promise<AdmissionTier | false | undefined>,
   ): Promise<StreamAttempt | undefined> {
     let last: StreamAttempt | undefined
     const response = await this.vault.send(
       accountId,
       async (token, attempt) => {
+        if (revalidate) {
+          const tier = await revalidate(attempt)
+          if (!tier) {
+            last = undefined
+            return new Response(null, { status: 200 })
+          }
+          freeQuota = tier === 'free'
+        }
         // An attempt the vault retries is dropped unread: it ended without
         // streaming, so nothing of it reached Pi.
         last = await this.attempt(

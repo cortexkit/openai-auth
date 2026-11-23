@@ -24,6 +24,7 @@ import {
   mutateAccounts,
   OpenAiVault,
   type RoutingMode,
+  VAULT_ROUTING_REFUSAL_MESSAGE,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
 import {
@@ -47,7 +48,7 @@ import { createPiMenu } from '../commands.ts'
 import { installRawCodexWebSocket } from '../index.ts'
 import { RawWebSocket } from '../raw-ws-node.ts'
 import { clearPiStickyRouting } from '../routing.ts'
-import { PiOpenAIRuntime } from '../runtime.ts'
+import { PiOpenAIRuntime, type PiOpenAIRuntimeDeps } from '../runtime.ts'
 import { VAULT_PLACEHOLDER_KEY } from '../vault-slot.ts'
 import { isolatePiAgentDir } from './test-isolation.ts'
 
@@ -167,7 +168,11 @@ function vault(): OpenAiVault {
   })
 }
 
-function runtimeWith(target: OpenAiVault, webSocket = false): PiOpenAIRuntime {
+function runtimeWith(
+  target: OpenAiVault,
+  webSocket = false,
+  deps: Partial<PiOpenAIRuntimeDeps> = {},
+): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
     createStream: createAssistantMessageEventStream,
@@ -176,6 +181,7 @@ function runtimeWith(target: OpenAiVault, webSocket = false): PiOpenAIRuntime {
     fetchImpl: fakeFetch,
     firstReadingWaitMs: 0,
     vault: target,
+    ...deps,
   })
 }
 
@@ -213,7 +219,449 @@ function enroll() {
   chmodSync(tokenPath, 0o600)
 }
 
+function observeRouting(
+  accountFor?: (ask: Record<string, unknown>) => unknown,
+) {
+  const reports: Record<string, unknown>[] = []
+  Reflect.set(globalThis, routingKey, () => ({
+    ...(accountFor && {
+      accountFor: async (ask: Record<string, unknown>) => accountFor(ask),
+    }),
+    report: (payload: Record<string, unknown>) => {
+      reports.push(payload)
+    },
+  }))
+  return reports
+}
+
+function errorMessage(events: AssistantMessageEvent[]) {
+  const event = events.at(-1)
+  return event?.type === 'error' ? event.error.errorMessage : undefined
+}
+
+function flushCacheTouches() {
+  // Cache touches use a deferred timer; queue another timer behind them.
+  return new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+const provedLimit = {
+  type: 'usage_limit_reached',
+  window: '5h',
+  resets_in_seconds: 60,
+}
+
 describe('Pi and the Claustrum vault', () => {
+  test('Thalamus reports clean HTTP finishes once, bills helpers as generate and only touches the primary cache', async () => {
+    const reports = observeRouting()
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const now = Date.now()
+    const runtime = runtimeWith(target, false, { now: () => now })
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      const primary = await send(runtime, { sessionId: 'primary' })
+      const helper = await send(runtime, {
+        sessionId: 'helper',
+        cacheRetention: 'none',
+      })
+      expect([primary.at(-1)?.type, helper.at(-1)?.type]).toEqual([
+        'done',
+        'done',
+      ])
+      expect(runtime.activity.get('primary')).toMatchObject({
+        lastAcceptedAt: now,
+      })
+      expect(runtime.activity.get('helper')).toBeUndefined()
+      await flushCacheTouches()
+      expect(reports.filter((report) => report.outcome === 'served')).toEqual(
+        Array.from({ length: 2 }, () => ({
+          outcome: 'served',
+          account_id: 'chatgpt-vault',
+          credential_id: 'oauth:openai:vault',
+          headers: {},
+        })),
+      )
+      expect(
+        reports
+          .filter((report) => report.kind === 'billing')
+          .map((report) => report.request_kind),
+      ).toEqual(['primary', 'generate'])
+      expect(reports.filter((report) => report.kind === 'cache_touch')).toEqual(
+        [
+          {
+            kind: 'cache_touch',
+            at: now,
+            ttl_ms: 'implicit',
+            source: 'response',
+          },
+        ],
+      )
+    } finally {
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
+
+  test('Thalamus does not report served for a 200 HTTP stream whose body fails', async () => {
+    const reports = observeRouting()
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    let read = false
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      const events = await send(runtime, {
+        sessionId: 'session-1',
+        maxRetries: 0,
+        fetch: (async () =>
+          new Response(
+            new ReadableStream({
+              pull(controller) {
+                if (read) controller.error(new Error('sentinel broken stream'))
+                else
+                  controller.enqueue(new TextEncoder().encode('data: {}\n\n'))
+                read = true
+              },
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          )) as unknown as typeof fetch,
+      })
+      expect(errorMessage(events)).toContain('sentinel broken stream')
+      expect(read).toBe(true)
+      await flushCacheTouches()
+      expect(reports.filter((report) => report.kind !== 'billing')).toEqual([])
+      expect(runtime.activity.get('session-1')).toBeUndefined()
+    } finally {
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
+
+  for (const scenario of [
+    {
+      name: '403 holds the same route',
+      status: 403,
+      delay: 3000,
+      ui: true,
+      sends: 2,
+    },
+    {
+      name: 'unproven 429 holds the same route',
+      status: 429,
+      delay: 3000,
+      ui: true,
+      sends: 2,
+    },
+    { name: 'headless refuses', status: 403, delay: 3000, ui: false, sends: 1 },
+    {
+      name: 'over-cap refuses',
+      status: 429,
+      delay: 7_200_000,
+      ui: true,
+      sends: 1,
+    },
+    {
+      name: 'changed account identity refuses',
+      status: 403,
+      delay: 3000,
+      ui: true,
+      sends: 1,
+      replace: true,
+    },
+    {
+      name: 'withdrawn vault custody refuses',
+      status: 403,
+      delay: 3000,
+      ui: true,
+      sends: 1,
+      withdraw: true,
+    },
+  ]) {
+    test(`Thalamus transient backoff: ${scenario.name}`, async () => {
+      const asks: unknown[] = []
+      const reports = observeRouting((ask) => asks.push(ask))
+      const credential = 'oauth:openai:a'
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: {
+          [credential]: vaultLogin('chatgpt-a'),
+          'oauth:openai:b': vaultLogin('chatgpt-b'),
+        },
+      })
+      enroll()
+      const target = vault()
+      let now = Date.now()
+      const start = now
+      const waits: number[] = []
+      const runtime = runtimeWith(target, false, {
+        now: () => now,
+        waitForPi: async (delay) => {
+          waits.push(delay)
+          expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-a')])
+          if (scenario.replace) {
+            daemon.credentials[credential] = vaultLogin('chatgpt-other')
+            await target.refresh()
+          }
+          if (scenario.withdraw) rmSync(vaultPaths(stateDir, 'pi').tokenPath)
+          now += delay
+          return 'elapsed'
+        },
+      })
+      if (scenario.ui) runtime.setWorkingMessage = () => {}
+      try {
+        await target.refresh()
+        await target.pollStale(0)
+        codexStatus = () => (codexTokens.length === 1 ? scenario.status : 200)
+        codexReplyHeaders = { 'retry-after': String(scenario.delay / 1000) }
+        codexErrorBody =
+          '{"error":{"type":"rate_limit_exceeded","window":"5h"}}'
+        const events = await send(runtime, {
+          sessionId: 'session-1',
+          maxRetries: 0,
+        })
+        const done = scenario.sends === 2
+        expect(codexTokens).toEqual(
+          Array(scenario.sends).fill(chatgptAccessToken('chatgpt-a')),
+        )
+        expect(waits).toEqual(
+          done || scenario.replace || scenario.withdraw ? [scenario.delay] : [],
+        )
+        expect(events.at(-1)?.type).toBe(done ? 'done' : 'error')
+        if (!done)
+          expect(errorMessage(events)).toBe(VAULT_ROUTING_REFUSAL_MESSAGE)
+        expect(asks).toEqual([])
+        expect(
+          reports.filter((report) => report.kind === 'transient_backoff'),
+        ).toEqual([
+          expect.objectContaining({
+            kind: 'transient_backoff',
+            account_id: 'chatgpt-a',
+            credential_id: credential,
+            retry_at_ms: start + scenario.delay,
+          }),
+        ])
+        expect(
+          reports.filter((report) => report.outcome === 'served'),
+        ).toHaveLength(done ? 1 : 0)
+        const waitReports = reports.filter((report) => report.kind === 'wait')
+        if (waits.length)
+          expect(waitReports).toEqual([
+            expect.objectContaining({
+              phase: 'start',
+              wait_id: expect.any(String),
+            }),
+            expect.objectContaining({
+              phase: 'end',
+              wait_id: waitReports[0]?.wait_id,
+              outcome: done ? 'resumed' : 'abandoned',
+            }),
+          ])
+        else expect(waitReports).toEqual([])
+      } finally {
+        await target.dispose()
+        await runtime.pool.dispose()
+      }
+    })
+  }
+
+  for (const scenario of [
+    {
+      name: 'uses the named alternative',
+      answer: { account_id: 'chatgpt-c' },
+      next: 'chatgpt-c',
+    },
+    {
+      name: 'missing answer uses subscription order',
+      answer: undefined,
+      next: 'chatgpt-b',
+    },
+    {
+      name: 'denial does not try the next route',
+      answer: { refused: { code: 'account_selection_refused' } },
+    },
+    {
+      name: 'holds the exhausted route when the cache cap fits',
+      answer: { account_id: 'chatgpt-a', hold: { retry_after_ms: 3000 } },
+      next: 'chatgpt-a',
+      delay: 3000,
+    },
+    {
+      name: 'refuses an exhausted hold beyond the cache cap',
+      answer: { account_id: 'chatgpt-a', hold: { retry_after_ms: 301_000 } },
+      delay: 301_000,
+    },
+  ]) {
+    test(`Thalamus continue: ${scenario.name}`, async () => {
+      const asks: Record<string, unknown>[] = []
+      const reports = observeRouting((ask) => {
+        expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-a')])
+        expect(
+          reports.filter((report) => report.outcome === 'exhausted'),
+        ).toHaveLength(1)
+        asks.push(ask)
+        return scenario.answer
+      })
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: {
+          'oauth:openai:a': vaultLogin('chatgpt-a'),
+          'oauth:openai:b': vaultLogin('chatgpt-b'),
+          'oauth:openai:c': vaultLogin('chatgpt-c'),
+        },
+      })
+      enroll()
+      let now = Date.now()
+      const target = vault()
+      const waits: number[] = []
+      const runtime = runtimeWith(target, false, {
+        now: () => now,
+        waitForPi: async (delay) => {
+          waits.push(delay)
+          now += delay
+          return 'elapsed'
+        },
+      })
+      if (scenario.delay !== undefined) runtime.setWorkingMessage = () => {}
+      try {
+        await target.refresh()
+        await target.pollStale(0)
+        const options = { sessionId: 'session-1', maxRetries: 0 }
+        if (scenario.delay !== undefined) {
+          expect((await send(runtime, options)).at(-1)?.type).toBe('done')
+          codexTokens = []
+        }
+        codexStatus = () => (codexTokens.length === 1 ? 429 : 200)
+        codexErrorBody = JSON.stringify({ error: provedLimit })
+        const events = await send(runtime, options)
+        expect(asks).toEqual([
+          expect.objectContaining({
+            mode: 'continue',
+            exhausted: expect.objectContaining({
+              account: 'chatgpt-a',
+              credential_id: 'oauth:openai:a',
+              limit_window: 'five_hour',
+            }),
+            candidates: expect.objectContaining({
+              accounts: expect.arrayContaining([
+                expect.objectContaining({ account_id: 'chatgpt-b' }),
+                expect.objectContaining({ account_id: 'chatgpt-c' }),
+              ]),
+            }),
+          }),
+        ])
+        expect(codexTokens).toEqual(
+          ['chatgpt-a', ...(scenario.next ? [scenario.next] : [])].map((id) =>
+            chatgptAccessToken(id),
+          ),
+        )
+        expect(waits).toEqual(scenario.next === 'chatgpt-a' ? [3000] : [])
+        if (scenario.next) expect(events.at(-1)?.type).toBe('done')
+        else expect(errorMessage(events)).toBe(VAULT_ROUTING_REFUSAL_MESSAGE)
+      } finally {
+        await target.dispose()
+        await runtime.pool.dispose()
+      }
+    })
+  }
+
+  for (const start of ['toolcall_start', 'text_delta'] as const) {
+    test(`Thalamus reports a limit after ${start} without another routing action`, async () => {
+      const asks: unknown[] = []
+      const reports = observeRouting((ask) => asks.push(ask))
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: {
+          'oauth:openai:a': vaultLogin('chatgpt-a'),
+          'oauth:openai:b': vaultLogin('chatgpt-b'),
+        },
+      })
+      enroll()
+      const target = vault()
+      const waits: number[] = []
+      const now = Date.now()
+      const runtime = runtimeWith(target, false, {
+        now: () => now,
+        waitForPi: async (delay) => {
+          waits.push(delay)
+          return 'elapsed'
+        },
+      })
+      runtime.setWorkingMessage = () => {}
+      try {
+        await target.refresh()
+        await target.pollStale(0)
+        const tool = start === 'toolcall_start'
+        const output = tool
+          ? [
+              'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"c1","name":"helper","arguments":""}}',
+            ]
+          : [
+              'data: {"type":"response.output_item.added","item":{"type":"message","id":"m1","role":"assistant","status":"in_progress","content":[]}}',
+              'data: {"type":"response.output_text.delta","item_id":"m1","delta":"partial"}',
+            ]
+        const error = tool
+          ? { code: 'rate_limit_exceeded' }
+          : { ...provedLimit, code: 'usage_limit_reached' }
+        const events = await send(runtime, {
+          sessionId: 'session-1',
+          maxRetries: 0,
+          fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+            codexTokens.push(
+              new Headers(init?.headers).get('authorization') ?? '',
+            )
+            return new Response(
+              [
+                ...output,
+                `data: ${JSON.stringify({ type: 'response.failed', response: { error } })}`,
+                '',
+              ].join('\n\n'),
+              { headers: { 'content-type': 'text/event-stream' } },
+            )
+          }) as typeof fetch,
+        })
+        expect(events.map((event) => event.type)).toContain(start)
+        expect(errorMessage(events)).toContain('already been shown')
+        expect(codexTokens).toEqual([
+          `Bearer ${chatgptAccessToken('chatgpt-a')}`,
+        ])
+        expect(asks).toEqual([])
+        expect(waits).toEqual([])
+        await flushCacheTouches()
+        expect(reports.filter((report) => report.kind !== 'billing')).toEqual([
+          {
+            account_id: 'chatgpt-a',
+            credential_id: 'oauth:openai:a',
+            ...(tool
+              ? {
+                  kind: 'transient_backoff',
+                  retry_at_ms: now + 5000,
+                  provider_code: 'http_429',
+                }
+              : {
+                  outcome: 'exhausted',
+                  window: '5h',
+                  resets_at: now + 60_000,
+                }),
+          },
+        ])
+        expect(runtime.activity.get('session-1')).toBeUndefined()
+      } finally {
+        await target.dispose()
+        await runtime.pool.dispose()
+      }
+    })
+  }
+
   test('vault slow and oversized diagnostics are bounded for pi-ai without rewriting an ordinary refusal', async () => {
     Reflect.set(globalThis, routingKey, () => ({}))
     daemon = await startMockDaemon({
@@ -343,15 +791,23 @@ describe('Pi and the Claustrum vault', () => {
       expect(waits).toEqual([])
       expect(asks).toBe(0)
       expect(decisions).toEqual([])
-      expect(reports).toEqual([
-        expect.objectContaining({
-          kind: 'billing',
-          attempt: 1,
-          outcome: 'completed',
-          status: 200,
-          credential_id: 'oauth:openai:vault',
-        }),
-      ])
+      expect(reports.filter((report) => report.kind !== 'cache_touch')).toEqual(
+        [
+          {
+            account_id: 'chatgpt-vault',
+            credential_id: 'oauth:openai:vault',
+            outcome: 'served',
+            headers: { 'retry-after': '0' },
+          },
+          expect.objectContaining({
+            kind: 'billing',
+            attempt: 1,
+            outcome: 'completed',
+            status: 200,
+            credential_id: 'oauth:openai:vault',
+          }),
+        ],
+      )
     } finally {
       await target.dispose()
       await runtime.pool.dispose()
@@ -434,7 +890,7 @@ describe('Pi and the Claustrum vault', () => {
             return undefined
           },
           report: (payload: Record<string, unknown>) => {
-            if (!payload.kind) reports.push(payload)
+            if (payload.outcome === 'exhausted') reports.push(payload)
             return new Promise(() => {})
           },
         }))
@@ -503,7 +959,7 @@ describe('Pi and the Claustrum vault', () => {
         expect(waits).toHaveLength(scenario.wait ? 1 : 0)
         expect(codexTokens).toHaveLength(scenario.wait ? 2 : 1)
         expect(events.at(-1)?.type).toBe(scenario.wait ? 'done' : 'error')
-        expect(asks).toBe(0)
+        expect(asks).toBe(scenario.accessor && scenario.usage ? 1 : 0)
         if (!scenario.accessor || !scenario.usage)
           expect(report).not.toHaveBeenCalled()
       } finally {
@@ -1290,9 +1746,11 @@ describe('Pi and the Claustrum vault', () => {
     const runtime = runtimeWith(target, true)
     const sessionId = 'pi-vault-reused-socket'
     const reports: { session: string; payload: Record<string, unknown> }[] = []
+    const outcomes: Record<string, unknown>[] = []
     Reflect.set(globalThis, routingKey, (session: string) => ({
       report(payload: Record<string, unknown>) {
         if (payload.kind === 'billing') reports.push({ session, payload })
+        else outcomes.push(payload)
       },
     }))
     const rawSend = RawWebSocket.prototype.send
@@ -1407,6 +1865,18 @@ describe('Pi and the Claustrum vault', () => {
       expect(reports[0]!.payload.attempt_id).not.toBe(
         reports[1]!.payload.attempt_id,
       )
+      await flushCacheTouches()
+      expect(outcomes.filter((report) => report.outcome === 'served')).toEqual(
+        Array.from({ length: 2 }, () => ({
+          account_id: 'chatgpt-vault',
+          credential_id: credential,
+          outcome: 'served',
+          headers: {},
+        })),
+      )
+      expect(
+        outcomes.filter((report) => report.kind === 'cache_touch'),
+      ).toHaveLength(2)
       expect(codexTokens).toEqual([])
     } finally {
       usage.mockRestore()

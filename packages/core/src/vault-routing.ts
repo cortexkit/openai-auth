@@ -110,7 +110,7 @@ export function startVaultRoutingWait(input: {
 /**
  * Placement offers every eligible vault login that passes the user's floors.
  * A continue still uses the local plan to find alternatives to the exhausted account.
- * The Pi host adapter is not wired because its provider stream gives no reliable request purpose.
+ * Pi asks only on continuation; its stream has no marker for a new user turn.
  */
 export async function chooseVaultRouting(input: {
   vaultMode: boolean
