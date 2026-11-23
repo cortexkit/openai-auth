@@ -29,6 +29,8 @@ The setup command detects OpenCode and Pi, registers the plugin, and offers a co
 
 Then start OpenCode and run `/openai`.
 
+On OpenCode 2, sign in once more: run `opencode auth login openai` and choose **ChatGPT (openai-auth pool, browser)** or **(headless)**, or use **Vault → Connect** in `/openai` on a host that uses only the vault. Do this after an upgrade from OpenCode 1 too, because OpenCode 2.3 and later import OpenCode 1's sign-in, which the plugin can't use. See [Signing in](docs/opencode-2.md#signing-in).
+
 ## Shared limit policy
 
 In `/openai`, **Routing → Longest wait on the same account** offers **Don't wait**, **15 minutes** (the default), and **Until the cache expires**. A wait needs a confirmed reset and usable cache evidence; an unknown reset does not justify holding the account. The killswitch and credential checks still apply, and the killswitch can prevent a same-account wait.

@@ -155,6 +155,9 @@ echo "  ✓ All checks passed"
 echo ""
 
 echo "→ Committing version bump..."
+# The gate and the tests run after the first check and can leave files behind.
+# Check again so nothing but the version files reaches the release commit.
+check_version_changes
 git add -A
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
@@ -167,7 +170,8 @@ git tag -a "$TAG" -m "Release $TAG"
 echo ""
 
 echo "→ Pushing to origin..."
-git push origin "$BRANCH" "$TAG"
+# The tag starts the npm publish, so it must never land without the branch.
+git push --atomic origin "$BRANCH" "$TAG"
 echo ""
 
 echo "  ✓ Released $TAG"
