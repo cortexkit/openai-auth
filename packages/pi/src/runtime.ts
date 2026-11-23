@@ -166,6 +166,11 @@ export interface PiOpenAIRuntimeDeps {
 /** How many vault tokens are remembered, so a WebSocket frame finds its account. */
 const VAULT_TOKENS_KEPT = 64
 
+// Pi's agent retries by matching the error text, so provider details must not
+// appear in the terminal error of an attempt that has already published output.
+const TERMINAL_AFTER_OUTPUT_MESSAGE =
+  'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started.'
+
 /** An attempt as the router sees it, with the events it produced so far. */
 interface StreamAttempt extends RouteAttempt {
   /** The events through the first output or terminal event, held until selection. */
@@ -1182,10 +1187,10 @@ export class PiOpenAIRuntime {
           if (event.type === 'error') {
             failed = true
             // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
-            event.error.errorMessage = redactCredentialText(
-              event.error.errorMessage ?? '',
-              token,
-            )
+            event.error.errorMessage =
+              outputStarted && event.reason !== 'aborted'
+                ? TERMINAL_AFTER_OUTPUT_MESSAGE
+                : redactCredentialText(event.error.errorMessage ?? '', token)
           }
           yield event
         }
@@ -1204,7 +1209,12 @@ export class PiOpenAIRuntime {
           )
       } catch (error) {
         billing?.end(outputStarted, false, status)
-        yield errorEvent(model, redactCredentialError(error, token).message)
+        yield errorEvent(
+          model,
+          outputStarted
+            ? TERMINAL_AFTER_OUTPUT_MESSAGE
+            : redactCredentialError(error, token).message,
+        )
       } finally {
         billing?.end(outputStarted, stopped && !failed, status)
       }
