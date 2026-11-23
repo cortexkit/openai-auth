@@ -316,11 +316,17 @@ describe('settings move publication', () => {
       responses_lite: true,
       codex_api_endpoint: 'https://example.test/responses',
     }
+    // Settings added after the move (no old-store source) have nothing to copy.
     expect(
       Object.keys(expected)
         .filter((key) => key !== 'schema_version')
         .sort(),
-    ).toEqual(Object.keys(openaiSettings.settings).sort())
+    ).toEqual(
+      Object.entries(openaiSettings.settings)
+        .filter(([, setting]) => setting.legacy.length > 0)
+        .map(([key]) => key)
+        .sort(),
+    )
     expect(await document(f.install)).toEqual(expected)
     await f.unchanged()
   })

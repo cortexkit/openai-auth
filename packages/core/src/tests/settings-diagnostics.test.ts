@@ -59,6 +59,7 @@ describe('settings diagnostic text contract', () => {
       sharedMissing: text.sharedMissing,
       sharedMoved: text.sharedMoved,
       sharedFound: text.sharedFound,
+      waitForResetOn: text.waitForResetOn,
       preExistingFile: text.preExistingFile('/settings.jsonc'),
       removedFile: text.removedFile('/settings.jsonc'),
       refused: text.refused('/records', 'permission denied'),
@@ -95,6 +96,8 @@ describe('settings diagnostic text contract', () => {
       sharedMissing: 'No settings file, so defaults are in use.',
       sharedMoved: 'Settings were moved to the settings file in this process.',
       sharedFound: 'Settings file found.',
+      waitForResetOn:
+        'wait_for_reset is on: when every account is at a usage limit with a known reset, the turn waits for the reset.',
       preExistingFile:
         "Settings come from /settings.jsonc. Preferences in the old account store weren't copied, because this file already existed.",
       removedFile:
@@ -443,21 +446,12 @@ describe('config-scoped Diagnostics section', () => {
     })
     expect(section.title).toBe('Diagnostics')
     expect(await section.build()).toEqual({
-      lines: [
-        "Settings stay in this install's account store.",
-        'wait_for_reset: false',
-      ],
+      lines: ["Settings stay in this install's account store."],
     })
     expect(await shared.open()).toEqual({
-      lines: [
-        text.file(shared.install.target),
-        text.sharedFound,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(shared.install.target), text.sharedFound],
     })
-    expect(await section.build()).toEqual({
-      lines: [text.separate, 'wait_for_reset: false'],
-    })
+    expect(await section.build()).toEqual({ lines: [text.separate] })
     expect(separate.warnings).toEqual([])
   })
 
@@ -465,19 +459,11 @@ describe('config-scoped Diagnostics section', () => {
     const f = await fixture()
     await f.start()
     expect(await f.open()).toEqual({
-      lines: [
-        text.file(f.install.target),
-        text.sharedMissing,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(f.install.target), text.sharedMissing],
     })
     await put(f.install.target, '{}')
     expect(await f.open()).toEqual({
-      lines: [
-        text.file(f.install.target),
-        text.sharedFound,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(f.install.target), text.sharedFound],
     })
     expect(f.warnings).toEqual([])
   })
@@ -488,11 +474,7 @@ describe('config-scoped Diagnostics section', () => {
     })
     expect((await f.start()).move?.outcome).toBe('moved')
     expect(await f.open()).toEqual({
-      lines: [
-        text.file(f.install.target),
-        text.sharedMoved,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(f.install.target), text.sharedMoved],
     })
     await rm(f.install.target)
     expect(await f.open()).toEqual({
@@ -500,7 +482,6 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedMissing,
         text.removedFile(f.install.target),
-        'wait_for_reset: false',
       ],
     })
     const handle = openSettings(openaiSettings, {
@@ -514,11 +495,7 @@ describe('config-scoped Diagnostics section', () => {
       { host: 'opencode' },
     )
     expect(await f.open()).toEqual({
-      lines: [
-        text.file(f.install.target),
-        text.sharedFound,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(f.install.target), text.sharedFound],
     })
     expect(f.warnings).toEqual([text.removedFile(f.install.target)])
   })
@@ -535,7 +512,6 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedFound,
         existing,
-        'wait_for_reset: false',
       ])
     expect(f.warnings).toEqual([existing])
     const note = `${f.install.configIdentity}.MOVED_READPLEASE`
@@ -546,7 +522,6 @@ describe('config-scoped Diagnostics section', () => {
     expect((await f.open()).lines).toEqual([
       text.file(f.install.target),
       text.sharedFound,
-      'wait_for_reset: false',
     ])
     await rm(f.install.target)
     const removed = text.removedFile(f.install.target)
@@ -555,7 +530,6 @@ describe('config-scoped Diagnostics section', () => {
         text.file(f.install.target),
         text.sharedMissing,
         removed,
-        'wait_for_reset: false',
       ])
     expect(f.warnings).toEqual([existing, removed])
     await put(f.install.target, '{}')
@@ -564,7 +538,6 @@ describe('config-scoped Diagnostics section', () => {
       text.file(f.install.target),
       text.sharedFound,
       existing,
-      'wait_for_reset: false',
     ])
     expect(f.warnings).toEqual([existing, removed])
   })
@@ -603,7 +576,6 @@ describe('config-scoped Diagnostics section', () => {
     expect((await mover.open()).lines).toEqual([
       text.file(mover.install.target),
       text.sharedFound,
-      'wait_for_reset: false',
     ])
   })
 
@@ -636,7 +608,6 @@ describe('config-scoped Diagnostics section', () => {
           { window: 'primary', floor: 30 },
         ],
         cache_keep_window: [{ start_hour: 1, end_hour: 1 }],
-        wait_for_reset: { default: false, opencode: true },
       }),
     )
     expect(snapshot.report()).toEqual([])
@@ -650,7 +621,6 @@ describe('config-scoped Diagnostics section', () => {
       text.checks.localBoth,
       text.checks.duplicateQuota,
       text.checks.warmWindow,
-      'wait_for_reset: true',
     ])
     expect(lines.join('\n')).not.toContain('private stored value')
     await put(f.install.target, 'not json')
@@ -659,12 +629,36 @@ describe('config-scoped Diagnostics section', () => {
     )
     await put(f.install.target, '{}')
     expect(await f.open(snapshot)).toEqual({
-      lines: [
-        text.file(f.install.target),
-        text.sharedFound,
-        'wait_for_reset: false',
-      ],
+      lines: [text.file(f.install.target), text.sharedFound],
     })
+  })
+
+  it('shows wait_for_reset only while the shared file turns it on', async () => {
+    const f = await fixture({ target: '{}' })
+    await f.start()
+    const handle = openSettings(openaiSettings, {
+      file: f.install.target,
+      separateInstall: false,
+      createMissing: true,
+      log: { warn() {}, info() {} },
+    })
+    const snapshot = await createSettingsSnapshot({
+      handle: { ...handle, watch: () => () => {} },
+      file: f.install.target,
+      host: 'opencode',
+    })
+    snapshots.push(snapshot)
+    await put(f.install.target, JSON.stringify({ wait_for_reset: true }))
+    expect((await f.open(snapshot)).lines).toEqual([
+      text.file(f.install.target),
+      text.sharedFound,
+      text.waitForResetOn,
+    ])
+    await put(f.install.target, JSON.stringify({ wait_for_reset: false }))
+    expect((await f.open(snapshot)).lines).toEqual([
+      text.file(f.install.target),
+      text.sharedFound,
+    ])
   })
 
   it('keeps a failed move visible on every open and never shows the source value', async () => {
@@ -677,7 +671,6 @@ describe('config-scoped Diagnostics section', () => {
       expect(lines).toEqual([
         text.file(f.install.target),
         text.legacySetting('quota_check_interval_minutes'),
-        'wait_for_reset: false',
       ])
       expect(lines.join('\n')).not.toContain('private stored value')
     }
@@ -691,7 +684,6 @@ describe('config-scoped Diagnostics section', () => {
       text.legacyFailed(
         `opencode ${f.install.configIdentity}: SOURCE_NOT_JSON`,
       ),
-      'wait_for_reset: false',
     ])
   })
 

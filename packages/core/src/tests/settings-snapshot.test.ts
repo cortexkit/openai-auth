@@ -1037,8 +1037,13 @@ async function moved(
 
 describe('old store to move to resolved view', () => {
   it('covers every setting-table row', () => {
+    // Settings added after the move (no old-store source) can't roundtrip.
     expect(roundtrips.map(({ setting }) => setting).sort()).toEqual(
-      (Object.keys(openaiSettings.settings) as SnapshotSetting[]).sort(),
+      (
+        Object.entries(openaiSettings.settings)
+          .filter(([, setting]) => setting.legacy.length > 0)
+          .map(([key]) => key) as SnapshotSetting[]
+      ).sort(),
     )
   })
   for (const host of ['opencode', 'pi'] as const) {

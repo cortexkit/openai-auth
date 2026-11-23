@@ -30,6 +30,8 @@ export const SETTINGS_DIAGNOSTICS_TEXT = Object.freeze({
   sharedMissing: 'No settings file, so defaults are in use.',
   sharedMoved: 'Settings were moved to the settings file in this process.',
   sharedFound: 'Settings file found.',
+  waitForResetOn:
+    'wait_for_reset is on: when every account is at a usage limit with a known reset, the turn waits for the reset.',
   preExistingFile: (path: string) =>
     `Settings come from ${path}. Preferences in the old account store weren't copied, because this file already existed.`,
   removedFile: (path: string) =>
@@ -195,10 +197,8 @@ export async function buildSettingsDiagnostics({
     }
     throw error
   }
-  const resetWaitLine = () =>
-    `wait_for_reset: ${authority.decision === 'shared' && (snapshot?.get('wait_for_reset') ?? false)}`
   if (authority.decision === 'separate')
-    return { lines: [SETTINGS_DIAGNOSTICS_TEXT.separate, resetWaitLine()] }
+    return { lines: [SETTINGS_DIAGNOSTICS_TEXT.separate] }
 
   const completion =
     authority.decision === 'shared'
@@ -228,8 +228,10 @@ export async function buildSettingsDiagnostics({
     }
     await snapshot?.refresh()
     lines.push(...(snapshot?.report().map(settingsReportLine) ?? []))
+    // Only shared settings can turn the opt-in on, so only they can show it.
+    if (snapshot?.get('wait_for_reset'))
+      lines.push(SETTINGS_DIAGNOSTICS_TEXT.waitForResetOn)
   }
-  lines.push(resetWaitLine())
   return { lines }
 }
 
