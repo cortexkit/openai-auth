@@ -37,7 +37,7 @@
     "types": "tsc"
   },
   "devDependencies": {
-    "@cortexkit/claustrum-client": "^0.20.0",
-    "@cortexkit/common-auth": "^0.56.3"
+    "@cortexkit/claustrum-client": "^0.22.0",
+    "@cortexkit/common-auth": "^0.57.0"
   }
 }
