@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { parseJwtClaims } from '@cortexkit/openai-auth-core/internal'
 import { shapePiCodexWebSocketFrame } from './codex-wire.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
 
@@ -11,50 +12,118 @@ type WebSocketAttempt = {
   url: string
   token: string
   owner: object
+  sessionId?: string | undefined
   onMessage(data: string): void
 }
 
-const attemptScope = new AsyncLocalStorage<WebSocketAttempt>()
+type ScopedAttempt = WebSocketAttempt & {
+  cacheKey?: string | undefined
+  settled: boolean
+}
 
-export function withPiCodexWebSocketAttempt<T>(
-  attempt: WebSocketAttempt,
-  run: () => T,
-): T {
-  return attemptScope.run(attempt, run)
+const attemptScope = new AsyncLocalStorage<ScopedAttempt>()
+const cachedSockets = new Map<string, PiRawCodexWebSocket>()
+
+function cacheKey({ sessionId, token }: WebSocketAttempt): string | undefined {
+  if (!sessionId) return
+  // pi-ai keys the cache by the original session ID and the nested JWT claim,
+  // not by the clamped prompt_cache_key or the plugin's routing account ID.
+  const accountId =
+    parseJwtClaims(token)?.['https://api.openai.com/auth']?.chatgpt_account_id
+  if (typeof accountId === 'string' && accountId)
+    return JSON.stringify([sessionId, accountId])
+}
+
+export function retireIdlePiCodexWebSocket(): void {
+  const attempt = attemptScope.getStore()
+  if (!attempt?.cacheKey) return
+  cachedSockets.get(attempt.cacheKey)?.retireIfIdle(attempt)
+}
+
+export function withPiCodexWebSocketAttempt<
+  T extends { result(): Promise<unknown> },
+>(attempt: WebSocketAttempt, run: () => T): T {
+  const scoped = { ...attempt, cacheKey: cacheKey(attempt), settled: false }
+  return attemptScope.run(scoped, () => {
+    retireIdlePiCodexWebSocket()
+    const finish = () => {
+      scoped.settled = true
+    }
+    try {
+      const stream = run()
+      // pi-ai releases the socket before publishing its terminal stream event.
+      void stream.result().then(finish, finish)
+      return stream
+    } catch (error) {
+      finish()
+      throw error
+    }
+  })
 }
 
 let installCount = 0
 let originalWebSocket: unknown
 
 class PiRawCodexWebSocket extends RawWebSocket {
-  private readonly binding: Omit<WebSocketAttempt, 'onMessage'>
-  private onAttemptMessage?: WebSocketAttempt['onMessage']
+  private readonly binding: Pick<WebSocketAttempt, 'url' | 'token' | 'owner'>
+  private readonly cacheKey?: string
+  private activeAttempt?: ScopedAttempt
 
-  constructor(
-    { url, token, owner }: WebSocketAttempt,
-    headers: Record<string, string>,
-  ) {
+  constructor(attempt: ScopedAttempt, headers: Record<string, string>) {
+    const { url, token, owner, cacheKey } = attempt
     super(url, headers)
     this.binding = { url, token, owner }
+    // An open incumbent means pi-ai opened this as a temporary socket while
+    // the cached connection was busy. It must not displace the cached one.
+    if (cacheKey && cachedSockets.get(cacheKey)?.readyState !== 1) {
+      this.cacheKey = cacheKey
+      this.addEventListener('close', () => this.forget())
+    }
     this.addEventListener('message', (event) => {
       const data = (event as { data?: unknown } | null)?.data
-      if (typeof data === 'string') this.onAttemptMessage?.(data)
+      if (typeof data === 'string') this.activeAttempt?.onMessage(data)
     })
+  }
+
+  private matches(attempt: WebSocketAttempt): boolean {
+    return (
+      attempt.owner === this.binding.owner &&
+      attempt.url === this.binding.url &&
+      attempt.token === this.binding.token
+    )
+  }
+
+  retireIfIdle(attempt: ScopedAttempt): void {
+    if (
+      this.readyState === 1 &&
+      this.activeAttempt?.settled &&
+      !this.matches(attempt)
+    ) {
+      this.close()
+    }
+  }
+
+  private forget(): void {
+    if (this.cacheKey && cachedSockets.get(this.cacheKey) === this)
+      cachedSockets.delete(this.cacheKey)
+  }
+
+  override close(): void {
+    this.forget()
+    super.close()
   }
 
   override send(data: string): void {
     const attempt = attemptScope.getStore()
-    if (
-      !attempt ||
-      attempt.owner !== this.binding.owner ||
-      attempt.url !== this.binding.url ||
-      attempt.token !== this.binding.token
-    ) {
-      // pi-ai caches by session and account, not by endpoint or bearer token.
-      // A stale connection must not send with the previous attempt's credential.
-      throw new Error('Cached Codex WebSocket does not match the request')
+    if (!attempt || !this.matches(attempt)) {
+      // This is a transport guard, not a provider error to show the user.
+      throw new Error()
     }
-    this.onAttemptMessage = attempt.onMessage
+    // pi-ai has acquired the socket by the first send. An aborted handshake
+    // never gets here and must not replace the cached entry.
+    if (!this.activeAttempt && this.cacheKey && this.readyState === 1)
+      cachedSockets.set(this.cacheKey, this)
+    this.activeAttempt = attempt
     super.send(shapePiCodexWebSocketFrame(data))
   }
 }

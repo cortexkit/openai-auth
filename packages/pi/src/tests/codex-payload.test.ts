@@ -831,6 +831,141 @@ test.each(['prefix', 'tools', 'instructions'] as const)(
   },
 )
 
+test.each([
+  [
+    'Pi stays on WebSocket when the bearer rotates for the same account and session',
+    'idle',
+  ],
+  [
+    'Pi opens a separate WebSocket after bearer rotation while the cached socket is busy',
+    'busy',
+  ],
+  [
+    'Pi replaces the old WebSocket if it goes idle while the new payload is prepared',
+    'payload',
+  ],
+] as const)('%s', async (_title, rotation) => {
+  const seam = spyOnRawCodexFrames()
+  const oldSocketClosed = Promise.withResolvers<void>()
+  const releaseOpening = Promise.withResolvers<() => void>()
+  let oldWasClosed = false
+  const upgrades: (string | null)[] = []
+  const wire: { socket: number; data: string }[] = []
+  const server = Bun.serve<number>({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request, server) {
+      const authorization = request.headers.get('authorization')
+      if (server.upgrade(request, { data: upgrades.length })) {
+        upgrades.push(authorization)
+        return
+      }
+      return new Response(null, { status: 400 })
+    },
+    websocket: {
+      message(socket, frame) {
+        wire.push({ socket: socket.data, data: frame.toString() })
+        const events = responseEvents(wire.length)
+        const send = (events: unknown[]) => {
+          for (const event of events) socket.send(JSON.stringify(event))
+        }
+        if (wire.length === 1 && rotation !== 'idle') {
+          send(events.slice(0, 2))
+          releaseOpening.resolve(() => send(events.slice(2)))
+        } else send(events)
+      },
+      close(socket) {
+        if (socket.data === 0) {
+          oldWasClosed = true
+          oldSocketClosed.resolve()
+        }
+      },
+    },
+  })
+  try {
+    const socketModel = { ...model, baseUrl: server.url.href }
+    const rotated = chatgptAccessToken('payload-test-account', 'refreshed')
+    const socketSessionId = `${sessionId}-rotated-${rotation}`
+    const options = {
+      ...cachedWebSocketOptions(),
+      sessionId: socketSessionId,
+      maxRetries: 0,
+      fetch: mockFetch(async () => {
+        throw new Error('Unexpected HTTP fallback after bearer rotation')
+      }),
+    }
+    const start = (
+      messages: Context['messages'],
+      token: string,
+      onPayload?: SimpleStreamOptions['onPayload'],
+    ) =>
+      runtime.stream(
+        socketModel,
+        { systemPrompt, messages },
+        { ...options, apiKey: token, onPayload },
+      )
+
+    const opening = start([firstUser], apiKey)
+    let secondMessages: Context['messages']
+    if (rotation === 'idle') {
+      const first = await opening.result()
+      expect(first.responseId).toBe('resp_1')
+      secondMessages = [firstUser, first, secondUser]
+    } else {
+      for await (const event of opening) {
+        if (event.type === 'error' || event.type === 'done')
+          throw new Error('Opening turn did not stay active')
+        if (event.type === 'text_delta') break
+      }
+      secondMessages = [firstUser, secondUser]
+    }
+    const finishOpening = async () => {
+      ;(await releaseOpening.promise)()
+      expect((await opening.result()).responseId).toBe('resp_1')
+    }
+    const second = await start(
+      secondMessages,
+      rotated,
+      rotation === 'payload' ? finishOpening : undefined,
+    ).result()
+    expect(second.errorMessage).toBeUndefined()
+    expect(second.responseId).toBe('resp_2')
+    if (rotation === 'busy') {
+      expect(oldWasClosed).toBe(false)
+      await finishOpening()
+    } else await oldSocketClosed.promise
+    const third = await start(
+      [...secondMessages, second, thirdUser],
+      rotated,
+    ).result()
+    expect(third.responseId).toBe('resp_3')
+    await oldSocketClosed.promise
+
+    expect(upgrades).toEqual([
+      `Bearer ${apiKey}`,
+      `Bearer ${rotated}`,
+      ...(rotation === 'busy' ? [`Bearer ${rotated}`] : []),
+    ])
+    expect(wire.map(({ socket }) => socket)).toEqual([
+      0,
+      1,
+      rotation === 'busy' ? 2 : 1,
+    ])
+    expect(wire.map(({ data }) => data)).toEqual(seam.frames)
+    const frames = wire.map(({ data }) => JSON.parse(data))
+    expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+      undefined,
+      undefined,
+      rotation === 'busy' ? undefined : 'resp_2',
+    ])
+    expect(frames[1].input[0]).toMatchObject({ role: 'developer' })
+  } finally {
+    seam.restore()
+    closeOpenAICodexWebSocketSessions(`${sessionId}-rotated-${rotation}`)
+    await server.stop(true)
+  }
+})
+
 function rateLimitsFrame(usedPercent: number) {
   return {
     type: 'codex.rate_limits',

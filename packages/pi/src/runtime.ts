@@ -100,7 +100,10 @@ import type {
   Model,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-import { withPiCodexWebSocketAttempt } from './codex-websocket.ts'
+import {
+  retireIdlePiCodexWebSocket,
+  withPiCodexWebSocketAttempt,
+} from './codex-websocket.ts'
 import {
   piCodexHttpUrl,
   piCodexWebSocketUrl,
@@ -1014,11 +1017,15 @@ export class PiOpenAIRuntime {
         // Effort updates belong in pi-ai's logical history; wire-only changes do not.
         onPayload: async (payload, payloadModel) => {
           const replacement = await options?.onPayload?.(payload, payloadModel)
-          const source = replacement === undefined ? payload : replacement
-          if (!effortSessionId || !isRecord(source)) return source
-          const body = { ...source }
-          this.applyEffort(body, effortSessionId)
-          return body
+          let source = replacement === undefined ? payload : replacement
+          if (effortSessionId && isRecord(source)) {
+            const body = { ...source }
+            this.applyEffort(body, effortSessionId)
+            source = body
+          }
+          // A cached socket may have gone idle while the caller built its payload.
+          if (useWebSocketShim) retireIdlePiCodexWebSocket()
+          return source
         },
         // Scrub before pi-ai parses errors into its shared partial message objects.
         fetch: Object.assign(
@@ -1118,6 +1125,7 @@ export class PiOpenAIRuntime {
               url: piCodexWebSocketUrl(httpUrl),
               token,
               owner: this,
+              sessionId: effortSessionId,
               onMessage: (data) =>
                 this.observeWebSocketMessage(quotaDispatch, data),
             },
