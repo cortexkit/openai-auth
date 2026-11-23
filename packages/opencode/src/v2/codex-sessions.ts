@@ -23,6 +23,7 @@ import {
   FrameTurnState,
   uuidV7,
 } from '@cortexkit/openai-auth-core/internal'
+import { CodexPrimaryTurns } from '../codex-request'
 import {
   acquireCodexSessionsLock,
   CODEX_SESSIONS_LOCK_WAIT_MS,
@@ -77,6 +78,7 @@ export class CodexSessionStore {
    * to the session file at `path`.
    */
   readonly frameTurns = new FrameTurnState()
+  readonly primaryTurns = new CodexPrimaryTurns()
   /** Sessions this process created since its last successful save. */
   readonly #dirty = new Set<string>()
   /** Sessions this process deleted since its last successful save. */
@@ -295,7 +297,11 @@ export function acquireCodexSessions(
   }
   // Releases before 1.2 kept the same public store protocol but did not track
   // WebSocket frame turns. Add that state to the store old locations still hold.
-  const shared: { frameTurns?: FrameTurnState } = store
+  const shared: {
+    frameTurns?: FrameTurnState
+    primaryTurns?: CodexPrimaryTurns
+  } = store
   shared.frameTurns ??= new FrameTurnState()
+  shared.primaryTurns ??= new CodexPrimaryTurns()
   return store
 }

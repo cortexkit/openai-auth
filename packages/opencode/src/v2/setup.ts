@@ -411,9 +411,8 @@ export async function installPoolHooks<Q, A extends OpenAIAttemptData>(
                 `${received.sessionID}:${received.kind}`,
               )
               if (socket) {
-                // Only an owned socket's frames move the frame turn state.
-                codex.frameReceived(received.sessionID, received.frame)
                 if (received.kind === 'primary') {
+                  codex.frameReceived(received.sessionID, received.frame)
                   let capture: FrameMirrorCapture | undefined
                   mirror?.receive(
                     received.sessionID,

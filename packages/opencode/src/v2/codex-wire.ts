@@ -15,6 +15,7 @@ import {
   supportsMidConversationEffort,
   uuidV7,
 } from '@cortexkit/openai-auth-core/internal'
+import { CodexPrimaryTurns } from '../codex-request'
 import type { CodexSessionStore } from './codex-sessions'
 import type { FrameMirrorCapture } from './frame-mirror'
 
@@ -40,10 +41,10 @@ export class CodexHttpState {
   /**
    * Each session's WebSocket frame turn (see `frame-turn.ts`). With a store
    * this is the store's process-wide state; without a store it is this
-   * object's own. Only WebSocket frames update it; HTTP requests of every
-   * kind leave it alone.
+   * object's own. Only primary WebSocket frames update it.
    */
   readonly frameTurns: FrameTurnState
+  readonly primaryTurns: CodexPrimaryTurns
   readonly installationID: string
   constructor(
     readonly runtime?: CodexRequestRuntime,
@@ -53,6 +54,7 @@ export class CodexHttpState {
     this.installationID = installationID ?? processInstallationID()
     this.sessions = store?.sessions ?? new Map()
     this.frameTurns = store?.frameTurns ?? new FrameTurnState()
+    this.primaryTurns = store?.primaryTurns ?? new CodexPrimaryTurns()
   }
 
   get(sessionID: string): CodexSessionMetadata {
@@ -72,7 +74,9 @@ export class CodexHttpState {
    * about to send, as the host built it, and returns the frame's turn.
    */
   advanceFrame(sessionID: string, frame: Record<string, unknown>): FrameTurn {
-    return this.frameTurns.advance(sessionID, frame, this.runtime)
+    const turn = this.frameTurns.advance(sessionID, frame, this.runtime)
+    this.primaryTurns.record(this.get(sessionID), turn)
+    return turn
   }
 
   /**
@@ -284,6 +288,8 @@ export async function rewriteCodexHttpRequest(
   // has established that this request belongs to the account pool.
   if (body) delete body.max_output_tokens
   const headers = new Headers(request.headers)
+  const session = state.get(scope.sessionID)
+  const primary = scope.kind === 'primary'
   const prepared = prepareCodexRequest({
     init: {
       body: body
@@ -293,16 +299,20 @@ export async function rewriteCodexHttpRequest(
           : text,
     },
     headers,
-    metadata: state.get(scope.sessionID),
+    metadata: primary
+      ? session
+      : state.primaryTurns.forAuxiliary(session, state.runtime),
     installationID: state.installationID,
     runtime: state.runtime,
     websocket: false,
+    skipTurnUpdate: !primary,
     responsesLite: lite,
     applyEffort: (parsed) => {
       effort.apply(parsed, scope, 'http')
       if (onModel && typeof parsed.model === 'string') onModel(parsed.model)
     },
   })
+  if (primary) state.primaryTurns.record(session)
   return new Request(request, { headers, body: prepared.init?.body })
 }
 
@@ -394,9 +404,9 @@ function frameInputMatches(host: unknown, sent: unknown): boolean {
  * builder (`prepareCodexRequest` with `websocket: true`): the thread cache
  * key, `parallel_tool_calls`, Codex tool shapes, the Codex `client_metadata`
  * (installation, window, turn metadata, send time) and Codex's body key
- * order, with output caps removed. The turn metadata carries the frame turn
- * (see `frame-turn.ts`), never the HTTP turn, and shaping never writes the
- * session's HTTP turn state.
+ * order, with output caps removed. Primary frames use the frame turn and
+ * helpers borrow the latest primary turn, even when it was sent over HTTP.
+ * Shaping never writes the session's HTTP turn state.
  *
  * `input` keeps the host's items except for the effort rule's
  * `configuration_update` and completed call status restored on full frames
@@ -416,8 +426,12 @@ export function rewriteCodexFrame(
   if (body?.type !== 'response.create') return undefined
   // The turn rule reads the frame as the host built it, before the effort
   // rule below may insert its item.
-  const turn = effort.http.advanceFrame(scope.sessionID, body)
-  const session = effort.http.get(scope.sessionID)
+  const state = effort.http
+  const turn =
+    scope.kind === 'primary'
+      ? state.advanceFrame(scope.sessionID, body)
+      : undefined
+  const session = state.get(scope.sessionID)
   const chained = 'previous_response_id' in body
   // Codex does not accept output caps.
   delete body.max_output_tokens
@@ -428,10 +442,13 @@ export function rewriteCodexFrame(
     // edits go to this unused set; the frame's turn metadata travels in its
     // client_metadata.
     headers: new Headers(),
-    metadata: frameRequestMetadata(session, turn),
-    installationID: effort.http.installationID,
-    runtime: effort.http.runtime,
+    metadata: turn
+      ? frameRequestMetadata(session, turn)
+      : state.primaryTurns.forAuxiliary(session, state.runtime),
+    installationID: state.installationID,
+    runtime: state.runtime,
     websocket: true,
+    skipTurnUpdate: !turn,
     responsesLite: false,
     // Hosts before 2.3.2 build incremental frames against their own request
     // shape. Leave instructions where the host put them; 2.3.2 moves the

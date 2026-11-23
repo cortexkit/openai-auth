@@ -1,7 +1,7 @@
 // The WebSocket frame turn (`v2/frame-turn.ts`): which `response.create`
 // frames start a new turn, that the frame turn is kept apart from the
-// session's HTTP turn state, which title, compaction and generate requests
-// keep sharing exactly as on OpenCode 1, and how the plugin feeds it from the
+// session's HTTP turn state, how helpers inherit the latest primary turn,
+// and how the plugin tracks sent and completed primary frames through the
 // host's WebSocket hooks and session deletions.
 
 import { afterEach, describe, expect, it } from 'bun:test'
@@ -258,7 +258,7 @@ describe('WebSocket frame turn rule', () => {
 })
 
 describe('WebSocket frame turn and HTTP turn state are separate', () => {
-  const http = (kind: string, input: unknown[]) =>
+  const http = (input: unknown[]) =>
     new Request('https://codex.test/v1/responses', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -305,7 +305,7 @@ describe('WebSocket frame turn and HTTP turn state are separate', () => {
     const step = async (kind: string, input: unknown[]) => {
       httpClock.clock.now += 1_000
       await rewriteCodexHttpRequest(
-        http(kind, input),
+        http(input),
         { sessionID: SESSION, kind },
         effort,
         false,
@@ -324,13 +324,12 @@ describe('WebSocket frame turn and HTTP turn state are separate', () => {
     turns.completed(SESSION)
     const beforeTitle = httpTurn(state)
     await step('title', [user('name this session')])
-    // The title request moved the HTTP turn, as it does on OpenCode 1.
-    expect(httpTurn(state).turnID).not.toBe(beforeTitle.turnID)
+    expect(httpTurn(state)).toEqual(beforeTitle)
     const tool = frame(chained('r1', [call('c1'), output('c1')]))
     turns.completed(SESSION)
     const beforeCompaction = httpTurn(state)
     await step('compaction', [user('summarize this session')])
-    expect(httpTurn(state).turnID).not.toBe(beforeCompaction.turnID)
+    expect(httpTurn(state)).toEqual(beforeCompaction)
     const next = frame(chained('r2', [output('c2')]))
 
     expect([first, tool, next].map((metadata) => metadata.turn_id)).toEqual([
@@ -383,35 +382,48 @@ describe('WebSocket frame turn in the OpenCode 2 plugin', () => {
       await store?.settled()
     })
     const owned = `Bearer ${placeholderSecret('openai')}`
-    await host.fire('experimental.ws.handshake', {
-      ...scope(SESSION),
-      url: 'wss://api.openai.com/v1/responses',
-      headers: { authorization: owned } as Record<string, string>,
-    })
+    const handshake = (kind: RequestKind) =>
+      host.fire('experimental.ws.handshake', {
+        ...scope(SESSION, kind),
+        url: 'wss://api.openai.com/v1/responses',
+        headers: { authorization: owned } as Record<string, string>,
+      })
+    await handshake('primary')
+    const sendFrame = async (
+      frame: Record<string, unknown>,
+      kind: RequestKind,
+    ) => {
+      ids.clock.now += 1_000
+      const draft = { ...scope(SESSION, kind), frame: JSON.stringify(frame) }
+      await host.fire('experimental.ws.send', draft)
+      return JSON.parse(draft.frame)
+    }
     // The runtime's ids also mint the session's thread id, so a turn is
     // named by the order its id first appeared in: 1, 2, ...
     const seen: string[] = []
     /** Sends one frame on the owned socket and returns its turn's number. */
     const send = async (frame: Record<string, unknown>) => {
-      ids.clock.now += 1_000
-      await host.fire('experimental.ws.send', {
-        ...scope(SESSION),
-        frame: JSON.stringify(frame),
-      })
-      const id = codex.frameTurns.get(SESSION)?.turnID
-      if (id === undefined) return undefined
+      const sent = await sendFrame(frame, 'primary')
+      const { turn_id: id } = JSON.parse(
+        sent.client_metadata['x-codex-turn-metadata'],
+      )
       if (!seen.includes(id)) seen.push(id)
       return seen.indexOf(id) + 1
     }
     /** Delivers one server frame on the owned socket. */
-    const receive = (type: string, fields: Record<string, unknown> = {}) =>
+    const receive = (
+      type: string,
+      fields: Record<string, unknown> = {},
+      kind: RequestKind = 'primary',
+    ) =>
       host.fire('experimental.ws.receive', {
-        ...scope(SESSION),
+        ...scope(SESSION, kind),
         frame: JSON.stringify({ type, response: { id: 'r' }, ...fields }),
       })
     /** Sends one owned HTTP request of `kind` for the session. */
-    const http = (kind: RequestKind, input: unknown[]) =>
-      host.fire('http.request', {
+    const http = async (kind: RequestKind, input: unknown[]) => {
+      ids.clock.now += 1_000
+      const draft = {
         ...scope(SESSION, kind),
         request: new Request('https://api.openai.com/v1/responses', {
           method: 'POST',
@@ -421,8 +433,11 @@ describe('WebSocket frame turn in the OpenCode 2 plugin', () => {
           },
           body: JSON.stringify({ model: 'gpt-6.1-sol', input }),
         }),
-      })
-    return { host, codex, send, receive, http }
+      }
+      await host.fire('http.request', draft)
+      return draft.request.headers.get('x-codex-turn-metadata')
+    }
+    return { host, codex, send, receive, http, handshake, sendFrame }
   }
 
   it('takes the completion of a frame from experimental.ws.receive, so only an uncompleted full frame is resent in its turn', async () => {
@@ -494,8 +509,8 @@ describe('WebSocket frame turn in the OpenCode 2 plugin', () => {
       const plugin = await start()
       expect(await plugin.send(full([user('one')]))).toBe(1)
       await plugin.receive('response.completed')
-      const httpTurn = plugin.codex.get(SESSION).turnID
-      await plugin.http(
+      const httpOfSession = { ...plugin.codex.get(SESSION) }
+      const metadata = await plugin.http(
         kind,
         kind === 'generate'
           ? [
@@ -507,15 +522,73 @@ describe('WebSocket frame turn in the OpenCode 2 plugin', () => {
             ]
           : [user('summarize this session')],
       )
-      // The request went through the plugin's HTTP shaping, which moves the
-      // HTTP turn for every request kind, as on OpenCode 1.
-      expect(plugin.codex.get(SESSION).turnID).not.toBe(httpTurn)
+      expect(metadata).toBe(
+        '{"session_id":"turn-1","thread_id":"turn-1","thread_source":"user","turn_id":"turn-3","sandbox":"seccomp","turn_started_at_unix_ms":2000,"request_kind":"turn","window_id":"turn-1:0"}',
+      )
+      expect(plugin.codex.get(SESSION)).toEqual(httpOfSession)
       expect(await plugin.send(chained('r1', [call('c1'), output('c1')]))).toBe(
         1,
       )
       expect(plugin.codex.frameTurns.get(SESSION)?.turnStartedAt).toBe(2_000)
     })
   }
+
+  it('an auxiliary completion on WebSocket cannot complete the pending primary resend', async () => {
+    const plugin = await start()
+    const control = await start()
+    const frame = full([user('one')])
+    expect(await plugin.send(frame)).toBe(1)
+    await plugin.handshake('compaction')
+    // Even matching input would corrupt resend classification if its completion
+    // marked the primary frame as complete.
+    const helper = await plugin.sendFrame(frame, 'compaction')
+    expect(helper.client_metadata['x-codex-turn-metadata']).toBe(
+      '{"session_id":"turn-1","thread_id":"turn-1","thread_source":"user","turn_id":"turn-3","sandbox":"seccomp","turn_started_at_unix_ms":2000,"request_kind":"turn","window_id":"turn-1:0"}',
+    )
+    await plugin.receive('response.completed', {}, 'compaction')
+    expect(plugin.codex.frameTurns.get(SESSION)?.completed).toBe(false)
+    const resend = await plugin.sendFrame(frame, 'primary')
+    await control.send(frame)
+    const controlResend = await control.sendFrame(frame, 'primary')
+    expect(resend.client_metadata['x-codex-turn-metadata']).toBe(
+      controlResend.client_metadata['x-codex-turn-metadata'],
+    )
+    expect(resend.client_metadata['x-codex-turn-metadata']).toBe(
+      helper.client_metadata['x-codex-turn-metadata'],
+    )
+  })
+
+  it('a WebSocket helper before a primary frame gets an unrecorded turn', async () => {
+    const plugin = await start({ store: true })
+    await plugin.handshake('generate')
+    const frame = full([user('one')])
+    const helper = await plugin.sendFrame(frame, 'generate')
+    expect(helper.client_metadata['x-codex-turn-metadata']).toBe(
+      '{"session_id":"turn-1","thread_id":"turn-1","thread_source":"user","turn_id":"turn-3","sandbox":"seccomp","turn_started_at_unix_ms":2000,"request_kind":"turn","window_id":"turn-1:0"}',
+    )
+    await plugin.receive('response.completed', {}, 'generate')
+    expect(plugin.codex.frameTurns.get(SESSION)).toBeUndefined()
+    const primary = await plugin.sendFrame(frame, 'primary')
+    expect(primary.client_metadata['x-codex-turn-metadata']).toBe(
+      '{"session_id":"turn-1","thread_id":"turn-1","thread_source":"user","turn_id":"turn-4","sandbox":"seccomp","turn_started_at_unix_ms":3000,"request_kind":"turn","window_id":"turn-1:0"}',
+    )
+    const resend = await plugin.sendFrame(frame, 'primary')
+    expect(resend.client_metadata['x-codex-turn-metadata']).toBe(
+      primary.client_metadata['x-codex-turn-metadata'],
+    )
+  })
+
+  it('a WebSocket helper uses the latest primary even when it was sent over HTTP', async () => {
+    const plugin = await start()
+    await plugin.send(full([user('over the socket')]))
+    const latest = await plugin.http('primary', [user('over HTTP')])
+    await plugin.handshake('title')
+    const title = await plugin.sendFrame(full([user('title?')]), 'title')
+    expect(title.client_metadata['x-codex-turn-metadata']).toBe(
+      '{"session_id":"turn-1","thread_id":"turn-1","thread_source":"user","turn_id":"turn-4","sandbox":"seccomp","turn_started_at_unix_ms":3000,"request_kind":"turn","window_id":"turn-1:0"}',
+    )
+    expect(title.client_metadata['x-codex-turn-metadata']).toBe(latest)
+  })
 
   it('keeps a fixed-size state with no message text after a multi-megabyte user message, and its resend rules still hold', async () => {
     const plugin = await start()

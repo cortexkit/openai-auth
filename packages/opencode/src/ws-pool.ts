@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  type FrameTurn,
   isRecord,
   orderCodexBody,
   sanitizeHttpFallbackInit,
@@ -94,6 +95,10 @@ interface PoolEntry {
   turnSignature?: string
   turnCanonical?: CanonicalInput
 }
+
+type TurnContext =
+  | { kind: 'auxiliary'; agent: string }
+  | { kind: 'primary'; record: (turn?: FrameTurn) => void }
 
 interface ContinuationState {
   responseID: string
@@ -206,6 +211,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   async function websocketFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
+    turn?: TurnContext,
   ): Promise<Response> {
     const url =
       input instanceof URL
@@ -218,7 +224,24 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
         ? internalHeaders[QUOTA_ACCOUNT_HEADER]
         : undefined
-    const sendHttp = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const auxiliary = turn?.kind === 'auxiliary'
+    const recordPrimary = (
+      sentTurn?: Pick<PoolEntry, 'turnID' | 'turnStartedAt'>,
+    ) => {
+      if (turn?.kind !== 'primary') return
+      const { turnID, turnStartedAt } = sentTurn ?? {}
+      turn.record(
+        turnID !== undefined && turnStartedAt !== undefined
+          ? { turnID, turnStartedAt }
+          : undefined,
+      )
+    }
+    const sendHttp = async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+      entry?: PoolEntry,
+    ) => {
+      recordPrimary(entry)
       const response = await httpFetch(input, init)
       return options?.onHttpResponse?.(response, requestAccountId) ?? response
     }
@@ -265,7 +288,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       wsInit?.headers,
     )
     const acctDisc = accountDiscriminator(sourceHeadersForKey)
-    const key = `${sessionID}:${acctDisc}:conversation`
+    // A helper must not replace (or invalidate) the conversation's socket
+    // history, even when it uses the same session, account and model.
+    const key = `${sessionID}:${acctDisc}:${auxiliary ? `auxiliary:${turn.agent}` : 'conversation'}`
     const requestOnRateLimitReached = onRateLimitReached
       ? (window: string, resetAt?: number) =>
           onRateLimitReached(window, requestAccountId, resetAt)
@@ -280,19 +305,16 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pool.set(key, entry)
     const sourceBody = normalizeResponseBody(body)
     let comparison: RequestComparison | undefined
+    const runHttpFallback = () =>
+      auxiliary
+        ? sendHttp(input, httpInit)
+        : sendHttp(
+            input,
+            httpFallbackInit(entry, body, httpInit, comparison),
+            entry,
+          )
 
-    if (entry.fallback) {
-      return sendHttp(
-        input,
-        httpFallbackInit(entry, body, httpInit, comparison),
-      )
-    }
-    if (entry.busy) {
-      return sendHttp(
-        input,
-        httpFallbackInit(entry, body, httpInit, comparison),
-      )
-    }
+    if (entry.fallback || entry.busy) return runHttpFallback()
 
     entry.busy = true
     entry.lastUsedAt = Date.now()
@@ -361,8 +383,11 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       )
       const continuedBody = withContinuation(entry, sourceBody, comparison)
       const requestBody = orderCodexBody(
-        applyTurnId(entry, continuedBody, sourceBody, comparison),
+        auxiliary
+          ? continuedBody
+          : applyTurnId(entry, continuedBody, sourceBody, comparison),
       )
+      const { turnID, turnStartedAt } = entry
       // The request chained to the prior continuation iff it carries a
       // previous_response_id (withContinuation only sets it when it actually
       // trimmed against the prior response; an empty-suffix full replay does not).
@@ -377,6 +402,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         method: wsInit?.method,
         headers: wsInit?.headers,
       })
+      recordPrimary({ turnID, turnStartedAt })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body: requestBody,
@@ -457,8 +483,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       }
       // advanceTurn is idempotent for a body already applied this send, so the
       // post-attempt exits re-stamp the header without minting a second turn.
-      const runHttpFallback = () =>
-        sendHttp(input, httpFallbackInit(entry, body, httpInit, comparison))
       if (!entry.fallback)
         return relayWithOversizedFallback(response, runHttpFallback)
       return runHttpFallback()
@@ -492,11 +516,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       recordStreamFailure(entry)
       entry.continuation = undefined
       invalidate(entry)
-      if (entry.fallback)
-        return sendHttp(
-          input,
-          httpFallbackInit(entry, body, httpInit, comparison),
-        )
+      if (entry.fallback) return runHttpFallback()
       return failedResponse(
         new ResponseStreamError(
           error instanceof Error ? error.message : String(error),
@@ -531,10 +551,8 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   }
 
   function remove(sessionID: string) {
-    // The pool key is now `${sessionID}:${acctDisc}:conversation` — there may
-    // be multiple entries for the same session (one per account used). Remove
-    // all entries whose key starts with `${sessionID}:` so cleanup is complete
-    // regardless of which account was active when the session ended.
+    // Remove every socket for the session, including helper sockets and
+    // sockets for accounts that are no longer active.
     const prefix = `${sessionID}:`
     for (const [key, entry] of pool) {
       if (!key.startsWith(prefix)) continue

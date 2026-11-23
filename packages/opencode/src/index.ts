@@ -97,6 +97,7 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import { applyMidConversationEffort } from './codex-effort'
+import { CodexPrimaryTurns } from './codex-request'
 import {
   codexSessionsSettled,
   loadCodexSessions,
@@ -580,6 +581,7 @@ export async function CodexAuthPlugin(
     options.codexApiEndpoint ?? startupSettings.codexApiEndpoint
   const installationID = crypto.randomUUID()
   const codexSessions = loadCodexSessions(codexSessionStatePath())
+  const codexPrimaryTurns = new CodexPrimaryTurns()
   const persistCodexSessions = () =>
     saveCodexSessions(codexSessionStatePath(), codexSessions)
   let websocketFetchInstalled = false
@@ -2645,6 +2647,13 @@ export async function CodexAuthPlugin(
 
           const sessionID = resolveSidebarSessionId(headers)
           const agent = headers.get(OPENAI_AGENT_HEADER) ?? undefined
+          const auxiliary =
+            agent &&
+            ['title', 'compaction', 'summary', 'generate'].includes(agent)
+              ? agent
+              : headers.get(OpenAIWebSocketPool.TITLE_HEADER) === 'true'
+                ? 'title'
+                : undefined
 
           const codexMetadata = sessionID
             ? getCodexSessionMetadata(
@@ -2667,6 +2676,9 @@ export async function CodexAuthPlugin(
             parsed.pathname.includes('/chat/completions')
               ? new URL(codexApiEndpoint)
               : parsed
+          const useWebSocket = Boolean(
+            websocketFetch && parsed.pathname.endsWith('/responses'),
+          )
           const prepared = prepareCodexRequest({
             applyEffort: applyMidConversationEffort,
             init: {
@@ -2674,14 +2686,20 @@ export async function CodexAuthPlugin(
               headers,
             },
             headers,
-            metadata: codexMetadata,
+            metadata:
+              auxiliary && codexMetadata
+                ? codexPrimaryTurns.forAuxiliary(codexMetadata)
+                : codexMetadata,
             installationID,
-            websocket: Boolean(
-              websocketFetch && parsed.pathname.endsWith('/responses'),
-            ),
+            websocket: useWebSocket,
+            skipTurnUpdate: auxiliary !== undefined,
             responsesLite: options.responsesLite ?? false,
             dumpSessionID: sessionID,
           })
+          const preparedTurn = codexMetadata && {
+            turnID: codexMetadata.turnID,
+            turnStartedAt: codexMetadata.turnStartedAt,
+          }
           const requestInit = prepared.init
           if (limitsRequest) {
             const bindingIsActive = () => {
@@ -2804,7 +2822,7 @@ export async function CodexAuthPlugin(
               sessionId: keepwarmHeaders.get('session-id'),
             })
           }
-          if (websocketFetch && parsed.pathname.endsWith('/responses')) {
+          if (websocketFetch && useWebSocket) {
             logT.debug('WS transport', {
               pid: process.pid,
               pathname: parsed.pathname,
@@ -2829,10 +2847,22 @@ export async function CodexAuthPlugin(
             scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
             const release = () => streams.delete(key)
             try {
-              const response = await websocketFetch(url, {
-                ...requestInit,
-                headers: scopedHeaders,
-              })
+              const response = await websocketFetch(
+                url,
+                { ...requestInit, headers: scopedHeaders },
+                auxiliary
+                  ? { kind: 'auxiliary', agent: auxiliary }
+                  : {
+                      kind: 'primary',
+                      record: (turn) => {
+                        if (codexMetadata)
+                          codexPrimaryTurns.record(
+                            codexMetadata,
+                            turn ?? preparedTurn,
+                          )
+                      },
+                    },
+              )
               if (!response.body) {
                 release()
                 return reportResponse(response)
@@ -2876,6 +2906,8 @@ export async function CodexAuthPlugin(
               throw redactCredentialError(error, accessToken)
             }
           }
+          if (codexMetadata && !auxiliary)
+            codexPrimaryTurns.record(codexMetadata, preparedTurn)
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
           if (typeof finalInit?.body !== 'string') {

@@ -24,9 +24,10 @@ import { createRequestTestScope } from './request-test-scope'
 import { restoreEnv } from './setup-env'
 
 const cleanups: Array<() => void | Promise<void>> = []
-afterEach(async () => {
+async function cleanup() {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
-})
+}
+afterEach(cleanup)
 
 async function start(dump = false) {
   const files = poolFiles()
@@ -393,7 +394,7 @@ const HEADER_ALLOWLIST: Record<string, string> = {
     'Both hosts supply the JSON media type before the plugin runs.',
 }
 
-type OracleStep = { kind: RequestKind; input: unknown[] }
+type OracleStep = { kind: RequestKind | 'summary'; input: unknown[] }
 type TurnMetadata = Record<string, unknown> & { turn_id: string }
 
 /**
@@ -538,7 +539,8 @@ async function runOracle(
   }))
   // OpenCode 1 tells the request kinds apart only by the agent header
   // `chat.headers` sets; OpenCode 2 also passes the kind in the hook scope.
-  const agentOf = (kind: RequestKind) => (kind === 'primary' ? 'build' : kind)
+  const agentOf = (kind: OracleStep['kind']) =>
+    kind === 'primary' ? 'build' : kind
   counter = 0
   for (let i = 0; i < sequence.length; i++) {
     now = start + stepMs * i
@@ -555,11 +557,13 @@ async function runOracle(
   const opencode2: TurnMetadata[] = []
   for (let i = 0; i < sequence.length; i++) {
     now = start + stepMs * i
+    const kind = sequence[i]!.kind
     const draft = {
-      ...scope('ses_1', sequence[i]!.kind),
+      // OC2 has no separate summary kind in its hook scope.
+      ...scope('ses_1', kind === 'summary' ? 'compaction' : kind),
       request: request(bodies[i]!),
     }
-    draft.request.headers.set('x-openai-auth-agent', agentOf(sequence[i]!.kind))
+    draft.request.headers.set('x-openai-auth-agent', agentOf(kind))
     await host.fire('http.request', draft)
     const expected = sent[i]!
     const actualHeaders = draft.request.headers
@@ -607,19 +611,17 @@ for (const lite of [false, true]) {
         { kind: 'primary', input: tool },
         { kind: 'primary', input: [...tool, user('two')] },
       ])
-      const turns = opencode2.map((metadata) => metadata.turn_id)
-      expect(new Set(turns.slice(0, 4)).size).toBe(4)
-      expect(turns[4]).toBe(turns[3])
-      expect(turns[5]).not.toBe(turns[4])
+      expect(opencode2.map((metadata) => metadata.turn_id)).toEqual([
+        '01ba60d3-3800-7303-8303-030303030303',
+        '01ba60d3-3800-7303-8303-030303030303',
+        '01ba60d3-3800-7303-8303-030303030303',
+        '01ba60d3-3800-7303-8303-030303030303',
+        '01ba60d3-3800-7404-8404-040404040404',
+        '01ba60d3-3800-7505-8505-050505050505',
+      ])
     })
 
-    // The sequence above sends title and compaction only before generate,
-    // whose input then becomes the history the next agent-loop request is
-    // compared with. So whatever title or compaction leave in the session's
-    // turn state is overwritten before any agent-loop request reads it. Here
-    // an agent-loop request follows each of them, and the first two are tool
-    // steps that, alone, would stay in the turn they continue.
-    it(`agent-loop turn state after title, compaction and generate matches OpenCode 1 (Lite=${lite}, cap=${capped})`, async () => {
+    it(`HTTP helpers preserve the primary-only turn (Lite=${lite}, cap=${capped})`, async () => {
       const call = (id: string) => [
         { type: 'function_call', name: 'read', call_id: id, arguments: '{}' },
         { type: 'function_call_output', call_id: id, output: 'ok' },
@@ -634,6 +636,8 @@ for (const lite of [false, true]) {
         { kind: 'compaction', input: [user('summarize this session')] },
         { kind: 'primary', input: next },
         { kind: 'generate', input: [...next, user('keep warm')] },
+        { kind: 'summary', input: [user('summarize this answer')] },
+        { kind: 'primary', input: [...next, ...call('c3')] },
       ]
       const { opencode1, opencode2 } = await runOracle(
         lite,
@@ -643,18 +647,52 @@ for (const lite of [false, true]) {
       )
       const primary = (metadata: TurnMetadata[]) =>
         metadata.filter((_, i) => sequence[i]!.kind === 'primary')
-      expect(primary(opencode2)).toEqual(primary(opencode1))
-      expect(opencode2).toEqual(opencode1)
-      // What OpenCode 1 does, and so what OpenCode 2 must do: every request
-      // kind of a session shares one turn state, and a title or compaction
-      // request, whose input is not the conversation, becomes the history
-      // the next request is compared with. The tool steps after them
-      // therefore start new turns.
-      const turns = opencode1.map((metadata) => metadata.turn_id)
-      expect(new Set(turns).size).toBe(6)
-      expect(
-        opencode1.map((metadata) => metadata.turn_started_at_unix_ms),
-      ).toEqual(sequence.map((_, i) => 1_900_000_000_000 + 1000 * i))
+      await cleanup()
+      const control = await runOracle(
+        lite,
+        capped,
+        sequence.filter(({ kind }) => kind === 'primary'),
+        1000,
+      )
+      expect(primary(opencode1)).toEqual(control.opencode1)
+      expect(primary(opencode2)).toEqual(control.opencode2)
+      expect(opencode2).toEqual(
+        Array<TurnMetadata>(8).fill({
+          session_id: '01ba60d3-3800-7101-8101-010101010101',
+          thread_id: '01ba60d3-3800-7101-8101-010101010101',
+          thread_source: 'user',
+          turn_id: '01ba60d3-3800-7303-8303-030303030303',
+          sandbox: 'seccomp',
+          turn_started_at_unix_ms: 1_900_000_000_000,
+          request_kind: 'turn',
+          window_id: '01ba60d3-3800-7101-8101-010101010101:0',
+        }),
+      )
     })
   }
 }
+
+it('HTTP helpers before the first primary each carry an unrecorded turn', async () => {
+  const { opencode2 } = await runOracle(
+    false,
+    false,
+    [
+      { kind: 'generate', input: [user('one')] },
+      { kind: 'generate', input: [user('one')] },
+      { kind: 'primary', input: [user('one')] },
+      { kind: 'primary', input: [user('one'), tool[1], tool[2]] },
+    ],
+    1000,
+  )
+  expect(opencode2.map(({ turn_id }) => turn_id)).toEqual([
+    '01ba60d3-3800-7303-8303-030303030303',
+    '01ba60d3-3be8-7404-8404-040404040404',
+    '01ba60d3-3fd0-7505-8505-050505050505',
+    '01ba60d3-3fd0-7505-8505-050505050505',
+  ])
+  expect(
+    opencode2.map(({ turn_started_at_unix_ms }) => turn_started_at_unix_ms),
+  ).toEqual([
+    1_900_000_000_000, 1_900_000_001_000, 1_900_000_002_000, 1_900_000_002_000,
+  ])
+})

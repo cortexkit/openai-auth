@@ -2397,6 +2397,180 @@ describe('integration: WS quota push', () => {
     delete process.env.NODE_ENV
   })
 
+  it('OC1 WebSocket helpers inherit turns without changing primary resends or continuation', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+    const originalFetch = globalThis.fetch
+    const httpTurns: string[] = []
+    globalThis.fetch = (async (url, init) => {
+      if (!isResponsesSend(url)) return new Response(null, { status: 503 })
+      httpTurns.push(new Headers(init?.headers).get('x-codex-turn-metadata')!)
+      return new Response('{}')
+    }) as typeof fetch
+    type Frame = {
+      client_metadata: { 'x-codex-turn-metadata': string }
+      generate?: boolean
+      previous_response_id?: string
+      input: unknown[]
+    }
+    const frames: Array<{ frame: Frame; prewarmID: string | undefined }> = []
+    let prewarms = 0
+    let incomplete = false
+    const user = (text: string) => ({
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text }],
+    })
+    const input = [user('one')]
+    const tool = { type: 'function_call_output', call_id: 'c1', output: 'ok' }
+    try {
+      await withFakeWebSocket(
+        ({ message }) => {
+          let prewarmID: string | undefined
+          return {
+            send(text) {
+              const frame: Frame = JSON.parse(text)
+              const prewarm = frame.generate === false
+              if (prewarm) prewarmID = `warm_${++prewarms}`
+              else frames.push({ frame, prewarmID })
+              message(
+                JSON.stringify({
+                  type:
+                    incomplete && !prewarm
+                      ? 'response.incomplete'
+                      : 'response.completed',
+                  response: {
+                    id: prewarm ? prewarmID : `resp_${frames.length}`,
+                  },
+                }),
+              )
+            },
+          }
+        },
+        async () => {
+          const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          scope.ownPlugin(hooks)
+          const loaded = await hooks.auth!.loader!(
+            async () => ({
+              type: 'oauth',
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 3600_000,
+              accountId: 'chatgpt-main',
+            }),
+            { id: 'openai', models: {} } as never,
+          )
+          const fetchOverride = scope.wrap(
+            (loaded as { fetch: typeof fetch }).fetch,
+          )
+          const send = async (
+            session: string,
+            agent: string,
+            items: unknown[],
+            stream = true,
+          ) => {
+            const response = await fetchOverride(
+              'https://api.openai.com/v1/responses',
+              {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'session-id': session,
+                  'x-openai-auth-agent': agent,
+                  ...(agent === 'title' ? { 'x-opencode-title': 'true' } : {}),
+                },
+                body: JSON.stringify({
+                  model: 'gpt-6.1-sol',
+                  input: items,
+                  stream,
+                }),
+              },
+            )
+            expect(response.status).toBe(200)
+            await response.text()
+            if (agent === 'title' || !stream) return { turn: httpTurns.at(-1) }
+            const { frame, prewarmID } = frames.at(-1)!
+            return {
+              frame,
+              prewarmID,
+              turn: frame.client_metadata['x-codex-turn-metadata'],
+            }
+          }
+
+          const early = await send('auxiliary-first', 'generate', input)
+          const first = await send('auxiliary-first', 'build', input)
+          expect(first.turn).not.toBe(early.turn)
+          // On a fresh socket the pool sends an empty request with generation
+          // disabled. The primary can chain to that response, not the helper's.
+          expect(first.frame?.previous_response_id).toBe(first.prewarmID)
+          expect(first.prewarmID).not.toBe(early.prewarmID)
+
+          const run = async (session: string, interleave: boolean) => {
+            incomplete = true
+            const opening = await send(session, 'build', input)
+            incomplete = false
+            if (interleave) {
+              const summary = await send(session, 'summary', [
+                user('summarize'),
+              ])
+              expect(summary.turn).toBe(opening.turn)
+              expect(summary.frame?.previous_response_id).toBe(
+                summary.prewarmID,
+              )
+            }
+            const resend = await send(session, 'build', input)
+            const responseID = `resp_${frames.length}`
+            if (interleave) {
+              const compact = await send(session, 'compaction', [
+                user('compact'),
+              ])
+              expect(compact.turn).toBe(opening.turn)
+              const title = await send(session, 'title', [user('title')])
+              expect(title.turn).toBe(opening.turn)
+            }
+            const step = await send(session, 'build', [...input, tool])
+            expect(step.frame?.previous_response_id).toBe(responseID)
+            return {
+              resendKeptTurn: resend.turn === opening.turn,
+              resendChainedOnlyToPrewarm:
+                resend.frame?.previous_response_id === resend.prewarmID,
+              resendInput: resend.frame?.input,
+              stepKeptTurn: step.turn === opening.turn,
+              stepInput: step.frame?.input,
+            }
+          }
+          const control = await run('primary-only', false)
+          expect(control).toEqual({
+            resendKeptTurn: true,
+            resendChainedOnlyToPrewarm: true,
+            resendInput: input,
+            stepKeptTurn: true,
+            stepInput: [tool],
+          })
+          expect(await run('interleaved', true)).toEqual(control)
+          const overHttp = await send('mixed', 'build', input, false)
+          const overWebSocket = await send('mixed', 'generate', [
+            user('helper'),
+          ])
+          expect(overWebSocket.turn).toBe(overHttp.turn)
+          expect(httpTurns).toHaveLength(2)
+          expect(frames).toHaveLength(11)
+        },
+      )
+    } finally {
+      await scope.settlePluginWork()
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('attributes an early fallback WS quota push to the served fallback', async () => {
     const now = Date.now()
     const fallback = {
