@@ -93,7 +93,7 @@ function fixture() {
   }
   script(
     join(repo, 'scripts/gate.sh'),
-    `printf "gate %s\\n" "$*" >> "$RELEASE_LOG"\nexit "\${GATE_STATUS:-0}"`,
+    `printf "gate %s\\n" "$*" >> "$RELEASE_LOG"\nif [[ -n "\${GATE_LEAVES:-}" ]]; then printf 'left\\n' > "$GATE_LEAVES"; fi\nexit "\${GATE_STATUS:-0}"`,
   )
   script(
     join(bin, 'gh'),
@@ -204,7 +204,7 @@ describe('release script CI suite selection', () => {
     expect(result.status).toBe(0)
     expect(result.events).toContain('gate --fast\n')
     expect(result.events).not.toContain('suite\n')
-    expect(result.events).toContain('push push origin main v9.8.7\n')
+    expect(result.events).toContain('push push --atomic origin main v9.8.7\n')
     expect(f.git('rev-parse', 'HEAD')).not.toBe(f.sha)
     expect(f.git('rev-parse', 'v9.8.7^{}')).toBe(f.git('rev-parse', 'HEAD'))
     expect(f.git('status', '--porcelain')).toBe('')
@@ -275,8 +275,24 @@ describe('release version-sync boundary', () => {
     expect(result.status).toBe(0)
     expect(result.events).toContain('gate --fast\n')
     expect(result.events).not.toContain('suite\n')
-    expect(result.events).toContain('push push origin main v9.8.7\n')
+    expect(result.events).toContain('push push --atomic origin main v9.8.7\n')
   })
+
+  it.each(['unexpected.txt', 'source.ts'])(
+    'refuses a file the pre-release checks left behind (%s) before committing',
+    (path) => {
+      const f = fixture()
+      const result = f.release({ extraEnv: { GATE_LEAVES: path } })
+      expect(result.status).not.toBe(0)
+      expect(result.output).toContain(
+        `Error: the pre-release checks changed a non-version file: ${path}`,
+      )
+      expect(result.events).toContain('gate --fast\n')
+      expect(result.events).not.toContain('push ')
+      expect(f.git('rev-parse', 'HEAD')).toBe(f.sha)
+      expect(f.git('tag', '--list')).toBe('')
+    },
+  )
 
   for (const green of [true, false]) {
     it.each(['tracked', 'untracked', 'staged', 'rename'])(

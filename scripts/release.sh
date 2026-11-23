@@ -107,11 +107,11 @@ if ci_passed; then CI_PASSED=true; fi
 # Keep this allowlist aligned with version-sync.mjs: no other source edits
 # may hitch a ride on a release that relies on the source commit's CI.
 check_version_changes() {
-  local path
+  local source="${1:-version sync}" path
   while IFS= read -r -d '' path; do
     case "$path" in
       packages/opencode/package.json|packages/pi/package.json|packages/opencode/src/version.ts|README.md|packages/opencode/README.md|packages/pi/README.md|docs/configuration.md|docs/opencode-2.md) ;;
-      *) echo "Error: version sync changed a non-version file: $path" >&2; return 1 ;;
+      *) echo "Error: $source changed a non-version file: $path" >&2; return 1 ;;
     esac
   done < <(git diff --no-renames --name-only -z HEAD; git ls-files --others --exclude-standard -z)
 }
@@ -157,7 +157,7 @@ echo ""
 echo "→ Committing version bump..."
 # The gate and the tests run after the first check and can leave files behind.
 # Check again so nothing but the version files reaches the release commit.
-check_version_changes
+check_version_changes "the pre-release checks"
 git add -A
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
