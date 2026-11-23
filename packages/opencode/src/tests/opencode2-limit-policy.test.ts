@@ -261,7 +261,8 @@ describe('OpenCode 2 shared limit policy', () => {
     Object.assign(f.storage, { waitForReset: true })
     f.mark('b', 7_200_123)
     const choice = await f.retry(10_800_000)
-    // B frees first: ceil(7,200.123s) plus 17s of jitter for "ses_1".
+    // Account "b" frees first, at 7,200.123 s. The wait rounds that up to
+    // 7,201 s and adds 17 s of jitter derived from the session id "ses_1".
     expect(choice).toEqual({
       hold: {
         kind: 'terminal',

@@ -654,7 +654,9 @@ describe('OC1 pre-send terminal wire', () => {
       f.ctx.waitForReset = enabled
       f.ctx.storage!.routing!.maxSameAccountWait = 0
       f.ctx.storage!.killswitch = { enabled: true }
-      // B frees first: 3h and a fraction, rounded up, plus 7s for "session".
+      // The second account (rows[1]) frees first, at 3h and 123 ms. The wait
+      // rounds that up to whole seconds and adds 7s of jitter derived from
+      // the fixture's session id, "session".
       f.rows[0]!.quota = quota(100, T0 + 2 * 3600_000, T0, T0 + 4 * 86_400_000)
       f.rows[1]!.quota = quota(100, T0 + 3 * 3600_000 + 123)
       const key = Symbol.for('cortexkit.routing')

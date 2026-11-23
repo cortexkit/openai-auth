@@ -1553,8 +1553,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           }
         }
       }
-      // The ordinary terminal path precedes the chooser's all-marked escape.
-      // Without a full reset hold, a single account keeps the host's delay.
+      // Decide the terminal case here, before account selection: when every
+      // account carries a rate-limit mark, selection still sends to one of them
+      // to probe whether it recovered. Without a full reset hold, a single
+      // account keeps the host's own delayed retry.
       const others = targets.filter((target) => target.id !== previousId)
       const terminal =
         previous.confirmedBlockers?.some((window) => window.confirmed) &&
