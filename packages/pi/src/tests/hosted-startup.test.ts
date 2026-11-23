@@ -230,13 +230,10 @@ test('a non-hosted Pi session still uses its native login', async () => {
 })
 
 test('a missing Pi credential override bridge warns once with the installed version', async () => {
-  const warn = spyOn(console, 'warn').mockImplementation(() => {})
-  try {
-    await installHostedVaultKey({})
-    await installHostedVaultKey({ runtime: { setRuntimeApiKey: null } })
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(warn.mock.calls[0]?.[0]).toContain(`Pi ${VERSION}`)
-  } finally {
-    warn.mockRestore()
-  }
+  const warnings: string[] = []
+  const log = { warn: (message: string) => warnings.push(message) }
+  await installHostedVaultKey({}, log)
+  await installHostedVaultKey({ runtime: { setRuntimeApiKey: null } }, log)
+  expect(warnings).toHaveLength(1)
+  expect(warnings[0]).toContain(`Pi ${VERSION}`)
 })

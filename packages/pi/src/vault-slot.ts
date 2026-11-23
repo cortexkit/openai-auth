@@ -14,7 +14,10 @@ export const VAULT_SLOT_REFUSAL =
 
 let warnedMissingBridge = false
 
-export async function installHostedVaultKey(registry: object): Promise<void> {
+export async function installHostedVaultKey(
+  registry: object,
+  log: { warn(message: string): unknown },
+): Promise<void> {
   // Pi resolves stored OAuth before the configured provider key. Use its
   // in-memory credential override so it does not refresh the saved login.
   const runtime = 'runtime' in registry ? registry.runtime : undefined
@@ -29,7 +32,7 @@ export async function installHostedVaultKey(registry: object): Promise<void> {
   }
   if (!warnedMissingBridge) {
     warnedMissingBridge = true
-    console.warn(
+    log.warn(
       `Pi ${VERSION} does not expose the in-memory credential override. Hosted OpenAI Codex requests with an expired native login may not reach the vault.`,
     )
   }

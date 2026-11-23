@@ -57,6 +57,7 @@ import {
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OAuthQuotaSnapshot,
+  OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE,
   OpenAiVault,
   poolLimitsNamespace,
   quotaSnapshotPassesPolicy,
@@ -246,7 +247,7 @@ export function blockedMessage(block: PiBlock): string {
       : ''
   switch (block.reason) {
     case 'quota-minimum':
-      return 'No OpenAI account meets the configured minimum remaining quota.'
+      return OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE
     case 'quota-unknown':
       return `No OpenAI account has a quota reading yet; one is being taken now. Try again in ${POOL_QUOTA_UNKNOWN_RETRY_SECONDS} seconds.`
     case 'quota-exhausted':

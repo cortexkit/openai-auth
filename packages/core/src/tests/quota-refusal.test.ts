@@ -13,6 +13,7 @@ import { LimitProvenanceStore } from '../limit-provenance'
 import {
   buildOpenAiQuotaRefusal,
   decideOpenAiTerminal,
+  OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE,
   type OpenAiTerminalAccount,
   openAiLimitMessages,
   openAiTerminalFacts,
@@ -428,6 +429,12 @@ test('registered final causes survive numeric reset fuzz without generic fallbac
   // Pi-ai 1.4.0 RETRYABLE_PROVIDER_ERROR_PATTERN, independent of our templates.
   const pi =
     /overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])|service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http\/?2 stream failed|network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|request to \S+ failed, reason:|getaddrinfo|ENOTFOUND|EAI_AGAIN|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|stream disconnected before completion|pending stream has been canceled|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable/i
+  const minimumText = OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE
+  expect(hasUnsafeWording(minimumText)).toBe(false)
+  expect([...oc1, pi].some((pattern) => pattern.test(minimumText))).toBe(false)
+  expect(minimumText).not.toMatch(
+    /exhausted|unavailable|too_many_requests|try again/i,
+  )
   const starts = {
     quota: 'Every OpenAI account has used up its quota.',
     killswitch:

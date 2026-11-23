@@ -225,7 +225,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
       void runtime.start()
       try {
         if (isVaultHosted()) {
-          await installHostedVaultKey(ctx.modelRegistry)
+          await installHostedVaultKey(ctx.modelRegistry, settingsStartup.log)
           return
         }
         await syncSlot()

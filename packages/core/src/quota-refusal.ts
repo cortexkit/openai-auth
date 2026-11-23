@@ -29,6 +29,11 @@ import type { LimitProvenanceStore } from './limit-provenance'
 import { hasVaultRoutingAccessor } from './vault-routing'
 
 export type OpenAiQuotaCause = 'killswitch' | 'quota' | 'timed-mark'
+
+/** A configured minimum can block an account that still has quota left. */
+export const OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE =
+  'No OpenAI account meets the configured minimum remaining quota.'
+
 export const OPENAI_FINAL_CAUSES = {
   quota: 'Every OpenAI account has used up its quota.',
   killswitch:
