@@ -31,7 +31,10 @@ import {
   type PoolLoginMethod,
   type VaultActivationMethod,
 } from '@cortexkit/common-auth/opencode2'
-import type { PoolStore } from '@cortexkit/common-auth/store'
+import {
+  PoolOperationError,
+  type PoolStore,
+} from '@cortexkit/common-auth/store'
 import { withAccountRules } from '@cortexkit/openai-auth-core'
 import {
   type AccountPaths,
@@ -164,6 +167,8 @@ function identityOf(login: PoolLoginResult): string | undefined {
   return claims ? extractAccountIdFromClaims(claims) : undefined
 }
 
+const LOGIN_WRITE_ATTEMPTS = 3
+
 /**
  * Writes one login into the pool by the rules at the top of this file. Row
  * writes hold the legacy locks an older openai-auth process refreshes a row
@@ -186,11 +191,6 @@ export async function writeLoginToPool(
   const store = withAccountRules(pool, {
     rowLocks: (id) => legacyRefreshLocks(paths, id),
   })
-  const load = await store.read()
-  if (load.status !== 'ready')
-    throw new Error(
-      `the account pool cannot be read (${load.status}); the login was not stored`,
-    )
   const credential = {
     type: 'oauth' as const,
     refresh: login.refresh,
@@ -198,60 +198,98 @@ export async function writeLoginToPool(
     ...(login.expires !== undefined ? { expires: login.expires } : {}),
   }
   const identity = identityOf(login)
-  if (options.vault) await assertLocalPoolLogin(options.vault)
   const withIdentity = identity !== undefined ? { identity } : {}
-  if (options.origin === 'import') {
-    const held = load.rows.find(
-      (row) =>
-        (identity !== undefined && row.identity === identity) ||
-        (row.credential?.type === 'oauth' &&
-          row.credential.refresh === login.refresh),
-    )
-    if (held) return { id: held.id, operation: 'kept' }
-  }
-  const oauth = load.rows.filter((row) => row.type === 'oauth' && !row.invalid)
-  const holder = identity
-    ? oauth.find((row) => row.identity === identity)
-    : undefined
-  const main = load.rows.find((row) => row.id === POOL_MAIN_ROW_ID)
-  if (holder) {
-    const replaced = await store.replace(holder.id, credential, withIdentity)
-    return { id: replaced.id, operation: 'replaced' }
-  }
-  if (!main) {
-    const added = await store.add({
-      id: POOL_MAIN_ROW_ID,
-      credential,
-      ...withIdentity,
-      ...(login.label !== undefined ? { label: login.label } : {}),
-    })
-    return {
-      id: added.id,
-      operation:
-        added.outcome === 'added-disabled' ? 'added-disabled' : 'added',
+  for (let attempt = 1; ; attempt++) {
+    const load = await pool.read()
+    if (load.status !== 'ready')
+      throw new Error(
+        `the account pool cannot be read (${load.status}); the login was not stored`,
+      )
+    if (options.vault) await assertLocalPoolLogin(options.vault)
+    if (options.origin === 'import') {
+      const held = load.rows.find(
+        (row) =>
+          (identity !== undefined && row.identity === identity) ||
+          (row.credential?.type === 'oauth' &&
+            row.credential.refresh === login.refresh),
+      )
+      if (held) return { id: held.id, operation: 'kept' }
     }
-  }
-  if (!main.invalid && !main.credential) {
-    const replaced = await store.replace(
-      POOL_MAIN_ROW_ID,
-      credential,
-      withIdentity,
+    const oauth = load.rows.filter(
+      (row) => row.type === 'oauth' && !row.invalid,
     )
-    return { id: replaced.id, operation: 'replaced' }
-  }
-  const added = await store.add({
-    id: login.id,
-    credential,
-    ...withIdentity,
-    ...(login.label !== undefined ? { label: login.label } : {}),
-  })
-  return {
-    id: added.id,
-    operation:
-      added.outcome === 'added-disabled'
-        ? 'added-disabled'
-        : added.outcome === 'rotated'
-          ? 'replaced'
-          : 'added',
+    const holder = identity
+      ? oauth.find((row) => row.identity === identity)
+      : undefined
+    const main = load.rows.find((row) => row.id === POOL_MAIN_ROW_ID)
+    const emptyMain =
+      main && !main.invalid && !main.credential ? main : undefined
+    // Use the row ID as a fallback only if the login or row lacks an identity.
+    const byId =
+      main && login.id !== POOL_MAIN_ROW_ID
+        ? oauth.find(
+            (row) =>
+              row.id === login.id &&
+              (identity === undefined || row.identity === undefined),
+          )
+        : undefined
+    const target = holder ?? emptyMain ?? byId
+    try {
+      if (target) {
+        // A competing replace advances the epoch. This cannot detect another
+        // writer completing an empty row via add at the same epoch and identity.
+        const replaced = await store.replace(
+          target.id,
+          credential,
+          withIdentity,
+          {
+            attribution: {
+              credentialEpoch: target.credentialEpoch ?? 1,
+              ...(target.identity !== undefined
+                ? { identity: target.identity }
+                : {}),
+            },
+          },
+        )
+        return { id: replaced.id, operation: 'replaced' }
+      }
+      // The account-rules add can replace a row by ID without checking its
+      // epoch and identity. Use the store's own add instead.
+      const added = await pool.add(
+        {
+          id: main ? login.id : POOL_MAIN_ROW_ID,
+          credential,
+          ...withIdentity,
+          ...(login.label !== undefined ? { label: login.label } : {}),
+        },
+        main
+          ? undefined
+          : {
+              protect: ({ row }) =>
+                row ? 'row main already exists' : undefined,
+            },
+      )
+      return {
+        id: added.id,
+        operation:
+          added.outcome === 'added-disabled'
+            ? 'added-disabled'
+            : main && added.outcome === 'rotated'
+              ? 'replaced'
+              : 'added',
+      }
+    } catch (error) {
+      if (
+        attempt === LOGIN_WRITE_ATTEMPTS ||
+        !(error instanceof PoolOperationError) ||
+        error.phase !== 'before-first-write' ||
+        (error.kind !== 'attribution' &&
+          error.kind !== 'unknown-row' &&
+          error.kind !== 'row-key-changed' &&
+          error.kind !== 'row-protected' &&
+          error.kind !== 'id-exists')
+      )
+        throw error
+    }
   }
 }
