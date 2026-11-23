@@ -20,13 +20,16 @@ test('shutdown awaits an asynchronous Windows log drain', () => {
     import { mock } from 'bun:test';
     Object.defineProperty(process, 'platform', { value: 'win32' });
     let drained = false;
-    mock.module('@cortexkit/openai-auth-core/tui-support', () => ({
+    // The shutdown hook lives in core's setupLogger and drains through the
+    // shared logger engine, so the engine is what this probe replaces.
+    mock.module('@cortexkit/common-auth/logger', () => ({
       initLogger() {},
       async flushLogs() {
         await new Promise(resolve => setTimeout(resolve, 25));
         drained = true;
       },
-      createLogger() {}, flushForTest() {}, redact() {}, redactStrings() {}, setLogLevel() {},
+      createRedactor: () => ({ redact() {}, redactStrings() {} }),
+      createLogger() {}, flushForTest() {}, resetLoggerForTest() {}, setLogLevel() {},
     }));
     await import(${JSON.stringify(logger)});
     const hook = process.listeners('beforeExit').at(-1);
