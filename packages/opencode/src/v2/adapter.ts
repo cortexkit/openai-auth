@@ -89,10 +89,12 @@ import {
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   isKillswitchEnabled,
+  killswitchPassesPolicy,
   type LimitsProbe,
   logInputTransformations,
   normalizeQuotaHeaders,
   normalizeWsFrame,
+  OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE,
   type OpenAiLimitsOwner,
   type OpenAiLimitsRequest,
   type OpenAiVault,
@@ -115,7 +117,6 @@ import {
   VAULT_ROUTING_REFUSAL_MESSAGE,
   VaultBillingAttempt,
   type VaultBillingWarming,
-  type VaultModeRefusal,
   type VaultRoutingFeedback,
   type VaultRoutingResponse,
   vaultModeNoRouteCause,
@@ -855,7 +856,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     storage: AccountStorage | null,
     at: number,
     vaultMode: boolean,
-  ): Target[] => {
+  ): { targets: Target[]; quotaMinimumBlocked: boolean } => {
     const rows = vaultMode
       ? []
       : routableRows(
@@ -865,16 +866,32 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           vault?.identities() ?? new Set<string>(),
           deps.configPath,
         )
-    const routes = (vault?.routes() ?? []).filter(
-      (route) =>
-        route.kind === 'oauth' &&
-        quotaSnapshotPassesPolicy(
-          windowsFromQuotaMap(route.quota),
-          storage,
-          at,
-        ),
+    const vaultRoutes = (vault?.routes() ?? []).filter(
+      (route) => route.kind === 'oauth',
     )
-    return [
+    const routes = vaultRoutes.filter((route) =>
+      quotaSnapshotPassesPolicy(windowsFromQuotaMap(route.quota), storage, at),
+    )
+    let quotaMinimumBlocked = false
+    if (vaultMode && storage && routes.length === 0 && vaultRoutes.length > 0) {
+      // Don't blame the minimum if unknown quota or the per-account
+      // killswitch floor would still keep the route out.
+      const withoutMinimum = {
+        ...storage,
+        quota: {
+          ...storage.quota,
+          minimumRemaining: { primary: 0, secondary: 0 },
+        },
+      }
+      quotaMinimumBlocked = vaultRoutes.some((route) => {
+        const reading = windowsFromQuotaMap(route.quota)
+        return (
+          quotaSnapshotPassesPolicy(reading, withoutMinimum, at) &&
+          killswitchPassesPolicy(reading, storage, route.id, at)
+        )
+      })
+    }
+    const targets = [
       ...rows.map(
         (row): Target => ({
           id: row.id,
@@ -891,6 +908,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }),
       ),
     ]
+    return { targets, quotaMinimumBlocked }
   }
 
   const routingInput = (
@@ -1113,11 +1131,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       await source.prepareTokens(source.peek().rows, storage)
     }
     let at = now()
-    let targets = currentTargets(storage, at, vaultMode)
+    let selection = currentTargets(storage, at, vaultMode)
     const checkpoint = input.wake?.checkpoint
     if (checkpoint && clearedRoutingHolds.has(checkpoint)) throw vaultRefusal()
     const wake = checkpoint && routingWakes.get(checkpoint)
     if (wake && checkpoint) {
+      const { targets } = selection
       routingWakes.delete(checkpoint)
       routingWakeEnds.get(checkpoint)?.('resumed')
       const accountId = checkpoint.accountKey.accountId
@@ -1247,7 +1266,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             deadline?.signal.throwIfAborted()
             if (capacityWaited) {
               at = now()
-              targets = currentTargets(storage, at, vaultMode)
+              selection = currentTargets(storage, at, vaultMode)
               if (typeof answer === 'string') {
                 // A route offered before a capacity wait may no longer be eligible.
                 const offered = eligible.find((route) => route.id === answer)
@@ -1296,7 +1315,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 throw error
               }
               at = now()
-              targets = currentTargets(storage, at, vaultMode)
+              selection = currentTargets(storage, at, vaultMode)
               continue
             }
           }
@@ -1315,7 +1334,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         ? undefined
         : waitForFirstQuotaReading(
             routingInput(
-              targets.filter(
+              selection.targets.filter(
                 (target) => target.id !== input.rerouteFrom?.accountId,
               ),
               storage,
@@ -1331,11 +1350,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       )
       await firstReading
       at = now()
-      targets = currentTargets(storage, at, vaultMode)
+      selection = currentTargets(storage, at, vaultMode)
       if (end)
         end(
           planOrdered({
-            ...routingInput(targets, storage, at),
+            ...routingInput(selection.targets, storage, at),
             // Reporting admission must not trigger another quota poll.
             requestPull: () => {},
             placement: 'roster',
@@ -1345,6 +1364,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             : 'resumed',
         )
     }
+    const { targets, quotaMinimumBlocked } = selection
     const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
     const admissionTiers = hasVaultRoutingAccessor()
@@ -2000,10 +2020,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         (await deps.slotPlaceholderWithoutMain?.())
       )
         refuseMissingLogin()
-      // Vault mode never falls back to a local account. When no vault account
-      // could be tried, or the vault refused every one it was asked for, the
-      // request is refused here with a fixed text naming the cause and the
-      // remedy. An admission refusal (quota) keeps the installer's own.
+      // Vault mode never falls back to a local account. If no target could be
+      // tried, explain why here; a vault authorization refusal takes priority.
+      // A surviving target blocked later by admission keeps the host's error.
       if (
         accountId === undefined &&
         vaultMode &&
@@ -2011,8 +2030,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         !resetWake &&
         (targets.length === 0 || refused.size > 0)
       ) {
-        const cause: VaultModeRefusal =
-          refused.size > 0 ? 'vault-refused' : vaultModeNoRouteCause(vault)
+        const cause =
+          refused.size > 0
+            ? 'vault-refused'
+            : quotaMinimumBlocked
+              ? 'quota-minimum'
+              : vaultModeNoRouteCause(vault)
         log?.warn(
           'vault mode: no vault account can serve; refusing the request',
           {
@@ -2024,7 +2047,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           providerID: OPENAI_PROVIDER_ID,
           sessionID: input.sessionID,
           requestKind: input.kind,
-          message: vaultModeRefusalText(cause, vault.name),
+          message:
+            cause === 'quota-minimum'
+              ? OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE
+              : vaultModeRefusalText(cause, vault.name),
         })
       }
       if (accountId !== undefined) {
@@ -2313,7 +2339,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       )
       if (!vaultMode && !(await source.current()).active) return undefined
       const at = now()
-      const targets = currentTargets(storage, at, vaultMode)
+      const { targets } = currentTargets(storage, at, vaultMode)
       const target = targets.find(
         (candidate) => candidate.id === input.accountId,
       )

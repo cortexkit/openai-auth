@@ -23,6 +23,7 @@ import {
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import {
+  OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE,
   OpenAiVault,
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
@@ -64,6 +65,7 @@ import { restoreEnv } from './setup-env'
 
 const PLACEHOLDER = placeholderSecret('openai')
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')
+const WORK_ACCESS = chatgptAccessToken('chatgpt-work')
 const ENROLLMENT_TOKEN = '01'.repeat(32)
 
 const cleanups: Array<() => Promise<void> | void> = []
@@ -84,6 +86,23 @@ const usageOnly = (async (input: unknown) => {
     throw new Error('offline in tests')
   return new Response(usageBody(10), { status: 200 })
 }) as unknown as typeof fetch
+
+function setVaultQuotaMinimum(files: PoolFiles, killswitchFloor?: number) {
+  writeFileSync(
+    files.configPath,
+    JSON.stringify({
+      ...files.readConfig(),
+      quota: { minimumRemaining: { primary: 95 } },
+      ...(killswitchFloor !== undefined && {
+        killswitch: {
+          enabled: true,
+          schema: 'floors-v1',
+          defaults: { primary: killswitchFloor, secondary: 0 },
+        },
+      }),
+    }),
+  )
+}
 
 async function waitFor(check: () => boolean, what: string) {
   const deadline = Date.now() + 5_000
@@ -211,6 +230,27 @@ async function start(
   return { host, daemon, files, tokenPath, relay }
 }
 
+function startWithMixedVaultQuota() {
+  return start(
+    'main-first',
+    [{ id: 'main' }],
+    {
+      'chatgpt:openai': vaultLogin('chatgpt-vault'),
+      'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+    },
+    {
+      prepare: setVaultQuotaMinimum,
+      fetch: (async (input: unknown, init?: RequestInit) => {
+        if (!String(input).includes('/wham/usage'))
+          throw new Error('offline in tests')
+        const bearer = new Headers(init?.headers).get('authorization')
+        const usedPercent = bearer === `Bearer ${WORK_ACCESS}` ? 1 : 10
+        return new Response(usageBody(usedPercent), { status: 200 })
+      }) as unknown as typeof fetch,
+    },
+  )
+}
+
 type Host = Awaited<ReturnType<typeof start>>['host']
 
 it('vault activation is registered and returns only the host placeholder without a pool write', async () => {
@@ -241,8 +281,8 @@ it('vault activation is registered and returns only the host placeholder without
   ).toEqual(before)
 })
 
-/** Asserts the host's request is refused locally in vault mode for `cause`. */
-async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
+/** Asserts the host's request is refused locally without a credential. */
+async function expectLocalRefusal(host: Host, expectedMessage: string) {
   const draftScope = scope('ses_1', 'primary')
   const headers = {
     authorization: `Bearer ${PLACEHOLDER}`,
@@ -263,12 +303,18 @@ async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
       (reason: unknown) => reason,
     )
   expect(error).toBeInstanceOf(OpenCode2AuthError)
-  expect((error as OpenCode2AuthError).message).toBe(
-    vaultModeRefusalText(cause, 'openai-auth-opencode'),
-  )
+  expect((error as OpenCode2AuthError).kind).toBe('no-account')
+  expect((error as OpenCode2AuthError).message).toBe(expectedMessage)
   // Nothing was given a credential to go out with.
   expect(draft.request.headers.get('authorization')).toBe(
     `Bearer ${PLACEHOLDER}`,
+  )
+}
+
+function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
+  return expectLocalRefusal(
+    host,
+    vaultModeRefusalText(cause, 'openai-auth-opencode'),
   )
 }
 
@@ -798,8 +844,49 @@ describe('vault accounts on OpenCode 2', () => {
     expect(readFileSync(files.statePath, 'utf8')).toBe(state)
   })
 
-  it('refuses locally when the vault serves no account', async () => {
-    const { host } = await start('main-first', [{ id: 'main' }], {})
+  it('refuses with the quota minimum message when every vault account is below the minimum', async () => {
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      { 'chatgpt:openai': vaultLogin('chatgpt-vault') },
+      { prepare: setVaultQuotaMinimum },
+    )
+    await expectLocalRefusal(host, OPENAI_QUOTA_MINIMUM_REFUSAL_MESSAGE)
+  })
+
+  it('serves a vault account above the quota minimum instead of the default below it', async () => {
+    const { host } = await startWithMixedVaultQuota()
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${WORK_ACCESS}`,
+    )
+  })
+
+  it('keeps the vault refusal when it declines the only account above the quota minimum', async () => {
+    const { host, daemon } = await startWithMixedVaultQuota()
+    const credential = daemon.credentials['chatgpt:openai:work']
+    if (credential) credential.refuse = 'credential_unavailable'
+    await expectVaultRefusal(host, 'vault-refused')
+  })
+
+  it('does not blame the quota minimum when the vault account also fails the killswitch floor', async () => {
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      { 'chatgpt:openai': vaultLogin('chatgpt-vault') },
+      { prepare: (files) => setVaultQuotaMinimum(files, 95) },
+    )
+    await expectVaultRefusal(host, 'vault-empty')
+  })
+
+  it('keeps the vault-empty refusal for an empty roster with a quota minimum', async () => {
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {},
+      {
+        prepare: setVaultQuotaMinimum,
+      },
+    )
     await expectVaultRefusal(host, 'vault-empty')
   })
 
