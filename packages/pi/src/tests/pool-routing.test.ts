@@ -526,20 +526,31 @@ describe('Pi pre-publication policy evidence', () => {
       sessionId: 'session-1',
       apiKey: jwt('acct-main', 'refresh'),
     })
+    expect(observations).toHaveLength(1)
     expect(observations[0]?.facts.attempted).toEqual(activity.accountKey)
     expect(observations[0]?.decision.action).toBe('reroute')
-    now = dispatchedAt + 300_000
+    now = dispatchedAt + activity.ttlMs + 1
     await send(runtime, {
       sessionId: 'session-1',
       apiKey: jwt('acct-main', 'refresh'),
     })
-    expect(observations.at(-1)?.decision.action).not.toBe('hold')
-    runtime.main.observeToken(jwt('replacement'))
-    await send(runtime, { sessionId: 'session-1', apiKey: jwt('replacement') })
-    expect(observations.at(-1)?.facts.attempted).not.toEqual(
-      activity.accountKey,
-    )
-    expect(observations.at(-1)?.decision.action).not.toBe('hold')
+    expect(observations).toHaveLength(2)
+    expect(observations[1]?.facts.attempted).toEqual(activity.accountKey)
+    expect(observations[1]?.decision.action).not.toBe('hold')
+    const replacementToken = jwt('replacement')
+    runtime.main.observeToken(replacementToken)
+    // The old login's quota is gone; a ready peer can serve before the new poll finishes.
+    expect(await runtime.main.pending()).toEqual({ ok: true })
+    const beforeReplacement = observations.length
+    await send(runtime, { sessionId: 'session-1', apiKey: replacementToken })
+    expect(observations).toHaveLength(beforeReplacement + 1)
+    const replacement = observations[beforeReplacement]
+    expect(replacement?.facts.attempted).not.toEqual(activity.accountKey)
+    expect(replacement?.facts.attempted).toEqual({
+      ...activity.accountKey,
+      incarnation: 'replacement',
+    })
+    expect(replacement?.decision.action).not.toBe('hold')
     await runtime.pool.dispose()
   })
 
