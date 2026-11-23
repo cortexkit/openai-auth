@@ -5,6 +5,8 @@
 // frame's `client_metadata`, never in a handshake header.
 
 import {
+  applyMidConversationEffort,
+  type CodexEffortState,
   type CodexRequestRuntime,
   type CodexSessionMetadata,
   type FrameTurn,
@@ -151,23 +153,15 @@ export type WireForm = 'http' | 'ws'
  * The backend keys its prompt cache on the request-level
  * `reasoning.effort`, so a session that changes effort part-way would have
  * the whole conversation read again uncached. Instead the request-level
- * value stays at the effort the session opened with, and the new effort goes
- * in as `{type: 'configuration_update', reasoning: {effort}}` immediately
- * before the user message that starts the current turn (the last user
- * message of the input). Only the agent loop's requests (`kind` `primary`)
- * take part; a session's first one with an effort pins it.
- *
- * The rule only ever adds to what the host built: it sets the request-level
- * effort back to the pinned value and inserts the one item. It never drops,
- * reorders or edits anything else, and never touches `previous_response_id`.
- * Given the session's pinned effort, the result depends on the body alone.
+ * value stays pinned and each effort change goes in as a `configuration_update`
+ * immediately before its user message. Only primary requests take part.
  *
  * Per form:
  *
- * - HTTP: every request replays the whole conversation, so the item rides
- *   on every request after a change, before the turn's user message; the
- *   tool steps of a turn keep it at the same place, so their prefix stays
- *   cached from one step to the next.
+ * - HTTP: the host replays the whole input but not the plugin's edits, so
+ *   rebuild all updates at their original message positions on every replay.
+ *   If the host rewrites the history, the HTTP pin can start over without
+ *   changing the WebSocket's opening effort.
  * - WebSocket: the host chains turns with `previous_response_id` and sends
  *   only the new input items, comparing against its own request as it was
  *   before this rewrite. The server keeps the items it has seen, the
@@ -185,7 +179,10 @@ export type WireForm = 'http' | 'ws'
  * keeps reporting the request-level (pinned) effort, as on OpenCode 1.
  */
 export class MidConversationEffort {
-  readonly #pinned = new Map<string, string>()
+  readonly #pinned = new Map<
+    string,
+    { opening: string; http: CodexEffortState }
+  >()
   constructor(readonly http = new CodexHttpState()) {}
 
   /**
@@ -210,8 +207,18 @@ export class MidConversationEffort {
       this.#pin(scope.sessionID, effort)
       return false
     }
-    if (effort === pinned) return false
-    const input = Array.isArray(body.input) ? body.input : undefined
+    const rawInput = body.input
+    const input = Array.isArray(rawInput) ? rawInput : undefined
+    // Leave requests already carrying host updates on the existing path;
+    // inserting plugin history there could duplicate the host's updates.
+    if (form === 'http' && !input?.some(isConfigurationUpdate)) {
+      applyMidConversationEffort(body, pinned.http)
+      return (
+        body.input !== rawInput ||
+        (body.reasoning !== reasoning && effort !== pinned.http.pinnedEffort)
+      )
+    }
+    if (effort === pinned.opening) return false
     // With nothing to sit in front of, an update would be the whole request;
     // let the request-level value stand, as OpenCode 1 does.
     if (!input || input.length === 0) return false
@@ -223,10 +230,10 @@ export class MidConversationEffort {
       // apply, so with no user message to place it before, the host's
       // request-level effort stands.
       if (form === 'http') return false
-      body.reasoning = { ...reasoning, effort: pinned }
+      body.reasoning = { ...reasoning, effort: pinned.opening }
       return true
     }
-    body.reasoning = { ...reasoning, effort: pinned }
+    body.reasoning = { ...reasoning, effort: pinned.opening }
     // A full resend after a new user turn moves the single item to the newest
     // user message, so the tail after the old change point is read uncached.
     if (!isConfigurationUpdate(input[at - 1]))
@@ -243,7 +250,10 @@ export class MidConversationEffort {
   }
 
   #pin(sessionID: string, effort: string) {
-    this.#pinned.set(sessionID, effort)
+    this.#pinned.set(sessionID, {
+      opening: effort,
+      http: { pinnedEffort: effort },
+    })
     while (this.#pinned.size > MAX_PINNED_SESSIONS) {
       const oldest = this.#pinned.keys().next().value
       if (oldest === undefined) break

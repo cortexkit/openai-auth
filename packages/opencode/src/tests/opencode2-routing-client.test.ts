@@ -7,10 +7,14 @@ import {
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import * as routingClient from '@cortexkit/common-auth/routing-accessor'
-import { VAULT_MODE_REFUSALS } from '@cortexkit/openai-auth-core/internal'
+import {
+  VAULT_MODE_REFUSALS,
+  VAULT_ROUTING_REFUSAL_MESSAGE,
+} from '@cortexkit/openai-auth-core/internal'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { OpenAIAttemptData } from '../v2/adapter'
 import { SessionAccounts } from '../v2/session-accounts'
+import { installPoolHooks } from '../v2/setup'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 import {
   fixture,
@@ -563,6 +567,159 @@ test('capacity placement stops and reports cancellation on HTTP abort', async ()
     await env.dispose()
   }
 })
+
+function capacityClock(start: number) {
+  let now = start
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const pending = new Map<
+    ReturnType<typeof setTimeout>,
+    { at: number; run: () => void }
+  >()
+  const set = spyOn(globalThis, 'setTimeout').mockImplementation(((
+    run: () => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (delay === undefined || delay < 60_000)
+      return realSetTimeout(run, delay, ...args)
+    const timer = realSetTimeout(() => {}, delay)
+    realClearTimeout(timer)
+    pending.set(timer, { at: now + delay, run })
+    return timer
+  }) as typeof setTimeout)
+  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(
+    (timer) => {
+      const handle = timer as ReturnType<typeof setTimeout> | undefined
+      if (handle !== undefined) pending.delete(handle)
+      realClearTimeout(handle)
+    },
+  )
+  return {
+    now: () => now,
+    advance(ms: number) {
+      now += ms
+      for (const [timer, { at, run }] of pending) {
+        if (at > now) continue
+        pending.delete(timer)
+        run()
+      }
+    },
+    restore() {
+      set.mockRestore()
+      clear.mockRestore()
+    },
+  }
+}
+
+test.each(['first ask', 'announced sleep', 'HTTP request signal'] as const)(
+  'capacity placement at the ten-minute deadline: %s',
+  async (scenario) => {
+    // These times are independent of the adapter's deadline constant.
+    const start = Date.now()
+    const clock = capacityClock(start)
+    const http = scenario === 'HTTP request signal'
+    const firstAsk = scenario === 'first ask'
+    const entered = Promise.withResolvers<void>()
+    const late = Promise.withResolvers<{ account_id: string }>()
+    const account = { account_id: 'account-b' }
+    const accountFor = mock(async () => {
+      if (accountFor.mock.calls.length > 1) return account
+      if (firstAsk) {
+        entered.resolve()
+        return late.promise
+      }
+      return {
+        refused: { code: 'concurrency_full', resets_at_ms: start + 1_200_000 },
+      }
+    })
+    const report = mock((payload: Record<string, unknown>) => {
+      if (payload.kind === 'wait' && payload.phase === 'start')
+        entered.resolve()
+    })
+    Reflect.set(globalThis, key, () => ({ accountFor, report }))
+    const env = fixture(true, 'sticky-balanced', clock.now)
+    const host = fakeOpenCode2Host()
+    const controller = new AbortController()
+    const providerSend = mock(() => {})
+    const installation = await installPoolHooks(host.ctx, env.openai.adapter, {
+      warn() {},
+      info() {},
+    })
+    env.openai.attach(installation)
+    try {
+      const requestScope = scope(env.request.sessionID)
+      const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+      const hook = http
+        ? host.fire('http.request', {
+            ...requestScope,
+            request: new Request('https://codex.test/responses', {
+              headers,
+              signal: controller.signal,
+            }),
+          })
+        : host.fire('experimental.ws.handshake', {
+            ...requestScope,
+            url: 'wss://chatgpt.com/backend-api/codex/responses',
+            headers,
+          })
+      const outcome = hook.then(providerSend, (error: unknown) => error)
+      const observe = () =>
+        Promise.race([
+          outcome,
+          new Promise((resolve) => setImmediate(() => resolve('pending'))),
+        ])
+      expect(await Promise.race([entered.promise, outcome])).toBeUndefined()
+      clock.advance(599_999)
+      expect(await observe()).toBe('pending')
+      clock.advance(1)
+      if (http) {
+        expect(await observe()).toBe('pending')
+        controller.abort()
+        expect(await observe()).toHaveProperty('name', 'AbortError')
+      } else {
+        const error = await observe()
+        expect(error).toBeInstanceOf(OpenCode2AuthError)
+        expect(error).toMatchObject({
+          kind: 'no-account',
+          message: VAULT_ROUTING_REFUSAL_MESSAGE,
+        })
+      }
+
+      late.resolve(account)
+      clock.advance(600_000)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(accountFor).toHaveBeenCalledTimes(1)
+      expect(providerSend).not.toHaveBeenCalled()
+      expect(env.authorized).toEqual([])
+      expect(env.openai.activeAccount(env.request.sessionID)).toBeUndefined()
+      const waits = report.mock.calls
+        .map(([payload]) => payload)
+        .filter((payload) => payload.kind === 'wait')
+      if (firstAsk) expect(waits).toEqual([])
+      else {
+        const started = waits[0]!
+        expect(started).toMatchObject({
+          phase: 'start',
+          reason: 'account_free',
+        })
+        expect(waits).toEqual([
+          started,
+          {
+            ...started,
+            phase: 'end',
+            outcome: http ? 'cancelled' : 'abandoned',
+          },
+        ])
+      }
+    } finally {
+      controller.abort()
+      await installation.dispose()
+      env.openai.dispose()
+      clock.restore()
+    }
+  },
+)
 
 test('capacity placement does not use a credential that changed while waiting', async () => {
   const now = Date.now()

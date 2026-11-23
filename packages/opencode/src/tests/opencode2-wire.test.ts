@@ -247,6 +247,42 @@ describe('mid-conversation effort on WebSocket frames', () => {
     expect(restarted.input).toEqual([user('two')])
     expect(restarted.prompt_cache_key).not.toBe(THREAD)
   })
+
+  it('keeps the WebSocket opening pin and single-update rule after HTTP effort replays', async () => {
+    const effort = testEffort()
+    const one = user('one')
+    const two = user('two')
+    const three = user('three')
+    const opening = await rewriteCodexHttpRequest(
+      httpBody('low', [one]),
+      SESSION,
+      effort,
+      false,
+    )
+    expect((await opening!.json()).reasoning.effort).toBe('low')
+    await rewriteCodexHttpRequest(
+      httpBody('high', [one, two]),
+      SESSION,
+      effort,
+      false,
+    )
+    // Shortening HTTP history removes the user message that carried the
+    // change. HTTP starts a new pin without changing the WebSocket pin.
+    const rebased = await rewriteCodexHttpRequest(
+      httpBody('xhigh', [three]),
+      SESSION,
+      effort,
+      false,
+    )
+    expect((await rebased!.json()).reasoning.effort).toBe('xhigh')
+
+    expect(
+      effortEdit(frame('xhigh', [one, two, three]), SESSION, effort),
+    ).toEqual({
+      reasoning: { effort: 'low', summary: 'auto' },
+      input: [one, two, update('xhigh'), three],
+    })
+  })
 })
 
 describe('mid-conversation effort and Responses Lite on HTTP', () => {

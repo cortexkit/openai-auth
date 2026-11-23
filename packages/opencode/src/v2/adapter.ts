@@ -171,6 +171,9 @@ export const OPENAI_HOST_RETRY_LIMIT = 10
  */
 export const DEFAULT_LIMIT_MARK_MS = 60_000
 
+/** The WebSocket handshake supplies no request signal to cancel a capacity wait. */
+const CAPACITY_WAIT_WITHOUT_SIGNAL_MS = 600_000
+
 /**
  * The size every request counts for in sticky placement. OpenCode 2 hands
  * the hooks no request body before the account is chosen, so each session
@@ -1114,109 +1117,132 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         pins.get(input.sessionID)
       const newTurn = primary && unplacedTurns.delete(input.sessionID)
       const place = newTurn || current === undefined
-      for (let retried = false; ; retried = true) {
-        const routes = (vault?.routes() ?? [])
-          .filter((route) => route.kind === 'oauth')
-          .map((route) => ({ ...route, quota: route.quota }))
-        // Missing or expired readings do not establish that a floor was breached.
-        const floorSettings = storage && {
-          ...storage,
-          quota: { ...storage.quota, failClosedOnUnknownQuota: false },
-        }
-        const floors = poolKillswitchVerdicts(routes, floorSettings, at)
-        const eligible = routes.filter(
-          (route) => floors.get(route.id) !== false,
-        )
-        let account = current
-        if (place) {
-          if (!eligible.some((route) => route.identity && route.credentialId)) {
-            placementBlocked = true
-            break
+      const routingRefusal = () =>
+        new OpenCode2AuthError({
+          kind: 'no-account',
+          providerID: OPENAI_PROVIDER_ID,
+          sessionID: input.sessionID,
+          requestKind: input.kind,
+          message: VAULT_ROUTING_REFUSAL_MESSAGE,
+        })
+      const deadline =
+        place && !input.signal ? new AbortController() : undefined
+      const capacitySignal = input.signal ?? deadline?.signal
+      let capacityTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        for (let retried = false; ; retried = true) {
+          const routes = (vault?.routes() ?? [])
+            .filter((route) => route.kind === 'oauth')
+            .map((route) => ({ ...route, quota: route.quota }))
+          // Missing or expired readings do not establish that a floor was breached.
+          const floorSettings = storage && {
+            ...storage,
+            quota: { ...storage.quota, failClosedOnUnknownQuota: false },
           }
-          const activity = limits?.activity.get(input.sessionID)
-          let capacityWaited = false
-          const answer = await chooseVaultRouting({
-            vaultMode,
-            fresh: true,
-            sessionId: input.sessionID,
-            request: { modelId: input.modelID, kind: input.kind },
-            routes,
-            routing: routingInput(routes, storage, at, floors),
-            warmAccountId: current,
-            wait: {
-              activity,
-              accountKey:
-                activity && limits?.accountKey(activity.accountKey.accountId),
-              maxSameAccountWait: storage?.routing?.maxSameAccountWait,
-            },
-            capacityWait: {
-              signal: input.signal,
-              now,
-              sleep: async (delayMs, signal) => {
-                capacityWaited = true
-                const end = startWait(input, 'account_free', now(), delayMs)
-                try {
-                  // Platform timers fire early on delays longer than 2^31-1 ms.
-                  let remaining = delayMs
-                  do {
-                    const next = Math.min(2_147_483_647, remaining)
-                    await waitForRoutingRetry(next, signal)
-                    remaining -= next
-                  } while (remaining > 0)
-                  end?.('resumed')
-                } catch (error) {
-                  end?.(signal?.aborted ? 'cancelled' : 'abandoned')
-                  throw error
-                }
-              },
-            },
-          })
-          if (capacityWaited) {
-            at = now()
-            targets = currentTargets(storage, at, vaultMode)
-            if (typeof answer === 'string') {
-              // A route offered before a capacity wait may no longer be eligible.
-              const offered = eligible.find((route) => route.id === answer)
-              const live = vault?.routes().find((route) => route.id === answer)
-              if (
-                !offered ||
-                !live ||
-                live.identity !== offered.identity ||
-                live.credentialId !== offered.credentialId ||
-                poolKillswitchVerdicts([live], floorSettings, at).get(
-                  answer,
-                ) === false
-              )
-                throw vaultRefusal()
-              routedTarget = { ...live, quota: live.quota }
+          const floors = poolKillswitchVerdicts(routes, floorSettings, at)
+          const eligible = routes.filter(
+            (route) => floors.get(route.id) !== false,
+          )
+          let account = current
+          if (place) {
+            if (
+              !eligible.some((route) => route.identity && route.credentialId)
+            ) {
+              placementBlocked = true
               break
             }
+            const activity = limits?.activity.get(input.sessionID)
+            let capacityWaited = false
+            // Start at the first ask, not at the first reported sleep. Keep the
+            // same deadline if routing asks us to retry placement.
+            if (deadline && capacityTimer === undefined) {
+              capacityTimer = setTimeout(
+                () => deadline.abort(routingRefusal()),
+                CAPACITY_WAIT_WITHOUT_SIGNAL_MS,
+              )
+              capacityTimer.unref()
+            }
+            const answer = await chooseVaultRouting({
+              vaultMode,
+              fresh: true,
+              sessionId: input.sessionID,
+              request: { modelId: input.modelID, kind: input.kind },
+              routes,
+              routing: routingInput(routes, storage, at, floors),
+              warmAccountId: current,
+              wait: {
+                activity,
+                accountKey:
+                  activity && limits?.accountKey(activity.accountKey.accountId),
+                maxSameAccountWait: storage?.routing?.maxSameAccountWait,
+              },
+              capacityWait: {
+                signal: capacitySignal,
+                now,
+                sleep: async (delayMs, signal) => {
+                  capacityWaited = true
+                  const end = startWait(input, 'account_free', now(), delayMs)
+                  try {
+                    // Platform timers fire early on delays longer than 2^31-1 ms.
+                    let remaining = delayMs
+                    do {
+                      const next = Math.min(2_147_483_647, remaining)
+                      await waitForRoutingRetry(next, signal)
+                      remaining -= next
+                    } while (remaining > 0)
+                    end?.('resumed')
+                  } catch (error) {
+                    end?.(input.signal?.aborted ? 'cancelled' : 'abandoned')
+                    throw error
+                  }
+                },
+              },
+            })
+            deadline?.signal.throwIfAborted()
+            if (capacityWaited) {
+              at = now()
+              targets = currentTargets(storage, at, vaultMode)
+              if (typeof answer === 'string') {
+                // A route offered before a capacity wait may no longer be eligible.
+                const offered = eligible.find((route) => route.id === answer)
+                const live = vault
+                  ?.routes()
+                  .find((route) => route.id === answer)
+                if (
+                  !offered ||
+                  !live ||
+                  live.identity !== offered.identity ||
+                  live.credentialId !== offered.credentialId ||
+                  poolKillswitchVerdicts([live], floorSettings, at).get(
+                    answer,
+                  ) === false
+                )
+                  throw vaultRefusal()
+                routedTarget = { ...live, quota: live.quota }
+                break
+              }
+            }
+            if (typeof answer === 'string') account = answer
+            else if (answer) {
+              const delayMs = !retried
+                ? vaultRoutingPlacementRetryMs(answer)
+                : undefined
+              if (delayMs === undefined) throw routingRefusal()
+              await waitForRoutingRetry(delayMs, capacitySignal)
+              capacitySignal?.throwIfAborted()
+              at = now()
+              targets = currentTargets(storage, at, vaultMode)
+              continue
+            }
           }
-          if (typeof answer === 'string') account = answer
-          else if (answer) {
-            const delayMs = !retried
-              ? vaultRoutingPlacementRetryMs(answer)
-              : undefined
-            if (delayMs === undefined)
-              throw new OpenCode2AuthError({
-                kind: 'no-account',
-                providerID: OPENAI_PROVIDER_ID,
-                sessionID: input.sessionID,
-                requestKind: input.kind,
-                message: VAULT_ROUTING_REFUSAL_MESSAGE,
-              })
-            await waitForRoutingRetry(delayMs, input.signal)
-            input.signal?.throwIfAborted()
-            at = now()
-            targets = currentTargets(storage, at, vaultMode)
-            continue
+          if (account !== undefined) {
+            routedTarget = eligible.find((route) => route.id === account)
+            if (!routedTarget) throw vaultRefusal()
           }
+          break
         }
-        if (account !== undefined) {
-          routedTarget = eligible.find((route) => route.id === account)
-          if (!routedTarget) throw vaultRefusal()
-        }
-        break
+      } finally {
+        if (capacityTimer !== undefined) clearTimeout(capacityTimer)
       }
     }
     const firstReading =

@@ -85,8 +85,9 @@ function request(body: Record<string, unknown>) {
 async function send(
   host: Awaited<ReturnType<typeof start>>,
   body: Record<string, unknown>,
+  kind: RequestKind = 'primary',
 ) {
-  const draft = { ...scope(), request: request(body) }
+  const draft = { ...scope('ses_1', kind), request: request(body) }
   await host.fire('http.request', draft)
   return draft.request
 }
@@ -124,6 +125,53 @@ describe('OpenCode 2 HTTP shape', () => {
       JSON.stringify(changed.input),
     )
     expect(continued.input.at(-1)).toEqual(output)
+  })
+
+  it('replays every HTTP effort change at its own user message, including a return to the opening effort', async () => {
+    const host = await start()
+    const [one, two, three, four] = ['one', 'two', 'three', 'four'].map(user)
+    const high = { type: 'configuration_update', reasoning: { effort: 'high' } }
+    const xhigh = {
+      type: 'configuration_update',
+      reasoning: { effort: 'xhigh' },
+    }
+    const low = { type: 'configuration_update', reasoning: { effort: 'low' } }
+    const dispatch = async (
+      effort: string,
+      input: unknown[],
+      kind: RequestKind = 'primary',
+      model = 'gpt-6.2-sol',
+    ) => {
+      const reasoning = { effort, summary: 'auto' }
+      const sent = await send(host, { model, input, reasoning }, kind)
+      const body = await sent.json()
+      return JSON.stringify({ input: body.input, reasoning: body.reasoning })
+    }
+    const expected = (input: unknown[], effort = 'low') =>
+      JSON.stringify({ input, reasoning: { effort, summary: 'auto' } })
+
+    expect(await dispatch('low', [one])).toBe(expected([one]))
+    expect(await dispatch('high', [one, two])).toBe(expected([one, high, two]))
+    const replay = [one, two, three]
+    for (const kind of ['title', 'compaction', 'generate'] as const) {
+      expect(await dispatch('xhigh', replay, kind)).toBe(
+        expected(replay, 'xhigh'),
+      )
+    }
+    // The host owns gpt-6-sol effort changes. It also owns the updates in an
+    // already-pinned request that carries its own configuration update.
+    const native = [one, xhigh, two, three]
+    expect(await dispatch('high', native, 'primary', 'gpt-6-sol')).toBe(
+      expected(native, 'high'),
+    )
+    expect(await dispatch('low', native)).toBe(expected(native))
+
+    expect(await dispatch('xhigh', replay)).toBe(
+      expected([one, high, two, xhigh, three]),
+    )
+    expect(await dispatch('low', [...replay, four])).toBe(
+      expected([one, high, two, xhigh, three, low, four]),
+    )
   })
 
   it('restores replayed call status on GPT-6.2 HTTP without changing GPT-6.1 input', async () => {
