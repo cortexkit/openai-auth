@@ -1213,10 +1213,9 @@ export class PiOpenAIRuntime {
     let rest: StreamAttempt['rest']
     for (;;) {
       const next = await iterator.next()
-      if (next.done) {
-        buffered.length = 0
-        break
-      }
+      // A stream that ends without output or a terminal event hands its held
+      // lifecycle events on unchanged; only a discarded attempt drops them.
+      if (next.done) break
       const event = next.value
       buffered.push(event)
       if (event.type === 'error') break
