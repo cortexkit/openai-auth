@@ -159,8 +159,84 @@ import { acquireSidebarPublisher } from './sidebar-publisher'
  */
 export const OPENAI_AUTH_PLUGIN_ID = 'cortexkit-openai-auth'
 
-/** Longest a shutdown waits for queued quota writes before it lets go. */
-const SETTLE_ON_DISPOSE_MS = 5_000
+/** Longest shutdown waits for any one release or drain. */
+const CLEANUP_STEP_TIMEOUT_MS = 5_000
+
+const CLEANUP_PHASES = [
+  ['control plane'],
+  ['migration lifecycle'],
+  ['limits and pool'],
+  ['sidebar'],
+  ['pool hooks', 'prompt hook', 'auth methods', 'model rules'],
+  ['migration drain', 'pool drain', 'session saves', 'cache keep'],
+  ['settings registration'],
+  ['settings snapshot'],
+] as const
+
+type CleanupStep =
+  | (typeof CLEANUP_PHASES)[number][number]
+  | 'session events'
+  | 'adapter'
+  | 'vault lease'
+  | 'process heartbeat'
+
+function createSetupCleanup(log: Pick<OpenAIAdapterLogger, 'warn'>) {
+  const releases = new Map<CleanupStep, () => unknown>()
+  let closing = false
+  let cleanup: Promise<void> | undefined
+
+  async function release(step: CleanupStep): Promise<void> {
+    const dispose = releases.get(step)
+    if (!dispose) return
+    releases.delete(step)
+    let failed = false
+    const work = (async () => dispose())().catch(() => {
+      failed = true
+    })
+    if (!(await settlesWithin(work, CLEANUP_STEP_TIMEOUT_MS)))
+      log.warn('OpenCode 2 cleanup step timed out', { step })
+    else if (failed) log.warn('OpenCode 2 cleanup step failed', { step })
+  }
+
+  async function close(): Promise<void> {
+    closing = true
+    try {
+      await release('session events')
+      await release('adapter')
+      // Drop the keep-warm hold before closing the pool and vault it uses.
+      // Wait for any in-flight cache-warming request alongside the other drains.
+      const cacheKeep = release('cache keep')
+      // Close the menu and stop migration before releasing the limits and pool
+      // they can write to. Join transfers, reads and session saves before
+      // letting go of their shared settings and vault.
+      for (const phase of CLEANUP_PHASES) {
+        await Promise.all(
+          phase.map((step) =>
+            step === 'cache keep' ? cacheKeep : release(step),
+          ),
+        )
+      }
+    } finally {
+      // Keep the process version visible until its vault work has drained or
+      // reached its deadline. Neither release depends on the other's success.
+      try {
+        await release('vault lease')
+      } finally {
+        await release('process heartbeat')
+      }
+    }
+  }
+
+  return {
+    get closing() {
+      return closing
+    },
+    defer(step: CleanupStep, dispose: () => unknown) {
+      releases.set(step, dispose)
+    },
+    run: () => (cleanup ??= close()),
+  }
+}
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
@@ -657,9 +733,25 @@ export async function setupOpenAIAuth(
   ctx: SetupContext,
   options: OpenAIAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
+  const log = createLogger('opencode2')
+  const cleanup = createSetupCleanup(log)
+  try {
+    await initializeOpenAIAuth(ctx, options, log, cleanup)
+  } catch (error) {
+    await cleanup.run()
+    throw error
+  }
+  return cleanup.run
+}
+
+async function initializeOpenAIAuth(
+  ctx: SetupContext,
+  options: OpenAIAuthV2Options,
+  log: ReturnType<typeof createLogger>,
+  cleanup: ReturnType<typeof createSetupCleanup>,
+): Promise<void> {
   const directory = ctx.location?.directory
   setupTrace('setup enter', directory)
-  const log = createLogger('opencode2')
   const logQ = createLogger('quota')
   const version = options.version ?? PackageVersion
   // Before anything resolves a runtime path: where this process keeps its
@@ -678,18 +770,12 @@ export async function setupOpenAIAuth(
   })
   setupTrace('after prepareSettingsStartup', directory)
   const snapshot = settingsStartup.snapshot
-  const unregisterSettings = snapshot
-    ? registerSettingsSnapshot(configPath, snapshot)
-    : undefined
-  const disposeSettings = () => {
-    unregisterSettings?.()
-    snapshot?.dispose()
-  }
-  let setupComplete = false
-  using _settingsRollback = {
-    [Symbol.dispose]() {
-      if (!setupComplete) disposeSettings()
-    },
+  if (snapshot) {
+    cleanup.defer('settings snapshot', () => snapshot.dispose())
+    cleanup.defer(
+      'settings registration',
+      registerSettingsSnapshot(configPath, snapshot),
+    )
   }
   // The logger starts with the environment floor. A saved choice overrides it,
   // just as it does on OpenCode 1, before setup writes any diagnostic lines.
@@ -730,16 +816,10 @@ export async function setupOpenAIAuth(
       },
       log,
     )
+    cleanup.defer('pool hooks', () => installation.dispose())
     setupTrace('after installPoolHooks (stand-aside)', directory)
-    setupComplete = true
     setupTrace('setup exit (stand-aside)', directory)
-    return async () => {
-      try {
-        await installation.dispose()
-      } finally {
-        disposeSettings()
-      }
-    }
+    return
   }
 
   // The vault serves nothing until this host is enrolled through
@@ -785,17 +865,12 @@ export async function setupOpenAIAuth(
     },
     paths(),
   )
+  cleanup.defer('vault lease', () => vaultLease.release())
   const vault = vaultLease.vault
   const loadStorage = async () =>
     (await vault.authority()) === 'local'
       ? loadAccounts(paths())
       : loadAccountSettings(paths())
-  let closing = false
-  using _leaseRollback = {
-    [Symbol.dispose]() {
-      if (!setupComplete) vaultLease.release()
-    },
-  }
   setupTrace('before vault.authority', directory)
   await vault.authority()
   setupTrace('after vault.authority', directory)
@@ -841,6 +916,8 @@ export async function setupOpenAIAuth(
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
   })
+  cleanup.defer('limits and pool', () => source.dispose())
+  cleanup.defer('pool drain', () => source.settled())
   setupTrace('before vault.authority (source)', directory)
   const authority = await vault.authority()
   setupTrace('after vault.authority (source)', directory)
@@ -856,11 +933,8 @@ export async function setupOpenAIAuth(
     vault,
     log: (message) => log.warn(message),
   })
-  using _limitsRollback = {
-    [Symbol.dispose]() {
-      if (!setupComplete) void limits.dispose()
-    },
-  }
+  // The limits source now owns disposal of the pool as well.
+  cleanup.defer('limits and pool', () => limits.dispose())
 
   setupTrace('before startProcessHeartbeat', directory)
   const heartbeat =
@@ -870,6 +944,7 @@ export async function setupOpenAIAuth(
           version,
           logger: createLogger('heartbeat'),
         })
+  if (heartbeat) cleanup.defer('process heartbeat', () => heartbeat.release())
   setupTrace('after startProcessHeartbeat', directory)
 
   // Only while the migration is switched on. With it off, setup gets here
@@ -901,7 +976,7 @@ export async function setupOpenAIAuth(
         migrate: async (deps) => {
           const outcome = await migrateToPool(deps)
           migrationRefused = outcome.status === 'refused'
-          if (!closing) await source.load()
+          if (!cleanup.closing) await source.load()
           return outcome
         },
         // `vaultServes` is false until the vault's first roster read has
@@ -910,17 +985,21 @@ export async function setupOpenAIAuth(
         // so the lifecycle (and a login waiting for it to go idle) is never
         // held, and the next scheduled run tries again.
         adopt: async (deps) => {
-          if (closing) return { status: 'retry', reason: 'unsettled' }
+          if (cleanup.closing) return { status: 'retry', reason: 'unsettled' }
           if (!(await settlesWithin(vaultFirstRoster, vaultRosterWaitMs)))
             return { status: 'retry', reason: 'vault-roster-pending' }
-          if (closing) return { status: 'retry', reason: 'unsettled' }
+          if (cleanup.closing) return { status: 'retry', reason: 'unsettled' }
           const outcome = await adoptHostSlotLogin(deps)
-          if (!closing) await source.load()
+          if (!cleanup.closing) await source.load()
           return outcome
         },
       })
     : undefined
-  lifecycle?.start()
+  if (lifecycle) {
+    cleanup.defer('migration lifecycle', () => lifecycle.dispose())
+    cleanup.defer('migration drain', () => lifecycle.idle())
+    lifecycle.start()
+  }
 
   vaultLease.start()
 
@@ -930,11 +1009,7 @@ export async function setupOpenAIAuth(
     options.sidebarStateFile,
     options.sidebarObservationIntervalMs,
   )
-  using _sidebarRollback = {
-    [Symbol.dispose]() {
-      if (!setupComplete) void sidebar.release()
-    },
-  }
+  cleanup.defer('sidebar', () => sidebar.release())
   // Disk publication must not hold up the host's location-ready lifecycle.
   void sidebar.publish()
   // Thread ids are saved per host session so the prompt cache key survives a
@@ -942,6 +1017,8 @@ export async function setupOpenAIAuth(
   const codex =
     options.codex ??
     new CodexHttpState(undefined, undefined, acquireCodexSessions())
+  const sessionStore = codex.store
+  if (sessionStore) cleanup.defer('session saves', () => sessionStore.settled())
   // One keep-warm manager per process and account store; this location lends
   // it its own pool source, vault, settings and request capture.
   const cacheKeepSettings = cacheKeepSettingsOf(storage, configPath)
@@ -967,14 +1044,10 @@ export async function setupOpenAIAuth(
       ...options.cacheKeep,
     },
   )
+  cleanup.defer('cache keep', () => cacheKeep.release())
   snapshot?.onChange(() => {
     cacheKeep.configure(cacheKeepSettingsOf(storage, configPath))
   })
-  using _cacheKeepRollback = {
-    [Symbol.dispose]() {
-      if (!setupComplete) void cacheKeep.release()
-    },
-  }
   const openai = createOpenAIAdapter({
     cacheWarming: (sessionId) => cacheKeepWarming(paths(), sessionId),
     limits,
@@ -998,6 +1071,7 @@ export async function setupOpenAIAuth(
     now,
     log,
   })
+  cleanup.defer('adapter', () => openai.dispose())
   setupTrace('before installPoolHooks', directory)
   const installation = await installPoolHooks(
     ctx,
@@ -1008,12 +1082,14 @@ export async function setupOpenAIAuth(
     mirror,
     (sessionID) => cacheKeep.forget(sessionID),
   )
+  cleanup.defer('pool hooks', () => installation.dispose())
   setupTrace('after installPoolHooks', directory)
   openai.attach(installation)
   setupTrace('before session.hook (prompt)', directory)
   const turns = await ctx.session.hook('prompt', (draft) => {
     openai.beginTurn(draft.sessionID)
   })
+  cleanup.defer('prompt hook', () => turns.dispose())
   setupTrace('after session.hook (prompt)', directory)
 
   /** Waits for a migration run when the install has not migrated yet. */
@@ -1061,9 +1137,11 @@ export async function setupOpenAIAuth(
     label: 'ChatGPT (openai-auth account pool)',
     vault: vaultLoginMethod(vault),
   })
+  cleanup.defer('auth methods', () => methods.dispose())
   setupTrace('after registerOpenCode2AuthMethods', directory)
   setupTrace('before registerCodexModelRules', directory)
   const models = await registerCodexModelRules(ctx)
+  cleanup.defer('model rules', () => models.dispose())
   setupTrace('after registerCodexModelRules', directory)
   if (options.controlPlane && (!ctx.command || !ctx.location))
     throw new Error(
@@ -1144,11 +1222,13 @@ export async function setupOpenAIAuth(
             }),
         )
       : undefined
+  if (controlPlane) cleanup.defer('control plane', controlPlane)
   setupTrace('after installControlPlane', directory)
 
   // A deleted session's pin, remembered account, mirror and keep-warm target
   // go with it.
   const abort = new AbortController()
+  cleanup.defer('session events', () => abort.abort())
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
@@ -1166,51 +1246,5 @@ export async function setupOpenAIAuth(
     }
   })()
 
-  setupComplete = true
   setupTrace('setup exit', directory)
-  return async () => {
-    closing = true
-    abort.abort()
-    openai.dispose()
-    // Drop this location's hold first, so no warm reads the pool source or
-    // vault released below. The last hold stops the manager at once; its
-    // warm in flight is joined within the shutdown limit below.
-    const cacheKeepReleased = cacheKeep.release()
-    await controlPlane?.()
-    lifecycle?.dispose()
-    await limits.dispose()
-    await sidebar.release()
-    await Promise.allSettled([
-      installation.dispose(),
-      turns.dispose(),
-      methods.dispose(),
-      models.dispose(),
-    ])
-    // Join account-pool transfers and reads after stopping new slot adoptions.
-    // Their reloads must finish before releasing this host's state. Also finish
-    // saving the sessions this location created or deleted, starting a save
-    // still inside its delay now, so a restart right after still finds their
-    // thread ids. Preserve the five-second shutdown
-    // limit for an unresponsive provider, login slot or session-file lock.
-    let settleTimer: ReturnType<typeof setTimeout> | undefined
-    try {
-      await Promise.race([
-        Promise.all([
-          lifecycle?.idle(),
-          source.settled(),
-          codex.store?.settled(),
-          cacheKeepReleased,
-        ]),
-        new Promise<void>((resolve) => {
-          settleTimer = setTimeout(resolve, SETTLE_ON_DISPOSE_MS)
-          settleTimer.unref?.()
-        }),
-      ])
-    } finally {
-      clearTimeout(settleTimer)
-      disposeSettings()
-      await vaultLease.release()
-      await heartbeat?.release()
-    }
-  }
 }
