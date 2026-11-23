@@ -126,6 +126,7 @@ import {
   vaultRoutingStreamMayFail,
 } from '@cortexkit/openai-auth-core/internal'
 import { getResolvedSettingsView } from '../config'
+import { retryAfterMs } from '../core/http-retry-after'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { VAULT_FIRST_ROSTER_WAIT_MS } from '../core/pool-account-source'
@@ -597,14 +598,6 @@ export function quotaFromCodexHeaders(
     snapshot: normalizeQuotaHeaders(headers) as Record<string, unknown>,
     complete: isCompleteQuotaHeaderFrame(headers),
   }
-}
-
-/** Seconds from a `Retry-After` header, when it holds a number. */
-function retryAfterMs(headers: Headers): number | undefined {
-  const value = headers.get('retry-after')
-  if (value === null) return undefined
-  const seconds = value.trim() ? Number(value) : NaN
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined
 }
 
 export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {

@@ -125,6 +125,7 @@ import {
   opencode1SlotForClient,
 } from './core/host-slot'
 import { OpenCodeLimitSource, withinVaultDeadline } from './core/limit-source'
+import { createOc1HttpObserver } from './core/oc1-http-outcome'
 import {
   PoolAccountSource,
   settlesWithin,
@@ -250,7 +251,6 @@ import {
   upsertSidebarActiveRouting,
 } from './sidebar-state'
 import { PackageVersion } from './version'
-import { observeHttpCompletion } from './ws'
 import { OpenAIWebSocketPool } from './ws-pool'
 
 export {
@@ -2062,7 +2062,8 @@ export async function CodexAuthPlugin(
             owner?: OpenAiLimitsOwner
             probe?: LimitsProbe
             limited: boolean
-            complete: (kind: 'http' | 'ws') => void
+            complete: () => void
+            observeHttp: (response: Response) => Response
           }
         >()
         // A vault account's quota reading lands in the vault roster; in vault
@@ -2071,6 +2072,30 @@ export async function CodexAuthPlugin(
           if (!vault.enrolled()) return
           sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
             writeMachineSidebarState(quotaManager),
+          )
+        }
+
+        function recordQuotaFrame(
+          snapshot: Record<string, unknown>,
+          accessToken: string,
+          id: string | undefined,
+          identity: string | undefined,
+          receipt: QuotaReceipt | undefined,
+          frame: unknown,
+        ) {
+          if (id && receipt) {
+            vault.reportUsage(id, { frame }, receipt)
+            void vault
+              .recordSnapshot(id, snapshot, true, receipt)
+              .then(queueVaultSidebarWrite)
+            return
+          }
+          pushQuota(
+            snapshot,
+            accessToken,
+            id,
+            !id || id === 'main' ? identity : undefined,
+            true,
           )
         }
 
@@ -2089,21 +2114,13 @@ export async function CodexAuthPlugin(
                 frame,
               ) => {
                 const served = accountId ? streams.get(accountId) : undefined
-                if (served?.receipt) {
-                  vault.reportUsage(served.id, { frame }, served.receipt)
-                  void vault
-                    .recordSnapshot(served.id, s, true, served.receipt)
-                    .then(queueVaultSidebarWrite)
-                  return
-                }
-                const quotaAccount = served?.id ?? accountId
-                const isMainBucket = !quotaAccount || quotaAccount === 'main'
-                pushQuota(
+                recordQuotaFrame(
                   s,
                   accessToken,
-                  quotaAccount,
-                  isMainBucket ? servedChatgptAccountId : undefined,
-                  true,
+                  served?.id ?? accountId,
+                  servedChatgptAccountId,
+                  served?.receipt,
+                  frame,
                 )
               },
               // WS quota exhaustion is authoritative without a quota-API call.
@@ -2163,13 +2180,11 @@ export async function CodexAuthPlugin(
               },
               onComplete: (event, accountId) => {
                 if (event.type === 'response.completed' && accountId)
-                  streams.get(accountId)?.complete('ws')
+                  streams.get(accountId)?.complete()
               },
               onHttpResponse: (response, accountId) => {
                 const stream = accountId ? streams.get(accountId) : undefined
-                return observeHttpCompletion(response, (clean) => {
-                  if (clean) stream?.complete('http')
-                })
+                return stream?.observeHttp(response) ?? response
               },
             })
           : undefined
@@ -2773,6 +2788,84 @@ export async function CodexAuthPlugin(
               if (oldest) sessionAccounts.delete(oldest)
             }
           }
+          function complete(kind: 'http' | 'ws') {
+            if (init?.signal?.aborted || stream.limited || !dispatched) return
+            recordSessionCompletion(
+              limits.activity,
+              dispatched,
+              currentSessionAccount(dispatched.sessionId),
+              kind === 'ws'
+                ? { kind, event: 'response.completed', aborted: false }
+                : { kind, completed: true, failed: false, aborted: false },
+            )
+          }
+          const http = createOc1HttpObserver({
+            classifyLimits: pooled,
+            onComplete: () => complete('http'),
+            onCleanRead:
+              probe?.evidence &&
+              (() => {
+                const signal =
+                  init?.signal ??
+                  (requestInput instanceof Request
+                    ? requestInput.signal
+                    : undefined)
+                if (!signal?.aborted)
+                  owner?.afterProbe(probe, true, stream.limited)
+              }),
+            onQuota: (snapshot, frame) => {
+              // An in-flight local response can outlive a row's credential.
+              const current = binding && limits.accountKey(keepwarmAccountKey)
+              if (
+                binding &&
+                !vaultReceipt &&
+                (!current || !sameAccount(binding.account, current))
+              )
+                return
+              recordQuotaFrame(
+                snapshot as Record<string, unknown>,
+                accessToken,
+                keepwarmAccountKey,
+                accountId,
+                vaultReceipt,
+                frame,
+              )
+            },
+            onLimit:
+              owner &&
+              ((limit, now) => {
+                if (!probe || owner.registry !== probe.registry) {
+                  owner.dropSignal()
+                  return
+                }
+                const current = limits.accountKey(keepwarmAccountKey)
+                const { command, provenance } = openAiRateLimitCommand({
+                  binding: probe.binding,
+                  baseRevision: probe.baseRevision,
+                  producerId: installationID,
+                  operationId: randomUUID(),
+                  parsed: limit.parsed,
+                  // Borrow the latest reset only from the dispatched identity.
+                  reading:
+                    current && sameAccount(probe.binding.account, current)
+                      ? rateLimitQuota(keepwarmAccountKey, true)
+                      : undefined,
+                  now,
+                  observedAt: now,
+                  evidenceAt: now,
+                  resetSource: limit.resetSource,
+                })
+                owner.enqueue(command, provenance)
+              }),
+          })
+          const finishResponse = async (response: Response) =>
+            http.finish(
+              await redactCredentialResponse(
+                response,
+                accessToken,
+                'event-stream',
+              ),
+            )
           const stream = {
             id: keepwarmAccountKey,
             receipt: vaultReceipt,
@@ -2780,17 +2873,10 @@ export async function CodexAuthPlugin(
             owner,
             probe,
             limited: false,
-            complete: (kind: 'http' | 'ws') => {
+            observeHttp: http.observe,
+            complete: () => {
               if (init?.signal?.aborted || stream.limited) return
-              if (dispatched)
-                recordSessionCompletion(
-                  limits.activity,
-                  dispatched,
-                  currentSessionAccount(dispatched.sessionId),
-                  kind === 'ws'
-                    ? { kind, event: 'response.completed', aborted: false }
-                    : { kind, completed: true, failed: false, aborted: false },
-                )
+              complete('ws')
               owner?.afterProbe(probe, true, stream.limited)
             },
           }
@@ -2865,11 +2951,11 @@ export async function CodexAuthPlugin(
               )
               if (!response.body) {
                 release()
-                return reportResponse(response)
+                return reportResponse(await http.finish(response))
               }
               const reader = response.body.getReader()
               return reportResponse(
-                await redactCredentialResponse(
+                await finishResponse(
                   new Response(
                     new ReadableStream<Uint8Array>({
                       async pull(controller) {
@@ -2897,8 +2983,6 @@ export async function CodexAuthPlugin(
                       headers: response.headers,
                     },
                   ),
-                  accessToken,
-                  'event-stream',
                 ),
               )
             } catch (error) {
@@ -2912,10 +2996,8 @@ export async function CodexAuthPlugin(
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
           if (typeof finalInit?.body !== 'string') {
             try {
-              return await redactCredentialResponse(
-                await fetch(url, finalInit),
-                accessToken,
-                'event-stream',
+              return await finishResponse(
+                http.observe(await fetch(url, finalInit)),
               )
             } catch (error) {
               throw redactCredentialError(error, accessToken)
@@ -2955,15 +3037,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return reportResponse(
-              await redactCredentialResponse(
-                observeHttpCompletion(response, (clean) => {
-                  if (clean) stream.complete('http')
-                }),
-                accessToken,
-                'event-stream',
-              ),
-            )
+            return reportResponse(await finishResponse(http.observe(response)))
           } catch (error) {
             await dumpCodexRequest({
               sessionID,

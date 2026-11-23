@@ -77,6 +77,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
 import { getConfigPath, getResolvedSettingsView } from '../config'
+import { oc1HttpLimitFeedback } from './oc1-http-outcome'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
 import {
@@ -431,17 +432,28 @@ async function afterLimit(
     ...windowsFromQuotaMap(current?.quota),
     ...normalizeQuotaHeaders(response.headers),
   }
-  const signal =
+  const feedback = oc1HttpLimitFeedback(response)
+  const classified =
     response.status === 429
       ? classifyOpenAiLimitBody({
           account,
           status: response.status,
-          headers: response.headers,
-          body: await response.clone().text(),
-          now: ctx.now(),
+          headers: feedback ? undefined : response.headers,
+          body: feedback?.body ?? (await response.clone().text()),
+          now: feedback?.observedAt ?? ctx.now(),
           reading,
         })
       : undefined
+  const signal =
+    classified && feedback?.limit.retryAfterMs !== undefined
+      ? {
+          ...classified,
+          retryAfterMs: feedback.limit.retryAfterMs,
+          ...(feedback.limit.resetSource === 'retry-after'
+            ? { retryAfterSource: 'retry-after' as const }
+            : {}),
+        }
+      : classified
   const candidates = policyCandidates(ctx, rows, signal, {
     id: row.id,
     reading,

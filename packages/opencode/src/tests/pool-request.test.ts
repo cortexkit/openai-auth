@@ -16,6 +16,8 @@ import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import { fallbackRefreshLockName } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { projectOpenCodeMarks } from '../core/limit-source'
+import { oc1HttpLimitFeedback } from '../core/oc1-http-outcome'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from '../core/pool-routing.ts'
 import { CodexAuthPlugin } from '../index.ts'
@@ -58,6 +60,7 @@ let stateFile: string
 let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+let limitsReader: PoolAccountSource | undefined
 const heldLocks: Array<{ release(): Promise<void> }> = []
 const scope = createRequestTestScope()
 const it = (
@@ -168,6 +171,8 @@ afterEach(async () => {
   await scope.teardown(
     async () => {
       await hooks?.dispose?.()
+      await limitsReader?.dispose()
+      limitsReader = undefined
       globalThis.fetch = originalFetch
       await drainSidebarWrites()
       process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
@@ -389,7 +394,7 @@ function heldUsagePoll() {
 /** Replace the network. Model requests answer `respond`; quota polls `usage`. */
 function installWire(
   options: {
-    respond?: (bearer: string) => Response
+    respond?: (bearer: string) => Response | Promise<Response>
     usage?: (bearer: string) => Response | Promise<Response>
   } = {},
 ): Wire {
@@ -506,6 +511,410 @@ function pinOf(state: SidebarState, sessionId: string) {
 const healthy = () => quotaMap(10)
 const bearer = (id: string) => `Bearer ${id}-token`
 
+async function otherLimitsOwner() {
+  limitsReader = new PoolAccountSource({
+    paths: () => ({ configPath: configFile, statePath: stateFile }),
+    refreshProvider: async () => {
+      throw new Error('the second owner must not refresh credentials')
+    },
+    pullQuota: async () => {
+      throw new Error('the second owner must not poll quota')
+    },
+  })
+  await limitsReader.limitsForRequest()
+  const owner = limitsReader.limitsOwner()
+  if (!owner) throw new Error('expected a pool limits owner')
+  return { source: limitsReader, owner }
+}
+
+const HTTP_NOW = 1_800_000_000_000
+
+describe('OC1 HTTP limits', () => {
+  const vectors: {
+    title: string
+    error?: Record<string, unknown>
+    headers?: Record<string, string>
+    stale?: boolean
+    hint?: number
+    until: number
+  }[] = [
+    {
+      title:
+        'OA-1 OC1 HTTP absolute reset beats both relative reset and Retry-After',
+      error: {
+        type: 'usage_limit_reached',
+        resets_at: 1_800_000_090,
+        resets_in_seconds: 600,
+      },
+      headers: { 'retry-after': '1200' },
+      hint: 90_000,
+      until: 1_800_000_090_000,
+    },
+    {
+      title: 'OA-2 OC1 HTTP relative reset uses the parser sample',
+      error: { type: 'usage_limit_reached', resets_in_seconds: 600 },
+      hint: 600_000,
+      until: 1_800_000_600_000,
+    },
+    {
+      title: 'OA-3 OC1 HTTP past absolute reset suppresses a future header',
+      error: { type: 'usage_limit_reached', resets_at: 1_799_999_999 },
+      headers: { 'retry-after': '600' },
+      hint: 0,
+      until: 1_800_000_060_000,
+    },
+    {
+      title:
+        'OA-3 OC1 HTTP past absolute reset falls through to the named cached reset',
+      error: { type: 'primary', resets_at: 1_799_999_999 },
+      headers: { 'retry-after': '600' },
+      hint: 0,
+      until: 1_800_007_200_000,
+    },
+    {
+      title: 'OA-4 OC1 empty HTTP 429 does not borrow a healthy primary reset',
+      until: 1_800_000_060_000,
+    },
+    {
+      title:
+        'OA-5 OC1 HTTP fractional Retry-After is exactly 1500 milliseconds',
+      headers: { 'retry-after': '1.5' },
+      hint: 1500,
+      until: 1_800_000_001_500,
+    },
+    {
+      title: 'OA-6 OC1 HTTP zero Retry-After does not create a nonfuture mark',
+      headers: { 'retry-after': '0' },
+      hint: 0,
+      until: 1_800_000_060_000,
+    },
+    {
+      title:
+        'OA-6/11 OC1 HTTP zero Retry-After borrows only the named stale healthy reset',
+      error: { type: 'primary' },
+      headers: { 'retry-after': '0' },
+      hint: 0,
+      stale: true,
+      until: 1_800_007_200_000,
+    },
+    {
+      title: 'OA-11 OC1 HTTP zero Retry-After never borrows the sibling reset',
+      error: { type: 'secondary' },
+      headers: { 'retry-after': '0' },
+      hint: 0,
+      stale: true,
+      until: 1_800_000_060_000,
+    },
+    ...['Fri, 15 Jan 2027 08:00:00 GMT', 'invalid', '-1'].map((value) => ({
+      title: `OA-7 OC1 HTTP numeric-only Retry-After rejects ${value}`,
+      headers: { 'retry-after': value },
+      until: 1_800_000_060_000,
+    })),
+    {
+      title: 'OA-8 OC1 HTTP retry-after-ms alone is ignored',
+      headers: { 'retry-after-ms': '1500' },
+      until: 1_800_000_060_000,
+    },
+    ...[
+      { type: 'capacity' },
+      { code: 'turn_rate_limit_exceeded' },
+      { message: 'slow down' },
+    ].map((error) => ({
+      title: `OA-9 OC1 HTTP unnamed ${JSON.stringify(error)} does not borrow primary`,
+      error,
+      until: 1_800_000_060_000,
+    })),
+  ]
+
+  for (const vector of vectors) {
+    it(vector.title, async () => {
+      const clock = spyOn(Date, 'now').mockReturnValue(HTTP_NOW)
+      try {
+        seedPool('main-first', [
+          {
+            id: 'main',
+            quota: quotaMap(10, {
+              checkedAt: HTTP_NOW - (vector.stale ? 900_001 : 0),
+            }),
+          },
+        ])
+        const body = vector.error ? JSON.stringify({ error: vector.error }) : ''
+        const wire = installWire({
+          usage: () => new Response('', { status: 503 }),
+          respond: () =>
+            new Response(body, { status: 429, headers: vector.headers }),
+        })
+        const fetchOverride = await loadFetch()
+        const { owner, source } = await otherLimitsOwner()
+        const response = await fetchOverride(URL_RESPONSES, request())
+        expect(response.status).toBe(429)
+        expect(await response.text()).toBe(body)
+        expect(wire.sends).toEqual(['Bearer main-token'])
+        expect(
+          projectOpenCodeMarks(owner.snapshot(), source.limitsBindings()),
+        ).toEqual(new Map([['main', vector.until]]))
+        expect(oc1HttpLimitFeedback(response)?.limit.retryAfterMs).toBe(
+          vector.hint,
+        )
+      } finally {
+        clock.mockRestore()
+      }
+    })
+  }
+
+  it('OC1 HTTP preserves 403 backoff and 401 auth responses without marking', async () => {
+    seedPool('main-first', [{ id: 'main', quota: healthy() }])
+    let status = 403
+    const body =
+      '{"error":{"type":"usage_limit_reached","resets_in_seconds":90}}'
+    const wire = installWire({
+      respond: () =>
+        new Response(body, { status, headers: { 'retry-after': '90' } }),
+    })
+    const send = await loadFetch()
+    const { owner, source } = await otherLimitsOwner()
+    for (status of [403, 401]) {
+      const response = await send(URL_RESPONSES, request())
+      expect(response.status).toBe(status)
+      expect(response.headers.get('retry-after')).toBe('90')
+      expect(await response.text()).toBe(body)
+      expect(
+        projectOpenCodeMarks(owner.snapshot(), source.limitsBindings()),
+      ).toEqual(new Map())
+    }
+    expect(wire.sends).toEqual(['Bearer main-token', 'Bearer main-token'])
+  })
+
+  it('OC1 legacy HTTP 429 acquires no limits registry', async () => {
+    seedLegacy('main-first', ['main'])
+    const limits = spyOn(PoolAccountSource.prototype, 'limitsForRequest')
+    const wire = installWire({
+      usage: heldUsagePoll(),
+      respond: () =>
+        new Response('legacy provider refusal', {
+          status: 429,
+          headers: { 'retry-after': '1.5' },
+        }),
+    })
+    try {
+      const send = await loadFetch()
+      const response = await send(URL_RESPONSES, request())
+      expect(response.status).toBe(429)
+      expect(await response.text()).toBe('legacy provider refusal')
+      expect(wire.sends).toEqual(['Bearer main-token'])
+      expect(limits).not.toHaveBeenCalled()
+    } finally {
+      limits.mockRestore()
+    }
+  })
+
+  it('OC1 HTTP records A even after a concurrent send changes the session to B', async () => {
+    seedPool('main-first', [
+      { id: 'main', quota: healthy() },
+      { id: 'fallback-1', quota: healthy() },
+    ])
+    const dispatched = Promise.withResolvers<void>()
+    const refusal = Promise.withResolvers<Response>()
+    const refreshHeaders = quotaHeaders(40, 3 * HOUR)
+    let first = true
+    const wire = installWire({
+      respond: (sent) => {
+        if (sent === 'Bearer fallback-1-token')
+          return new Response('B sentinel')
+        if (!first)
+          return new Response('backoff', {
+            status: 403,
+            headers: refreshHeaders,
+          })
+        first = false
+        dispatched.resolve()
+        return refusal.promise
+      },
+    })
+    const send = await loadFetch()
+    const { owner, source } = await otherLimitsOwner()
+    const firstSend = send(URL_RESPONSES, request('overlapping'))
+    try {
+      await dispatched.promise
+      expect(
+        await (await send(URL_RESPONSES, request('overlapping'))).text(),
+      ).toBe('B sentinel')
+      expect(
+        projectOpenCodeMarks(owner.snapshot(), source.limitsBindings()),
+      ).toEqual(new Map())
+      refusal.resolve(
+        Response.json(
+          { error: { type: 'primary' } },
+          {
+            status: 429,
+            headers: { 'retry-after': '0' },
+          },
+        ),
+      )
+      await (await firstSend).text()
+      const marks = projectOpenCodeMarks(
+        owner.snapshot(),
+        source.limitsBindings(),
+      )
+      expect(marks).toEqual(
+        new Map([
+          ['main', Number(refreshHeaders['x-codex-primary-reset-at']) * 1000],
+        ]),
+      )
+      expect(wire.sends.slice(0, 3)).toEqual([
+        'Bearer main-token',
+        'Bearer main-token',
+        'Bearer fallback-1-token',
+      ])
+
+      await owner.flush()
+      const store = openPoolStore({
+        provider: 'openai',
+        configPath: configFile,
+        statePath: stateFile,
+        quota: quotaCodec,
+      })
+      await store.replace(
+        'main',
+        {
+          type: 'oauth',
+          access: 'replacement-token',
+          refresh: 'replacement-refresh',
+          expires: Date.now() + HOUR,
+        },
+        { identity: 'chatgpt-replacement' },
+      )
+      await source.limitsForRequest()
+      expect(
+        projectOpenCodeMarks(owner.snapshot(), source.limitsBindings()),
+      ).toEqual(new Map())
+    } finally {
+      refusal.resolve(new Response('released'))
+    }
+  })
+
+  it('OA-19/24 OC1 HTTP clean body end clears an expired probe once, never a live mark or failed SSE', async () => {
+    let now = HTTP_NOW
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    const liveReply = Promise.withResolvers<Response>()
+    try {
+      seedPool('main-first', [{ id: 'main', quota: healthy() }])
+      let failed = false
+      const dispatched = Promise.withResolvers<void>()
+      let first = true
+      installWire({
+        usage: () => new Response('', { status: 503 }),
+        respond: () => {
+          if (first) {
+            first = false
+            dispatched.resolve()
+            return liveReply.promise
+          }
+          return failed
+            ? new Response('data: {"type":"response.failed"}\n\n', {
+                headers: { 'content-type': 'text/event-stream' },
+              })
+            : new Response('clean sentinel')
+        },
+      })
+      const send = await loadFetch()
+      const { owner, source } = await otherLimitsOwner()
+      const inFlight = send(URL_RESPONSES, request())
+      await dispatched.promise
+      const binding = source.limitsBindings()[0]!
+      const probe = owner.observe(binding)!
+      owner.enqueue({
+        type: 'mark',
+        binding,
+        baseRevision: probe.baseRevision,
+        producerId: 'test',
+        operationId: 'seed-mark',
+        scope: { kind: 'pool' },
+        window: 'account',
+        cause: 'rate-limit',
+        until: HTTP_NOW + 1000,
+        evidenceAt: HTTP_NOW,
+        mergeLaw: 'max-until',
+      })
+      liveReply.resolve(new Response('clean sentinel'))
+      expect(await (await inFlight).text()).toBe('clean sentinel')
+      await owner.flush()
+      expect(owner.snapshot()?.operationIds).toHaveLength(1)
+      expect(owner.snapshot()?.marks).toHaveLength(1)
+      now += 2000
+      failed = true
+      await (await send(URL_RESPONSES, request())).text()
+      await owner.flush()
+      expect(owner.snapshot()?.operationIds).toHaveLength(1)
+      failed = false
+      for (let i = 0; i < 2; i++) {
+        expect(await (await send(URL_RESPONSES, request())).text()).toBe(
+          'clean sentinel',
+        )
+        await owner.flush()
+        expect(owner.snapshot()?.operationIds).toHaveLength(2)
+        expect(owner.snapshot()?.marks).toEqual([])
+      }
+    } finally {
+      liveReply.resolve(new Response('released'))
+      clock.mockRestore()
+    }
+  })
+
+  it('OC1 HTTP SSE quota follows the sending account even after another account serves the session', async () => {
+    seedPool('main-first', [
+      { id: 'main', quota: healthy() },
+      { id: 'fallback-1', quota: healthy() },
+    ])
+    let stream!: ReadableStreamDefaultController<Uint8Array>
+    let first = true
+    const wire = installWire({
+      usage: () => new Response('', { status: 503 }),
+      respond: (sent) => {
+        if (sent === 'Bearer fallback-1-token')
+          return new Response('B sentinel')
+        if (!first) return new Response('backoff', { status: 403 })
+        first = false
+        return new Response(
+          new ReadableStream({
+            start: (controller) => {
+              stream = controller
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      },
+    })
+    const send = await loadFetch()
+    const firstResponse = await send(URL_RESPONSES, request('overlapping-sse'))
+    try {
+      expect(
+        await (await send(URL_RESPONSES, request('overlapping-sse'))).text(),
+      ).toBe('B sentinel')
+      const head = 'data: {"type":"codex.rate_'
+      const tail = `limits","rate_limits":{"primary":{"used_percent":42,"window_minutes":300,"reset_at":${Math.floor((Date.now() + HOUR) / 1000)}}}}\r\n\r\n`
+      const encode = new TextEncoder()
+      stream.enqueue(encode.encode(head))
+      stream.enqueue(encode.encode(tail))
+      stream.close()
+      expect(await firstResponse.text()).toBe(head + tail)
+      expect(wire.sends).toEqual([
+        'Bearer main-token',
+        'Bearer main-token',
+        'Bearer fallback-1-token',
+      ])
+      await waitFor(
+        () => (poolPrimaryUsed('main') === 42 ? true : undefined),
+        2000,
+        'SSE quota persisted on A',
+      )
+      expect(poolPrimaryUsed('fallback-1')).toBe(10)
+    } finally {
+      await firstResponse.body?.cancel().catch(() => {})
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Serving and recording
 // ---------------------------------------------------------------------------
@@ -559,6 +968,7 @@ describe('a migrated install serves requests from the account pool', () => {
               ),
       })
       const fetchOverride = await loadFetch()
+      const { owner, source } = await otherLimitsOwner()
       await (await fetchOverride(URL_RESPONSES, request('hold-session'))).text()
       limited = true
       const held = await fetchOverride(URL_RESPONSES, request('hold-session'))
@@ -566,6 +976,9 @@ describe('a migrated install serves requests from the account pool', () => {
       expect(await held.text()).toBe(
         '{"error":{"message":"OpenAI usage limit reached on this account. Waiting for it keeps the conversation\'s prompt cache. Retry in 1m.","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}',
       )
+      expect(
+        projectOpenCodeMarks(owner.snapshot(), source.limitsBindings()),
+      ).toEqual(new Map([['main', start + 60_000]]))
       now += 10_001
       expect(
         (

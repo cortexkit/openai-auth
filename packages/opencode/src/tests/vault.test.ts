@@ -2031,6 +2031,102 @@ describe('refresh', () => {
 })
 
 describe('routing', () => {
+  test('OC1 vault HTTP writes the 429 mark under the served route for another owner', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    installWire()
+    const wire = globalThis.fetch
+    const sent: (string | null)[] = []
+    globalThis.fetch = (async (input, init) => {
+      if (!String(input).includes('/responses')) return wire(input, init)
+      sent.push(new Headers(init?.headers).get('authorization'))
+      return new Response('vault limited', {
+        status: 429,
+        headers: { 'retry-after': '1.5' },
+      })
+    }) as typeof fetch
+    const now = Date.now()
+    const time = spyOn(Date, 'now').mockReturnValue(now)
+    const { vault } = await plugin()
+    const send = await fetchOverride()
+    const pool = new PoolAccountSource({
+      paths: () => ({
+        configPath: files.configFile,
+        statePath: files.stateFile,
+      }),
+      refreshProvider: async () => {
+        throw new Error('vault must not refresh the pool')
+      },
+      pullQuota: async () => {
+        throw new Error('vault must not poll the pool')
+      },
+    })
+    const reader = new OpenCodeLimitSource({ pool, vault })
+    try {
+      await reader.forRequest()
+      const [route] = vault.routes()
+      expect(route).toBeDefined()
+      const response = await request(send)
+      expect(response.status).toBe(429)
+      expect(await response.text()).toBe('vault limited')
+      expect(sent).toEqual([`Bearer ${VAULT_ACCESS}`])
+      expect(reader.marks()).toEqual(new Map([[route!.id, now + 1500]]))
+    } finally {
+      await reader.dispose()
+      time.mockRestore()
+    }
+  })
+
+  test('OC1 vault HTTP SSE forwards a quota frame under the response receipt', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    installWire()
+    const wire = globalThis.fetch
+    const event = {
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: {
+          used_percent: 37,
+          window_minutes: 300,
+          reset_at: 1_900_000_000,
+        },
+      },
+    }
+    const body = `data: ${JSON.stringify(event)}\n\n`
+    globalThis.fetch = (async (input, init) => {
+      if (!String(input).includes('/responses')) return wire(input, init)
+      expect(new Headers(init?.headers).get('authorization')).toBe(
+        `Bearer ${VAULT_ACCESS}`,
+      )
+      return new Response(body, {
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    }) as typeof fetch
+    const { vault } = await plugin()
+    const send = await fetchOverride()
+    const record = spyOn(vault, 'recordSnapshot')
+    const report = spyOn(vault, 'reportUsage')
+    try {
+      expect(await (await request(send)).text()).toBe(body)
+      const headers = report.mock.calls.find(([, reply]) => 'headers' in reply)
+      expect(headers?.[2].credentialId).toBe('oauth:openai:vault')
+      expect(report).toHaveBeenCalledWith(
+        headers![0],
+        { frame: event },
+        headers![2],
+      )
+      expect(record).toHaveBeenCalledWith(
+        headers![0],
+        { primary: expect.objectContaining({ usedPercent: 37 }) },
+        true,
+        headers![2],
+      )
+    } finally {
+      record.mockRestore()
+      report.mockRestore()
+    }
+  })
+
   test('an approval between requests switches from the local row to the vault without a poll', async () => {
     const running = await startDaemon({
       'oauth:openai:vault': vaultLogin('chatgpt-vault'),

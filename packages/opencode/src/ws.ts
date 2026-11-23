@@ -1326,13 +1326,20 @@ export * as OpenAIWebSocket from './ws'
 export function observeHttpCompletion(
   response: Response,
   onEnd: (clean: boolean) => void,
+  options?: {
+    onReadEnd?: () => void
+    onRateLimits?: (frame: Parameters<typeof normalizeWsFrame>[0]) => void
+  },
 ): Response {
-  if (
-    !response.ok ||
-    !response.body ||
-    !response.headers.get('content-type')?.includes('text/event-stream')
-  )
+  if (!response.ok) return response
+  if (!response.body) {
+    options?.onReadEnd?.()
     return response
+  }
+  const sse = response.headers
+    .get('content-type')
+    ?.includes('text/event-stream')
+  if (!sse && !options?.onReadEnd) return response
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let pending = ''
@@ -1358,6 +1365,7 @@ export function observeHttpCompletion(
       if (!data || data === '[DONE]') continue
       try {
         const event = JSON.parse(data)
+        if (event.type === 'codex.rate_limits') options?.onRateLimits?.(event)
         if (event.type === 'response.completed' && !completed) {
           completed = true
           logInputTransformations(event.response, 'http', 'opencode1')
@@ -1387,11 +1395,14 @@ export function observeHttpCompletion(
         try {
           const chunk = await reader.read()
           if (chunk.done) {
-            inspect(decoder.decode())
-            onEnd(completed && !failed)
+            if (sse) {
+              inspect(decoder.decode())
+              onEnd(completed && !failed)
+            }
+            if (!failed && (!sse || !pending.trim())) options?.onReadEnd?.()
             controller.close()
           } else {
-            inspect(decoder.decode(chunk.value, { stream: true }))
+            if (sse) inspect(decoder.decode(chunk.value, { stream: true }))
             controller.enqueue(chunk.value)
           }
         } catch (error) {
