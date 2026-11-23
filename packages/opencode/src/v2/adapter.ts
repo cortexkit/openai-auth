@@ -2375,8 +2375,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       },
     ) {
       const signal = input.rerouteFrom?.limit
-      // The installer releases the old choice just before rechecking a hold's
-      // checkpoint. Only a release outside transport selection ends that wait.
+      // When routing told a request to wait on its account, the installer
+      // releases the old choice just before it checks whether that wait should
+      // continue. Only a release outside transport selection ends the wait.
       if (signal && input.duringTransportSelection === false)
         routingHoldEnds.get(signal)?.('cancelled')
       const key = receiptKey(input)
@@ -2875,8 +2876,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           failed: routingFailures.has(attempt),
         })
       if (data?.kind !== 'vault' || !terminal401s.has(attempt)) return
-      // The vault consumer drops an outage-cached receipt without sending an
-      // authentication failure report to the vault.
+      // When this receipt was the last good token kept while the vault was
+      // unreachable, the vault consumer drops it instead of reporting the 401.
       await vault?.reportFailure(data.receipt, 401)
     },
   }
