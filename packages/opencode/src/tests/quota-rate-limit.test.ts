@@ -1047,23 +1047,53 @@ describe('OC1 shared limit transport lifecycle', () => {
     expect(f.legacySpy).not.toHaveBeenCalled()
   })
 
-  it('HTTP 429 records no mark and a clean HTTP completion accepts dispatch time, not EOF', async () => {
+  it('HTTP 429 marks both attempted accounts and a reissue sends nothing while both marks are live', async () => {
     const f = await fixture({ ws: false })
-    f.http(429, '{"error":{"type":"usage_limit_reached"}}')
-    await (await f.request()).text()
-    expect(f.limits().owner()?.snapshot()?.operationIds).toHaveLength(0)
+    const refusal = '{"error":{"type":"usage_limit_reached"}}'
+    f.http(429, refusal)
+    const limited = await f.request()
+    expect(limited.status).toBe(429)
+    expect(await limited.text()).toBe(refusal)
+    const owner = f.limits().owner()
+    await owner?.flush()
+    expect(owner?.snapshot()?.operationIds).toHaveLength(2)
+    expect(f.limits().marks()).toEqual(
+      new Map([
+        ['main', 1_800_000_060_000],
+        ['b', 1_800_000_060_000],
+      ]),
+    )
+
+    const completed = 'data: {"type":"response.completed"}\n\n'
+    f.http(200, completed)
+    const blocked = await f.request()
+    expect(blocked.status).toBe(429)
+    expect(await blocked.text()).not.toBe(refusal)
+    expect(f.wire).toEqual(['Bearer main-token', 'Bearer b-token'])
     expect(f.limits().activity.get('limit-session')).toBeUndefined()
+
+    f.advance(60_000)
+    const admitted = await f.request()
+    expect(admitted.status).toBe(200)
+    expect(await admitted.text()).toBe(completed)
+    expect(f.wire).toEqual([
+      'Bearer main-token',
+      'Bearer b-token',
+      'Bearer main-token',
+    ])
+    expect(f.legacySpy).not.toHaveBeenCalled()
+  })
+
+  it('a clean HTTP completion accepts dispatch time, not EOF', async () => {
+    const f = await fixture({ ws: false })
     let complete = () => {}
+    const completed = 'data: {"type":"response.completed"}\n\n'
     f.http(
       200,
       new ReadableStream<Uint8Array>({
         start(controller) {
           complete = () => {
-            controller.enqueue(
-              new TextEncoder().encode(
-                'data: {"type":"response.completed"}\n\n',
-              ),
-            )
+            controller.enqueue(new TextEncoder().encode(completed))
             controller.close()
           }
         },
@@ -1071,19 +1101,18 @@ describe('OC1 shared limit transport lifecycle', () => {
     )
     const dispatchedAt = f.now()
     const response = await f.request()
+    expect(response.status).toBe(200)
+    expect(f.wire).toEqual(['Bearer main-token'])
+    expect(f.limits().activity.get('limit-session')).toBeUndefined()
     f.advance(240_000)
     complete()
-    await response.text()
+    expect(await response.text()).toBe(completed)
     expect(f.limits().activity.get('limit-session')).toMatchObject({
       accountKey: f.limits().accountKey('main'),
       lastAcceptedAt: dispatchedAt,
       ttlMs: 300_000,
     })
-    expect(f.wire).toEqual([
-      'Bearer main-token',
-      'Bearer b-token',
-      'Bearer main-token',
-    ])
+    await f.limits().owner()?.flush()
     expect(f.legacySpy).not.toHaveBeenCalled()
     expect(f.limits().owner()?.snapshot()?.operationIds).toHaveLength(0)
   })
