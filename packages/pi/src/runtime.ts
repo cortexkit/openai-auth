@@ -9,13 +9,12 @@
 // account's token in place of Pi's: pi-ai derives the `chatgpt-account-id`
 // header from that token, so the token is the whole credential.
 //
-// An attempt that fails before streaming anything (an HTTP error answer) may
-// be sent again with another account: nothing reached Pi yet. Once an attempt
-// has streamed its first event, that attempt is the request's answer.
+// An attempt that fails before publishing output may hold or move to another
+// account. Once output reaches Pi, that attempt is the request's answer.
 //
 // Quota is recorded from every HTTP response's `x-codex-*` headers and from
-// every `codex.rate_limits` WebSocket frame, against the account whose token
-// produced it.
+// `codex.rate_limits` events on HTTP SSE and WebSocket, against the account
+// whose token produced them.
 //
 // Once Pi is connected to the Claustrum vault (`/openai` > Vault), Pi is in
 // vault mode: the OpenAI accounts the vault serves it are the only accounts
@@ -180,6 +179,8 @@ const TERMINAL_AFTER_OUTPUT_MESSAGE =
 
 /** An attempt as the router sees it, with the events it produced so far. */
 interface StreamAttempt extends RouteAttempt {
+  /** Only a real HTTP status can trigger vault credential recovery. */
+  httpStatus?: number
   /** The events through the first output or terminal event, held until selection. */
   buffered: AssistantMessageEvent[]
   /** The rest of the attempt's events, when it is streaming. */
@@ -667,7 +668,10 @@ export class PiOpenAIRuntime {
   }
 
   /** Credit quota to the account and vault credential that sent this request, not the socket's opener. */
-  observeWebSocketMessage(dispatch: PiQuotaDispatch, data: string): void {
+  observeWebSocketMessage(
+    dispatch: PiQuotaDispatch,
+    data: string,
+  ): OAuthQuotaSnapshot | undefined {
     if (!data.includes('codex.rate_limits')) return
     let event: unknown
     try {
@@ -675,20 +679,18 @@ export class PiOpenAIRuntime {
     } catch {
       return
     }
-    if (
-      !event ||
-      typeof event !== 'object' ||
-      (event as { type?: unknown }).type !== 'codex.rate_limits'
+    return this.recordQuotaEvent(dispatch, event)
+  }
+
+  private recordQuotaEvent(dispatch: PiQuotaDispatch, event: unknown) {
+    if (!isRecord(event) || event.type !== 'codex.rate_limits') return
+    const snapshot = normalizeWsFrame(
+      event as unknown as Parameters<typeof normalizeWsFrame>[0],
     )
-      return
-    this.recordQuota(
-      dispatch,
-      normalizeWsFrame(
-        event as Parameters<typeof normalizeWsFrame>[0],
-      ) as Record<string, unknown>,
-      true,
-      { frame: event },
-    )
+    this.recordQuota(dispatch, snapshot as Record<string, unknown>, true, {
+      frame: event,
+    })
+    return snapshot
   }
 
   // -------------------------------------------------------------------------
@@ -962,7 +964,7 @@ export class PiOpenAIRuntime {
   }
 
   /**
-   * Sends the request once with `token` and waits for output or termination.
+   * Calls pi-ai with one account's token and waits for output or termination.
    * Lifecycle events alone do not commit the attempt to a serving account.
    */
   private async attempt(
@@ -998,13 +1000,53 @@ export class PiOpenAIRuntime {
         freeQuota,
       )
     }
-    let status: number | undefined
-    let signal: LimitSignal | undefined
-    let reading: OAuthQuotaSnapshot | undefined
     const account = this.accounts(
       this.settings(this.storageCache?.storage ?? null),
     ).find((value) => value.id === accountId)
     const accountKey = account?.accountKey
+    const initialReading = windowsFromQuotaMap(account?.quota)
+    let reading = initialReading
+    let httpStatus: number | undefined
+    let httpBody: string | undefined
+    let headers: Headers | undefined
+    let limit: { signal: LimitSignal; body: unknown } | undefined
+    const status = () => limit?.signal.status ?? httpStatus
+    const beginSend = () => {
+      // pi-ai can retry a send or switch transports without ending its stream.
+      httpStatus = undefined
+      httpBody = undefined
+      headers = undefined
+      limit = undefined
+      reading = initialReading
+    }
+    const mergeReading = (snapshot: OAuthQuotaSnapshot | undefined) => {
+      if (!snapshot) return
+      const observedAt = this.now()
+      for (const window of [snapshot.primary, snapshot.secondary]) {
+        if (window) window.checkedAt = observedAt
+      }
+      reading = { ...reading, ...snapshot }
+    }
+    const reportLimit = () => {
+      if (
+        !receipt ||
+        !hasVaultRoutingAccessor() ||
+        limit?.signal.kind !== 'quota-exhausted'
+      )
+        return
+      const { signal, body } = limit
+      reportVaultRoutingLimit(
+        options?.sessionId,
+        receipt,
+        {
+          window: signal.reason,
+          resetAt: signal.windows.find(
+            (window) => window.confirmed && window.provenance === 'provider',
+          )?.resetAt,
+        },
+        { body, headers, quota: account?.quota, now: signal.observedAt },
+      )
+    }
     const dispatch: SessionDispatch | undefined =
       accountKey && options?.sessionId
         ? {
@@ -1014,7 +1056,6 @@ export class PiOpenAIRuntime {
             ttlMs: ttlForModel(JSON.stringify({ model: model.id })),
           }
         : undefined
-    let body: unknown
     let inner: AssistantMessageEventStream
     try {
       const send = options?.fetch ?? globalThis.fetch
@@ -1053,25 +1094,22 @@ export class PiOpenAIRuntime {
         // Scrub before pi-ai parses errors into its shared partial message objects.
         fetch: Object.assign(
           async (input: RequestInfo | URL, init?: RequestInit) => {
+            beginSend()
             try {
               const response = await send(
                 input,
                 input === httpUrl ? shapePiCodexHttpRequest(init) : init,
               )
-              // Never read an SSE success body: it may be an unbounded stream.
-              // The clone leaves the SDK's error bytes and response untouched.
-              if (response.status >= 400) {
-                try {
-                  body = await response.clone().text()
-                } catch {
-                  body = undefined
-                }
-              }
-              return await redactCredentialResponse(
+              const safe = await redactCredentialResponse(
                 response,
                 token,
                 'event-stream',
+                { boundRefusal: !!receipt && hasVaultRoutingAccessor() },
               )
+              // Read the same diagnostic pi-ai gets, never a second copy of
+              // the provider's potentially unbounded body.
+              if (safe.status === 429) httpBody = await safe.clone().text()
+              return safe
             } catch (error) {
               // pi-ai can inspect a fetch rejection before emitting its shared partial error.
               throw redactCredentialError(error, token)
@@ -1080,65 +1118,55 @@ export class PiOpenAIRuntime {
           send,
         ),
         onResponse: async (response, responseModel) => {
-          status = response.status
+          httpStatus = response.status
+          headers = new Headers(response.headers)
           this.recordHeaders(quotaDispatch, response.headers)
-          const observedAt = this.now()
-          const headersReading = normalizeQuotaHeaders(
-            new Headers(response.headers),
-          )
-          // Freshness must use the same clock as routing and stored observations.
-          for (const window of [
-            headersReading.primary,
-            headersReading.secondary,
-          ]) {
-            if (window) window.checkedAt = observedAt
-          }
-          reading = {
-            ...windowsFromQuotaMap(account?.quota),
-            ...headersReading,
-          }
-          if (accountKey && status === 429)
-            signal = classifyOpenAiLimitBody({
+          mergeReading(normalizeQuotaHeaders(headers))
+          limit = undefined
+          if (accountKey && httpStatus === 429) {
+            let body: unknown
+            if (httpBody !== undefined) {
+              try {
+                body = JSON.parse(httpBody)
+              } catch {
+                // A non-JSON diagnostic can only supply the HTTP status.
+              }
+            }
+            const signal = classifyOpenAiLimitBody({
               account: accountKey,
-              status,
-              headers: new Headers(response.headers),
+              status: httpStatus,
+              headers,
               body,
               now: this.now(),
               reading,
             })
-          if (
-            receipt &&
-            hasVaultRoutingAccessor() &&
-            signal?.kind === 'quota-exhausted'
-          ) {
-            let parsed = body
-            if (typeof parsed === 'string') {
-              try {
-                parsed = JSON.parse(parsed)
-              } catch {
-                parsed = undefined
-              }
-            }
-            // Report before routing chooses another account or waits on this one.
-            reportVaultRoutingLimit(
-              options?.sessionId,
-              receipt,
-              {
-                window: signal.reason,
-                resetAt: signal.windows.find(
-                  (window) =>
-                    window.confirmed && window.provenance === 'provider',
-                )?.resetAt,
-              },
-              {
-                body: parsed,
-                headers: new Headers(response.headers),
-                quota: account?.quota,
-                now: observedAt,
-              },
-            )
+            if (signal) limit = { signal, body }
           }
           await options?.onResponse?.(response, responseModel)
+        },
+        onProviderStreamEvent: async (event, eventModel) => {
+          // The bound WebSocket records quota before pi-ai dispatches this callback.
+          if (httpStatus !== undefined || !useWebSocketShim)
+            mergeReading(this.recordQuotaEvent(quotaDispatch, event))
+          if (
+            accountKey &&
+            isRecord(event) &&
+            event.type === 'response.failed'
+          ) {
+            const signal = classifyOpenAiLimitBody({
+              account: accountKey,
+              body: event,
+              headers,
+              now: this.now(),
+              reading,
+            })
+            if (signal)
+              limit = {
+                signal: { ...signal, status: signal.status ?? 429 },
+                body: structuredClone(event),
+              }
+          }
+          await options?.onProviderStreamEvent?.(event, eventModel)
         },
       }
       const start = () => this.deps.streamSimple(model, context, streamOptions)
@@ -1149,14 +1177,15 @@ export class PiOpenAIRuntime {
               token,
               owner: this,
               sessionId: effortSessionId,
+              onSend: beginSend,
               onMessage: (data) =>
-                this.observeWebSocketMessage(quotaDispatch, data),
+                mergeReading(this.observeWebSocketMessage(quotaDispatch, data)),
             },
             start,
           )
         : start()
     } catch (error) {
-      billing?.end(false, false, status)
+      billing?.end(false, false, status())
       return {
         buffered: [
           errorEvent(model, redactCredentialError(error, token).message),
@@ -1179,12 +1208,15 @@ export class PiOpenAIRuntime {
             else if (event.type === 'error') {
               billing.piResponseId(event.error.responseId)
               if (event.reason !== 'aborted') billing.event({ type: 'error' })
-              // Routing may discard an unpublished error without draining the iterator.
-              billing.end(outputStarted, false, status)
             }
           }
           if (event.type === 'error') {
             failed = true
+            // Only pi-ai's terminal result can make the wire observation a
+            // routing outcome. A retry or fallback inside pi-ai may succeed.
+            if (event.reason !== 'aborted') reportLimit()
+            // Routing may discard an unpublished error without draining the iterator.
+            billing?.end(outputStarted, false, status())
             // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
             event.error.errorMessage =
               outputStarted && event.reason !== 'aborted'
@@ -1207,7 +1239,7 @@ export class PiOpenAIRuntime {
             },
           )
       } catch (error) {
-        billing?.end(outputStarted, false, status)
+        billing?.end(outputStarted, false, status())
         yield errorEvent(
           model,
           outputStarted
@@ -1215,7 +1247,7 @@ export class PiOpenAIRuntime {
             : redactCredentialError(error, token).message,
         )
       } finally {
-        billing?.end(outputStarted, stopped && !failed, status)
+        billing?.end(outputStarted, stopped && !failed, status())
       }
     })()
     const buffered: AssistantMessageEvent[] = []
@@ -1233,12 +1265,16 @@ export class PiOpenAIRuntime {
         break
       }
     }
+    const attemptStatus = status()
     return {
       // The observed status still reaches billing. Neither the account router
       // nor vault credential recovery may use it to replay an output attempt.
-      ...(status !== undefined && !outputStarted ? { status } : {}),
+      ...(attemptStatus !== undefined && !outputStarted
+        ? { status: attemptStatus }
+        : {}),
+      ...(httpStatus !== undefined && !outputStarted ? { httpStatus } : {}),
       ...(accountKey ? { accountKey } : {}),
-      ...(signal && !outputStarted ? { signal } : {}),
+      ...(limit && !outputStarted ? { signal: limit.signal } : {}),
       ...(reading ? { reading } : {}),
       buffered,
       rest,
@@ -1275,7 +1311,7 @@ export class PiOpenAIRuntime {
           execution,
           freeQuota,
         )
-        return new Response(null, { status: last.status ?? 200 })
+        return new Response(null, { status: last.httpStatus ?? 200 })
       },
       { site: 'model', ...(options?.signal ? { signal: options.signal } : {}) },
     )

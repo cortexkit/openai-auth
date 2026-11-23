@@ -168,7 +168,7 @@ describe('evidence-table confirmation', () => {
             body: {
               type: 'response.failed',
               response: {
-                error: { [field]: reason, resets_at: (now + 60000) / 1000 },
+                error: { [field]: reason },
               },
             },
             now,
@@ -182,6 +182,30 @@ describe('evidence-table confirmation', () => {
       }
     },
   )
+  test('failed-event usage reset uses the same absolute-before-relative rule as HTTP 429', () => {
+    const signal = classifyOpenAiLimitBody({
+      account: a,
+      body: {
+        type: 'response.failed',
+        status: 429,
+        response: {
+          error: {
+            code: 'usage_limit_reached',
+            resets_at: 1800000060,
+            resets_in_seconds: 90,
+          },
+        },
+      },
+      now,
+    })
+    expect(signal?.windows[0]).toMatchObject({
+      window: 'usage',
+      confirmed: true,
+      resetAt: 1800000060000,
+      provenance: 'provider',
+    })
+    expect(signal?.status).toBe(429)
+  })
   test('cloned raw body uses positive absolute before relative reset, not Retry-After', () => {
     const signal = classifyOpenAiLimitBody({
       account: a,

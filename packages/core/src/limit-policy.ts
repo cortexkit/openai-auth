@@ -192,7 +192,7 @@ export function classifyOpenAiLimitBody(input: {
     ? openAiSignalWindows(
         {
           window: reason ?? 'rate_limit',
-          resetAt: failed ? undefined : resetAt,
+          resetAt,
         },
         input.now,
         input.reading,

@@ -32,6 +32,7 @@ import {
   type Context,
   createAssistantMessageEventStream,
   type Model,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
@@ -180,7 +181,7 @@ function runtimeWith(target: OpenAiVault, webSocket = false): PiOpenAIRuntime {
 
 async function send(
   runtime: PiOpenAIRuntime,
-  options: { sessionId?: string; apiKey?: string } = {},
+  options: SimpleStreamOptions = {},
 ): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = []
   const stream = runtime.stream(MODEL, CONTEXT, {
@@ -213,6 +214,200 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('vault slow and oversized diagnostics are bounded for pi-ai without rewriting an ordinary refusal', async () => {
+    Reflect.set(globalThis, routingKey, () => ({}))
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const encoder = new TextEncoder()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    let sentAt = 0
+    const slow = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('partial provider text'))
+            timer = setTimeout(() => controller.close(), 3000)
+          },
+          cancel() {
+            cancelled = true
+            clearTimeout(timer)
+          },
+        }),
+        { status: 403 },
+      )
+    let sentBytes = 0
+    let overflowCancelled = false
+    const oversized = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(65_536).fill(120))
+            controller.enqueue(encoder.encode('x'))
+            sentBytes = 65_537
+            timer = setTimeout(() => controller.close(), 100)
+          },
+          cancel() {
+            overflowCancelled = true
+            clearTimeout(timer)
+          },
+        }),
+        { status: 429 },
+      )
+    const refusal = async (body: () => Response) => {
+      const options = {
+        maxRetries: 0,
+        fetch: (async () => {
+          sentAt = performance.now()
+          return body()
+        }) as unknown as typeof fetch,
+      }
+      const event = (await send(runtime, options)).at(-1)
+      expect(event?.type).toBe('error')
+      return event?.type === 'error' ? event.error.errorMessage : undefined
+    }
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      expect(await refusal(slow)).toBe('No diagnostic was received.')
+      const elapsed = performance.now() - sentAt
+      expect(elapsed).toBeGreaterThanOrEqual(1900)
+      expect(elapsed).toBeLessThan(3000)
+      expect(cancelled).toBe(true)
+      expect(await refusal(oversized)).toBe('No diagnostic was received.')
+      expect(sentBytes).toBe(65_537)
+      expect(overflowCancelled).toBe(true)
+      expect(
+        await refusal(
+          () => new Response('ordinary provider refusal', { status: 403 }),
+        ),
+      ).toBe('ordinary provider refusal')
+    } finally {
+      clearTimeout(timer)
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
+
+  test('OA-57 a successful pi-ai HTTP retry does not report or act on the first limit', async () => {
+    const reports: Record<string, unknown>[] = []
+    let asks = 0
+    Reflect.set(globalThis, routingKey, () => ({
+      report(payload: Record<string, unknown>) {
+        reports.push(payload)
+      },
+      accountFor() {
+        asks++
+      },
+    }))
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const decisions: PolicyFacts[] = []
+    const waits: number[] = []
+    const runtime = new PiOpenAIRuntime({
+      streamSimple,
+      createStream: createAssistantMessageEventStream,
+      paths: () => paths,
+      vault: target,
+      fetchImpl: fakeFetch,
+      firstReadingWaitMs: 0,
+      onLimitDecision: (_decision, facts) => decisions.push(facts),
+      waitForPi: async (delay) => {
+        waits.push(delay)
+        return 'elapsed'
+      },
+    })
+    runtime.setWorkingMessage = () => {}
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      codexStatus = () => (codexTokens.length === 1 ? 429 : 200)
+      codexErrorBody =
+        '{"error":{"type":"usage_limit_reached","rate_limit_reached_type":"primary","resets_in_seconds":60}}'
+      codexReplyHeaders = { 'retry-after': '0' }
+      const events = await send(runtime, {
+        maxRetries: 1,
+        sessionId: 'session-1',
+      })
+      expect(events.at(-1)?.type).toBe('done')
+      expect(codexTokens).toEqual([VAULT_ACCESS, VAULT_ACCESS])
+      expect(waits).toEqual([])
+      expect(asks).toBe(0)
+      expect(decisions).toEqual([])
+      expect(reports).toEqual([
+        expect.objectContaining({
+          kind: 'billing',
+          attempt: 1,
+          outcome: 'completed',
+          status: 200,
+          credential_id: 'oauth:openai:vault',
+        }),
+      ])
+    } finally {
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
+
+  test('Pi attributes SSE-only codex.rate_limits to the receipt that sent the request', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 3,
+        }),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const usage = spyOn(target, 'reportUsage')
+    const quota = {
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 77, window_minutes: 300 } },
+    }
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      usage.mockClear()
+      const events = await send(runtime, {
+        fetch: (async () =>
+          new Response(
+            `data: ${JSON.stringify(quota)}\n\n${await sseOk().text()}`,
+            { headers: { 'content-type': 'text/event-stream' } },
+          )) as unknown as typeof fetch,
+      })
+      expect(events.at(-1)?.type).toBe('done')
+      const accountId = target.routes()[0]?.id
+      if (!accountId) throw new Error('Expected a served vault route')
+      expect(
+        usage.mock.calls.filter(([, reading]) => 'frame' in reading),
+      ).toEqual([
+        [
+          accountId,
+          { frame: quota },
+          expect.objectContaining({
+            credentialId: 'oauth:openai:vault',
+            recordVersion: 3,
+            accountIdentity: 'chatgpt-vault',
+          }),
+        ],
+      ])
+    } finally {
+      usage.mockRestore()
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
   for (const scenario of [
     { name: 'usage-limit refusal', accessor: true, wait: false, usage: true },
     {

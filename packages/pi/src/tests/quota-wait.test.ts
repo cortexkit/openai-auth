@@ -26,7 +26,15 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
+import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
+import { installRawCodexWebSocket } from '../codex-websocket.ts'
+import { RawWebSocket } from '../raw-ws-node.ts'
+import {
+  clearPiStickyRouting,
+  getPiStickyRouting,
+  setPiStickyRouting,
+} from '../routing.ts'
 import { PiOpenAIRuntime, type PiOpenAIRuntimeDeps } from '../runtime.ts'
 import { isolatePiAgentDir } from './test-isolation.ts'
 
@@ -52,17 +60,19 @@ function jwt(identity: string, nonce = '') {
 }
 const MAIN = jwt('main')
 const B = jwt('beta')
-function ok(tail = '') {
+const textFrames = [
+  '{"type":"response.output_item.added","item":{"type":"message","id":"m","role":"assistant","status":"in_progress","content":[]}}',
+  '{"type":"response.output_text.delta","item_id":"m","delta":"hello"}',
+  '{"type":"response.output_item.done","item":{"type":"message","id":"m","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}}',
+]
+const completed =
+  '{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}'
+function ok(tail = `data: ${completed}`) {
   return new Response(
-    [
-      'data: {"type":"response.output_item.added","item":{"type":"message","id":"m","role":"assistant","status":"in_progress","content":[]}}',
-      'data: {"type":"response.output_text.delta","item_id":"m","delta":"hello"}',
-      'data: {"type":"response.output_item.done","item":{"type":"message","id":"m","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}}',
-      tail ||
-        'data: {"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
-      '',
-    ].join('\n\n'),
-    { headers: { 'content-type': 'text/event-stream' } },
+    [...textFrames.map((frame) => `data: ${frame}`), tail, ''].join('\n\n'),
+    {
+      headers: { 'content-type': 'text/event-stream' },
+    },
   )
 }
 
@@ -124,6 +134,7 @@ beforeEach(async () => {
   }, paths)
 })
 afterEach(async () => {
+  clearPiStickyRouting('stream-limit')
   if (originalRouting)
     Object.defineProperty(globalThis, routingKey, originalRouting)
   else Reflect.deleteProperty(globalThis, routingKey)
@@ -180,9 +191,10 @@ async function start(overrides: Partial<PiOpenAIRuntimeDeps> = {}, ui = true) {
 async function send(
   options: SimpleStreamOptions = {},
   events: AssistantMessageEvent[] = [],
+  model = MODEL,
 ) {
   for await (const event of runtime.stream(
-    MODEL,
+    model,
     { messages: [{ role: 'user', content: 'hi', timestamp: 0 }] },
     {
       apiKey: MAIN,
@@ -240,6 +252,308 @@ async function addB() {
     },
   })
 }
+
+const heldFrames = [
+  '{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"empty-rs","summary":[]}}',
+  '{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":""}',
+  '{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"empty-rs","summary":[]}}',
+]
+
+function withSseFrames(frames: string[]) {
+  return new Response(frames.map((frame) => `data: ${frame}\n\n`).join(''), {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
+function withWebSocketPeer(framesFor: (token: string) => string[]) {
+  const sentFrames: string[] = []
+  const seamFrames: string[] = []
+  const tokens: string[] = []
+  const rawSend = RawWebSocket.prototype.send
+  const seam = spyOn(RawWebSocket.prototype, 'send').mockImplementation(
+    function (this: RawWebSocket, data: string) {
+      expect(globalThis.WebSocket.name).toBe('PiRawCodexWebSocket')
+      expect(this).toBeInstanceOf(globalThis.WebSocket)
+      seamFrames.push(data)
+      rawSend.call(this, data)
+    },
+  )
+  const server = Bun.serve<string>({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request, server) {
+      const token = request.headers.get('authorization')?.slice(7) ?? ''
+      if (server.upgrade(request, { data: token })) return
+      return new Response(null, { status: 400 })
+    },
+    websocket: {
+      message(socket, data) {
+        tokens.push(socket.data)
+        sentFrames.push(data.toString())
+        for (const frame of framesFor(socket.data)) socket.send(frame)
+      },
+    },
+  })
+  return {
+    model: { ...MODEL, baseUrl: server.url.href },
+    expectSends(expected: string[]) {
+      expect(tokens).toEqual(expected)
+      expect(sends).toEqual([])
+      expect(sentFrames).toHaveLength(expected.length)
+      expect(sentFrames).toEqual(seamFrames)
+    },
+    async stop(sessionId: string) {
+      closeOpenAICodexWebSocketSessions(sessionId)
+      seam.mockRestore()
+      await server.stop(true)
+    },
+  }
+}
+
+describe('Pi routed Codex transport limits', () => {
+  const sessionId = 'stream-limit'
+  async function startSticky() {
+    await addB()
+    await mutateAccounts((storage) => {
+      storage.routing = { mode: 'sticky-balanced', maxSameAccountWait: 15 }
+      return storage
+    }, paths)
+    setPiStickyRouting(sessionId, 'main')
+  }
+
+  for (const [transport, move, hold] of [
+    [
+      'HTTP 429',
+      'OA-58 HTTP 429 confirmed usage limit moves the sticky session without a fitting cache',
+      'OA-58 HTTP 429 confirmed usage limit holds for a fitting cache',
+    ],
+    [
+      'SSE',
+      'OA-58 SSE confirmed usage limit moves the sticky session without a fitting cache',
+      'OA-58 SSE confirmed usage limit holds for a fitting cache',
+    ],
+    [
+      'WebSocket',
+      'OA-58 WebSocket confirmed usage limit moves the sticky session without a fitting cache',
+      'OA-58 WebSocket confirmed usage limit holds for a fitting cache',
+    ],
+  ] as const) {
+    for (const fitting of [false, true]) {
+      test(fitting ? hold : move, async () => {
+        await startSticky()
+        const waits: number[] = []
+        let refusing = false
+        await start({
+          installWebSocket: installRawCodexWebSocket,
+          waitForPi: async (delay) => {
+            waits.push(delay)
+            now += delay
+            refusing = false
+            return 'elapsed'
+          },
+        })
+        const frame =
+          '{"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"provider limit on A","resets_at":1900000060}}}'
+        const framesFor = (token: string) =>
+          refusing && token === MAIN
+            ? [...heldFrames, frame]
+            : [...textFrames, completed]
+        reply = (token) => {
+          if (transport === 'SSE') return withSseFrames(framesFor(token))
+          if (!refusing || token !== MAIN) return ok()
+          return Response.json(
+            {
+              error: {
+                type: 'usage_limit_reached',
+                message: 'provider limit on A',
+                resets_at: 1900000060,
+              },
+            },
+            { status: 429 },
+          )
+        }
+        const peer =
+          transport === 'WebSocket' ? withWebSocketPeer(framesFor) : undefined
+        try {
+          const opts: SimpleStreamOptions = {
+            sessionId,
+            maxRetries: 0,
+            transport: peer ? 'websocket-cached' : 'sse',
+          }
+          const model = peer?.model ?? MODEL
+          if (fitting)
+            expect((await send(opts, [], model)).at(-1)?.type).toBe('done')
+          refusing = true
+          const events = await send(opts, [], model)
+          expect(events.map((event) => event.type)).toEqual([
+            'start',
+            'text_start',
+            'text_delta',
+            'text_end',
+            'done',
+          ])
+          expect(events[2]).toMatchObject({ delta: 'hello' })
+          expect(waits).toEqual(fitting ? [60_000] : [])
+          expect(runtime.main.quotaSnapshot()?.primary?.usedPercent).toBe(10)
+          expect(getPiStickyRouting(sessionId)).toBe(fitting ? 'main' : 'beta')
+          expect(decisions[0]?.decision.action).toBe(
+            fitting ? 'hold' : 'reroute',
+          )
+          expect(decisions[0]?.facts).toMatchObject({
+            status: 429,
+            signal: {
+              kind: 'quota-exhausted',
+              status: 429,
+              windows: [
+                { window: 'usage', confirmed: true, resetAt: 1900000060000 },
+              ],
+            },
+          })
+          const expected = fitting ? [MAIN, MAIN, MAIN] : [MAIN, B]
+          if (peer) peer.expectSends(expected)
+          else expect(sends).toEqual(expected)
+        } finally {
+          await peer?.stop(sessionId)
+        }
+      })
+    }
+  }
+
+  for (const { title, error, status, expected, expectedStatus } of [
+    {
+      title:
+        'OA-55 SSE code-only usage_limit_reached confirms without status or reset',
+      error: { code: 'usage_limit_reached' },
+      status: undefined,
+      expectedStatus: 429,
+      expected: 'reroute',
+    },
+    {
+      title: 'OA-55 SSE type-only rate_limit_exceeded at 429 is not exhaustion',
+      error: { type: 'rate_limit_exceeded', resets_at: 1900000060 },
+      status: 429,
+      expectedStatus: 429,
+      expected: 'retain',
+    },
+    {
+      title: 'OA-55 SSE code takes precedence over a usage-limit type',
+      error: { code: 'unrelated', type: 'usage_limit_reached' },
+      status: 429,
+      expectedStatus: undefined,
+      expected: undefined,
+    },
+    {
+      title: 'OA-55 SSE an explicit 403 is not replaced with 429',
+      error: { code: 'usage_limit_reached' },
+      status: 403,
+      expectedStatus: 403,
+      expected: 'reroute',
+    },
+  ] as const)
+    test(title, async () => {
+      await startSticky()
+      await start()
+      reply = (token) =>
+        token === MAIN
+          ? withSseFrames([
+              ...heldFrames,
+              JSON.stringify({
+                type: 'response.failed',
+                status,
+                response: { error },
+              }),
+            ])
+          : ok()
+      const events = await send({ sessionId, maxRetries: 0 })
+      expect(decisions[0]?.decision.action).toBe(expected)
+      expect(decisions[0]?.facts.status).toBe(expectedStatus)
+      expect(decisions[0]?.facts.signal?.kind).toBe(
+        expected === 'retain'
+          ? 'rate-limit'
+          : expected === 'reroute'
+            ? 'quota-exhausted'
+            : undefined,
+      )
+      expect(sends).toEqual(expected === 'reroute' ? [MAIN, B] : [MAIN])
+      expect(events.at(-1)?.type).toBe(
+        expected === 'reroute' ? 'done' : 'error',
+      )
+    })
+
+  test('OA-57 rejected WebSocket upgrade and unclassified fallback failure do not guess a status', async () => {
+    await addB()
+    await start({ installWebSocket: installRawCodexWebSocket })
+    const upgrades: string[] = []
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(request) {
+        upgrades.push(request.headers.get('authorization') ?? '')
+        return new Response('not a quota response', { status: 429 })
+      },
+    })
+    try {
+      reply = () => {
+        throw new Error('fallback failed without an HTTP response')
+      }
+      const events = await send(
+        {
+          sessionId: 'failed-upgrade',
+          transport: 'websocket-cached',
+          maxRetries: 0,
+        },
+        [],
+        { ...MODEL, baseUrl: server.url.href },
+      )
+      expect(upgrades).toEqual([`Bearer ${MAIN}`])
+      expect(sends).toEqual([MAIN])
+      expect(decisions).toEqual([])
+      expect(text(events)).toContain('fallback failed without an HTTP response')
+    } finally {
+      closeOpenAICodexWebSocketSessions('failed-upgrade')
+      await server.stop(true)
+    }
+  })
+
+  test('OA-60 WebSocket usage limit after published text does not reroute or hold', async () => {
+    await startSticky()
+    const waits: number[] = []
+    await start({
+      installWebSocket: installRawCodexWebSocket,
+      waitForPi: async (delay) => {
+        waits.push(delay)
+        return 'elapsed'
+      },
+    })
+    const peer = withWebSocketPeer(() => [
+      ...textFrames,
+      '{"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"late WebSocket quota limit","resets_at":1900000060}}}',
+    ])
+    try {
+      const events = await send(
+        { sessionId, transport: 'websocket-cached', maxRetries: 0 },
+        [],
+        peer.model,
+      )
+      peer.expectSends([MAIN])
+      expect(events.map((event) => event.type)).toEqual([
+        'start',
+        'text_start',
+        'text_delta',
+        'text_end',
+        'error',
+      ])
+      expect(events[2]).toMatchObject({ delta: 'hello' })
+      expect(text(events)).toContain('It was not sent again')
+      expect(text(events)).not.toContain('late WebSocket quota limit')
+      expect(waits).toEqual([])
+      expect(decisions).toEqual([])
+      expect(getPiStickyRouting(sessionId)).toBe('main')
+    } finally {
+      await peer.stop(sessionId)
+    }
+  })
+})
 
 describe('Pi bounded quota waits', () => {
   test.each([

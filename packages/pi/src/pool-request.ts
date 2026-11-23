@@ -104,7 +104,7 @@ function sendable(account: RouteAccount | undefined): account is RouteAccount {
   return account !== undefined && (account.vault === true || !!account.token)
 }
 
-/** What one attempt reports back: the HTTP status, when a response arrived. */
+/** What one attempt reports back: an HTTP response or a classified stream limit. */
 export interface RouteAttempt {
   status?: number
   /** Captured before dispatch, so a replacement cannot inherit old evidence. */
@@ -838,9 +838,17 @@ async function routeSticky<A extends RouteAttempt>(
     )
     const execution = policyResult(ctx, decision, attempt.signal)
     if (execution) return execution
-    if (after.action === 'migrate') {
+    // A confirmed refusal can arrive without a quota reading that moves the pin.
+    const confirmedMove =
+      attempt.status === 429 &&
+      attempt.signal?.kind === 'quota-exhausted' &&
+      decision?.action === 'reroute'
+    if (after.action === 'migrate' || confirmedMove) {
       const from = id
-      if (migrate(after.reason) && id !== from) {
+      if (
+        migrate(confirmedMove ? 'quota-exhausted' : after.reason) &&
+        id !== from
+      ) {
         const replacement = current.find((candidate) => candidate.id === id)
         const replaced = sendable(replacement)
           ? await ctx.send(replacement, tiers?.get(id))

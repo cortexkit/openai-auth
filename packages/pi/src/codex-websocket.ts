@@ -13,6 +13,7 @@ type WebSocketAttempt = {
   token: string
   owner: object
   sessionId?: string | undefined
+  onSend(): void
   onMessage(data: string): void
 }
 
@@ -124,6 +125,7 @@ class PiRawCodexWebSocket extends RawWebSocket {
     if (!this.activeAttempt && this.cacheKey && this.readyState === 1)
       cachedSockets.set(this.cacheKey, this)
     this.activeAttempt = attempt
+    attempt.onSend()
     super.send(shapePiCodexWebSocketFrame(data))
   }
 }
