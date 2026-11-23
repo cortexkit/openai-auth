@@ -238,7 +238,7 @@ export interface RuntimeLayoutOptions {
 interface LayoutMarker {
   version: 1
   /** The identity of the config folder the files came from. */
-  oldDir?: string
+  oldDir: string
   /** Set once the old files were removed or knowingly left in place. */
   oldFilesRemoved?: boolean
   /**
@@ -414,6 +414,14 @@ async function decide(
   )
   const fence = options.fence ?? defaultFence(options.version)
 
+  const readOwnMarker = async () => {
+    const found = await readMarker(location, files)
+    await assertOwnFolder(location, found)
+    if (found?.oldFilesRemoved && found.keptVaultState)
+      await refuseKeptVaultOverride(location, files)
+    return found
+  }
+
   const stateHome = async (): Promise<RuntimeLayout> => {
     await recordProcessLayout({
       key: location.key,
@@ -425,8 +433,7 @@ async function decide(
   }
 
   // Read-only first: whose folder this is, and whether the move is done.
-  let marker = await readMarker(markerPath, stateDir)
-  await assertOwnFolder(location, marker)
+  let marker = await readOwnMarker()
   if (marker?.oldFilesRemoved && !overrideInDestination) {
     await noticeReappearedFiles(location, files, overrides, marker, log)
     // A move that stopped right after its last marker write left its
@@ -453,7 +460,7 @@ async function decide(
     )
   } catch (error) {
     // Only an existing marker settles the layout without the lock.
-    marker = await readMarker(markerPath, stateDir)
+    marker = await readOwnMarker()
     if (marker && !overrideInDestination) return stateHome()
     throw new RuntimeLayoutRefusal(stateDir, errorClass(error))
   }
@@ -475,8 +482,7 @@ async function decide(
   }
 
   try {
-    marker = await readMarker(markerPath, stateDir)
-    await assertOwnFolder(location, marker)
+    marker = await readOwnMarker()
     if (!aliased) await writeOwnerNote(location)
 
     if (overrideInDestination) {
@@ -549,8 +555,7 @@ async function decide(
     } catch (error) {
       if (error instanceof RuntimeLayoutRefusal) throw error
       // Once the marker write began, the marker on disk decides.
-      if (markerStarted && (await readMarker(markerPath, stateDir)))
-        return await stateHome()
+      if (markerStarted && (await readOwnMarker())) return await stateHome()
       logOnce(`${location.key}\0failed`, () =>
         log.warn(
           "openai-auth's runtime files stay in OpenCode's config folder: moving them failed; the move is tried again at the next start",
@@ -952,6 +957,40 @@ async function vaultModeWithoutToken(
   }
 }
 
+/** Refuse an explicit state path that leads back to the enrollment left for older versions. */
+async function refuseKeptVaultOverride(
+  location: RuntimeLayoutLocation,
+  files: LayoutFiles,
+): Promise<void> {
+  const override = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
+  if (
+    !override ||
+    !accountPathsCollide(vaultStateDir(override), files.vault.old)
+  )
+    return
+
+  const old = vaultPaths(files.vault.old, 'opencode')
+  const names = await folderFiles(files.vault.old).catch(() => [])
+  if (names.length !== 1 || names[0] !== basename(old.statePath)) return
+  if (!(await vaultModeWithoutToken(old))) return
+
+  const moved = await readClaustrumEnrollmentStatus(
+    vaultPaths(files.vault.next, 'opencode'),
+    OPENCODE_ENROLLMENT_NAME,
+  ).catch(() => undefined)
+  if (
+    moved?.state !== 'approved' ||
+    moved.proposedName !== OPENCODE_ENROLLMENT_NAME
+  )
+    return
+
+  throw new RuntimeLayoutRefusal(
+    location.stateHomeDir,
+    'tokenless-vault-override',
+    `openai-auth cannot start: OPENCODE_OPENAI_AUTH_STATE_FILE points to ${override}, where the old vault contains only the kept enrollment state. Remove the override or point it at ${files.state.next}, then restart OpenCode.`,
+  )
+}
+
 /**
  * The SHA-256 of the enrollment state file this move copied, when that state
  * keeps the host in vault mode once the old token is gone: approved, or
@@ -1021,11 +1060,7 @@ export async function removeMovedVaultStateLeftover(
   const location = runtimeLayoutLocation()
   const files = layoutFiles(location)
   if (resolve(vaultDir) !== resolve(files.vault.next)) return
-  const stateDir = location.stateHomeDir
-  const marker = await readMarker(
-    join(stateDir, RUNTIME_LAYOUT_MARKER_FILE),
-    stateDir,
-  )
+  const marker = await readMarker(location, files)
   if (!marker?.keptVaultState || marker.oldDir !== location.key) return
   const leftover = vaultStateFile(files).old
   if (!(await isVaultStateLeftover(files, marker.keptVaultState))) return
@@ -1410,9 +1445,11 @@ async function noticeReappearedFiles(
  * briefly, then refuse the start: they prove neither presence nor absence.
  */
 async function readMarker(
-  path: string,
-  stateDir: string,
+  location: RuntimeLayoutLocation,
+  files: LayoutFiles,
 ): Promise<LayoutMarker | undefined> {
+  const stateDir = location.stateHomeDir
+  const path = join(stateDir, RUNTIME_LAYOUT_MARKER_FILE)
   let text: string | undefined
   let failure: unknown
   for (let attempt = 0; attempt < MARKER_READ_ATTEMPTS; attempt++) {
@@ -1431,21 +1468,37 @@ async function readMarker(
     throw new RuntimeLayoutRefusal(stateDir, errorClass(failure))
   try {
     const value = JSON.parse(text) as Partial<LayoutMarker> | null
-    if (value && typeof value === 'object' && !Array.isArray(value))
+    if (
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      value.version === 1 &&
+      typeof value.oldDir === 'string' &&
+      value.oldDir.length > 0 &&
+      (value.oldFilesRemoved === undefined ||
+        typeof value.oldFilesRemoved === 'boolean') &&
+      (value.keptVaultState === undefined ||
+        (typeof value.keptVaultState === 'string' &&
+          SHA256_HEX.test(value.keptVaultState)))
+    )
       return {
         version: 1,
-        ...(typeof value.oldDir === 'string' ? { oldDir: value.oldDir } : {}),
+        oldDir: value.oldDir,
         ...(value.oldFilesRemoved === true ? { oldFilesRemoved: true } : {}),
-        ...(typeof value.keptVaultState === 'string' &&
-        SHA256_HEX.test(value.keptVaultState)
+        ...(value.keptVaultState
           ? { keptVaultState: value.keptVaultState }
           : {}),
       }
   } catch {}
+  // Files in the destination may be the only surviving copies. Their presence
+  // does not prove the move completed or authorize rebuilding the marker.
+  const destination = await destinationFiles(files).catch(() => undefined)
   throw new RuntimeLayoutRefusal(
     stateDir,
     'malformed-marker',
-    `openai-auth cannot start: ${path} is malformed. The old files are still in OpenCode's config folder. Delete layout.json, then restart OpenCode.`,
+    destination?.length === 0
+      ? `openai-auth cannot start: ${path} is damaged or unrecognised. No runtime files were found in ${stateDir}. Delete layout.json, then restart OpenCode.`
+      : `openai-auth cannot start: ${path} is damaged or unrecognised. Keep the runtime files in ${stateDir}. Restore a backup of layout.json for this OpenCode config folder before restarting. Do not delete the marker.`,
   )
 }
 
@@ -1458,7 +1511,7 @@ async function assertOwnFolder(
   marker: LayoutMarker | undefined,
 ): Promise<void> {
   const stateDir = location.stateHomeDir
-  if (marker?.oldDir !== undefined && marker.oldDir !== location.key)
+  if (marker && marker.oldDir !== location.key)
     throw foreignFolder(stateDir, location.key)
   let text: string
   try {

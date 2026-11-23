@@ -986,7 +986,7 @@ describe('moving an existing layout', () => {
       writePrivate(path, text)
       await expect(prepare()).rejects.toMatchObject({
         name: 'RuntimeLayoutRefusal',
-        message: `openai-auth cannot start: ${path} is malformed. The old files are still in OpenCode's config folder. Delete layout.json, then restart OpenCode.`,
+        message: `openai-auth cannot start: ${path} is damaged or unrecognised. No runtime files were found in ${runtimeDir()}. Delete layout.json, then restart OpenCode.`,
       })
       expect(present(configDir(), files)).toEqual(files)
       expect(present(runtimeDir(), files)).toEqual(absent(files))
@@ -1001,6 +1001,42 @@ describe('moving an existing layout', () => {
     await expect(prepare()).rejects.toThrow(REFUSED)
     expect(present(configDir(), oldLayout())).toEqual(oldLayout())
   })
+
+  it.each([
+    ['syntax damage', undefined],
+    ['unknown version', { version: 2 }],
+    ['missing oldDir', { oldDir: undefined }],
+    ['non-boolean cleanup flag', { oldFilesRemoved: 'true' }],
+    ['invalid kept state hash', { keptVaultState: 'not a hash' }],
+  ] as const)(
+    'damaged marker after a completed move protects the state-home files: %s',
+    async (_label, fields) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      expect(await prepare()).toBe('state-home')
+      const path = join(runtimeDir(), 'layout.json')
+      const backup = readFileSync(path, 'utf8')
+      const damaged = fields ? JSON.stringify({ ...marker(), ...fields }) : '{'
+      writePrivate(path, damaged)
+      resetProcess()
+
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: `openai-auth cannot start: ${path} is damaged or unrecognised. Keep the runtime files in ${runtimeDir()}. Restore a backup of layout.json for this OpenCode config folder before restarting. Do not delete the marker.`,
+      })
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(present(runtimeDir(), files)).toEqual(files)
+      expect(readFileSync(path, 'utf8')).toBe(damaged)
+
+      writePrivate(path, backup)
+      resetProcess()
+      expect(await prepare()).toBe('state-home')
+      expect(getAccountPaths().statePath).toBe(
+        join(runtimeDir(), 'openai-auth-state.json'),
+      )
+      expect(present(runtimeDir(), files)).toEqual(files)
+    },
+  )
 
   it('a layout lease lost before the marker writes no marker and refuses to run unregistered', async () => {
     const files = oldLayout()
@@ -1381,6 +1417,50 @@ const APPROVED_LATER = (oldLayout()[VAULT_STATE] as string).replace(
 )
 
 describe('an approved vault enrollment and older versions', () => {
+  it.each(['approved', 'blocked for missing token'])(
+    'refuses a state override that selects only the kept enrollment after a completed move: %s',
+    async (shape) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      expect(await prepare()).toBe('state-home')
+      expect(marker()?.oldFilesRemoved).toBe(true)
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(present(runtimeDir(), files)).toEqual(files)
+      if (shape !== 'approved')
+        writePrivate(join(configDir(), VAULT_STATE), BLOCKED_MISSING_TOKEN)
+      const oldStatePath = join(configDir(), 'openai-auth-state.json')
+      const newStatePath = join(runtimeDir(), 'openai-auth-state.json')
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = oldStatePath
+      resetProcess()
+
+      const result = await prepare().then(
+        (layout) => ({ layout, statePath: getAccountPaths().statePath }),
+        (error: unknown) => error,
+      )
+      expect(result).toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: `openai-auth cannot start: OPENCODE_OPENAI_AUTH_STATE_FILE points to ${oldStatePath}, where the old vault contains only the kept enrollment state. Remove the override or point it at ${newStatePath}, then restart OpenCode.`,
+      })
+
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = newStatePath
+      resetProcess()
+      await prepare()
+      expect(getAccountPaths().statePath).toBe(newStatePath)
+      expect(present(runtimeDir(), files)).toEqual(files)
+    },
+  )
+
+  it('honours the old state path override if the state-home enrollment has no token either', async () => {
+    seed(configDir(), oldLayout())
+    expect(await prepare()).toBe('state-home')
+    rmSync(join(runtimeDir(), VAULT_TOKEN))
+    const oldStatePath = join(configDir(), 'openai-auth-state.json')
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = oldStatePath
+    resetProcess()
+    expect(await prepare()).toBe('state-home')
+    expect(getAccountPaths().statePath).toBe(oldStatePath)
+  })
+
   it('the move removes the old token but leaves the old state, so an older version stays in vault mode', async () => {
     const files = oldLayout()
     seed(configDir(), files)
@@ -1626,7 +1706,7 @@ describe('the layout lease before every removal', () => {
   })
 
   it('a finished move leaves atomic-write temps alone while a legacy writer is alive or a path is overridden', async () => {
-    seed(configDir(), oldLayout())
+    writePrivate(join(configDir(), 'openai-auth-state.json'), '{}\n')
     await prepare()
     resetProcess()
     const temp = join(
