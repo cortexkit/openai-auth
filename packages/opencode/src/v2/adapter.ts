@@ -874,8 +874,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     )
     let quotaMinimumBlocked = false
     if (vaultMode && storage && routes.length === 0 && vaultRoutes.length > 0) {
-      // Don't blame the minimum if unknown quota or the per-account
-      // killswitch floor would still keep the route out.
+      // Don't blame the minimum if unknown quota or the killswitch floor (the
+      // remaining quota an account must keep, per account or by default)
+      // would still keep the route out.
       const withoutMinimum = {
         ...storage,
         quota: {
@@ -2022,7 +2023,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         refuseMissingLogin()
       // Vault mode never falls back to a local account. If no target could be
       // tried, explain why here; a vault authorization refusal takes priority.
-      // A surviving target blocked later by admission keeps the host's error.
+      // A target that is still available here but refused by the later quota
+      // admission check keeps the host's error.
       if (
         accountId === undefined &&
         vaultMode &&
