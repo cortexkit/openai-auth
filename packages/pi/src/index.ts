@@ -20,70 +20,16 @@ import {
 } from '@earendil-works/pi-ai/compat'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
+import { installRawCodexWebSocket } from './codex-websocket.ts'
+import { PI_CODEX_BASE_URL } from './codex-wire.ts'
 import { registerCommands } from './commands.ts'
-import { RawWebSocket } from './raw-ws-node.ts'
 import { PiOpenAIRuntime, type PiOpenAIRuntimeDeps } from './runtime.ts'
 import { preparePiSettingsStartup } from './settings-startup.ts'
 import { VAULT_PLACEHOLDER_KEY } from './vault-slot.ts'
 
-const BASE_URL = 'https://chatgpt.com/backend-api'
+export { installRawCodexWebSocket } from './codex-websocket.ts'
 
 type CodexModel = Model<'openai-codex-responses'>
-type WebSocketOptions =
-  | string
-  | string[]
-  | { headers?: Record<string, string> }
-  | undefined
-
-type GlobalWebSocketSlot = { WebSocket?: unknown }
-
-/**
- * Receives every text frame of a Codex WebSocket with the headers the socket
- * was opened with, so a `codex.rate_limits` frame is recorded against the
- * account whose token opened it. Set by the extension.
- */
-let webSocketObserver:
-  | ((headers: Record<string, string>, data: string) => void)
-  | undefined
-
-class PiRawCodexWebSocket extends RawWebSocket {
-  constructor(url: string | URL, options?: WebSocketOptions) {
-    const headers =
-      options && typeof options === 'object' && !Array.isArray(options)
-        ? (options.headers ?? {})
-        : {}
-    super(String(url), headers)
-    const observer = webSocketObserver
-    if (observer) {
-      this.addEventListener('message', (event) => {
-        const data = (event as { data?: unknown } | null)?.data
-        if (typeof data === 'string') observer(headers, data)
-      })
-    }
-  }
-}
-
-let rawWebSocketInstallCount = 0
-let originalWebSocket: unknown
-
-export function installRawCodexWebSocket() {
-  const global = globalThis as unknown as GlobalWebSocketSlot
-  if (rawWebSocketInstallCount === 0) {
-    originalWebSocket = global.WebSocket
-    global.WebSocket = PiRawCodexWebSocket
-  }
-  rawWebSocketInstallCount++
-
-  return () => {
-    rawWebSocketInstallCount = Math.max(0, rawWebSocketInstallCount - 1)
-    if (rawWebSocketInstallCount === 0) {
-      if (global.WebSocket === PiRawCodexWebSocket) {
-        global.WebSocket = originalWebSocket
-      }
-      originalWebSocket = undefined
-    }
-  }
-}
 
 /**
  * Codex models a ChatGPT login can use that a Pi release may not list yet, each
@@ -179,7 +125,7 @@ export function registerPiProvider(
   runtime: PiOpenAIRuntime,
 ): void {
   pi.registerProvider('openai-codex', {
-    baseUrl: BASE_URL,
+    baseUrl: PI_CODEX_BASE_URL,
     api: 'openai-codex-responses',
     name: 'OpenAI Codex (CortexKit)',
     // Pi's built-in Codex provider is OAuth-only. This enables its api_key
@@ -219,8 +165,6 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     settingsStartup.paths,
     settingsStartup.snapshot,
   )
-  webSocketObserver = (headers, data) =>
-    runtime.observeWebSocketMessage(headers, data)
   let refresh: (() => unknown) | undefined
   let notify: ((message: string, level: 'error') => void) | undefined
   const syncSlot = (explicit = true) =>

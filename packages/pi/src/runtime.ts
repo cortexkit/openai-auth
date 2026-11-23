@@ -53,7 +53,6 @@ import {
   isRecord,
   limitAccountKey,
   loadAccounts,
-  moveInstructionsToDeveloperMessage,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OAuthQuotaSnapshot,
@@ -66,7 +65,6 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   reportVaultRoutingLimit,
-  restoreReplayedCallStatus,
   type SessionDispatch,
   sessionCacheKeepPlan,
   startVaultRoutingWait,
@@ -102,6 +100,12 @@ import type {
   Model,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
+import { withPiCodexWebSocketAttempt } from './codex-websocket.ts'
+import {
+  piCodexHttpUrl,
+  piCodexWebSocketUrl,
+  shapePiCodexHttpRequest,
+} from './codex-wire.ts'
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import {
@@ -162,9 +166,6 @@ export interface PiOpenAIRuntimeDeps {
   /** Replaces the cancellable countdown in isolated stream tests. */
   waitForPi?: typeof waitForPi
 }
-
-/** How many vault tokens are remembered, so a WebSocket frame finds its account. */
-const VAULT_TOKENS_KEPT = 64
 
 // Pi's agent retries by matching the error text, so provider details must not
 // appear in the terminal error of an attempt that has already published output.
@@ -250,13 +251,10 @@ export function blockedMessage(block: PoolBlock): string {
   }
 }
 
-function bearerOf(headers: Record<string, string>): string | undefined {
-  for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() !== 'authorization') continue
-    const match = /^Bearer\s+(.+)$/i.exec(value.trim())
-    return match?.[1]
-  }
-  return undefined
+type PiQuotaDispatch = {
+  accountId: string
+  token: string
+  receipt?: QuotaReceipt
 }
 
 export class PiOpenAIRuntime {
@@ -273,17 +271,6 @@ export class PiOpenAIRuntime {
    * is written once when an account starts serving on them.
    */
   private readonly creditsServing = new CreditsServing()
-  /**
-   * The vault account behind each recent vault token, with the receipt the
-   * vault served the token under, newest last, so a rate-limit frame
-   * arriving on a WebSocket opened with one is recorded against that
-   * account. The vault keeps a reading only while the account still holds
-   * the receipt's credential and ChatGPT account.
-   */
-  private readonly vaultTokens = new Map<
-    string,
-    { id: string; receipt: QuotaReceipt }
-  >()
   private readonly now: () => number
   private readonly paths: () => AccountPaths
   private slot: PiSlot | undefined
@@ -630,80 +617,42 @@ export class PiOpenAIRuntime {
     return this.pool.requestReading(id)
   }
 
-  private rememberVaultToken(
-    token: string,
-    entry: { id: string; receipt: QuotaReceipt },
-  ): void {
-    this.vaultTokens.delete(token)
-    this.vaultTokens.set(token, entry)
-    while (this.vaultTokens.size > VAULT_TOKENS_KEPT) {
-      const oldest = this.vaultTokens.keys().next().value
-      if (oldest === undefined) break
-      this.vaultTokens.delete(oldest)
-    }
-  }
-
   // -------------------------------------------------------------------------
   // Quota observed on the wire
   // -------------------------------------------------------------------------
 
   private recordHeaders(
-    accountId: string,
-    token: string,
+    dispatch: PiQuotaDispatch,
     headers: Record<string, string>,
   ): void {
     const parsed = new Headers(headers)
-    const snapshot = normalizeQuotaHeaders(parsed) as Record<string, unknown>
-    const complete = isCompleteQuotaHeaderFrame(parsed)
-    const vaultEntry = this.vaultTokens.get(token)
-    if (vaultEntry?.id === accountId) {
-      this.vault.reportUsage(accountId, { headers: parsed }, vaultEntry.receipt)
-      void this.vault.recordSnapshot(
-        accountId,
-        snapshot,
-        complete,
-        vaultEntry.receipt,
-      )
-    } else if (accountId === FORMER_MAIN_ID)
-      this.main.record(snapshot, token, complete)
-    else this.pool.recordSnapshot(accountId, snapshot, token, complete)
+    this.recordQuota(
+      dispatch,
+      normalizeQuotaHeaders(parsed) as Record<string, unknown>,
+      isCompleteQuotaHeaderFrame(parsed),
+      { headers: parsed },
+    )
   }
 
-  /**
-   * Records a `codex.rate_limits` frame that arrived on a WebSocket opened
-   * with `token`, against the account the token belongs to. A WebSocket may
-   * outlive the request that opened it, so the token, not the request,
-   * names the account.
-   */
-  recordRateLimitFrame(
-    token: string,
+  private recordQuota(
+    { accountId, token, receipt }: PiQuotaDispatch,
     snapshot: Record<string, unknown>,
-    frame?: Record<string, unknown>,
+    complete: boolean,
+    reply: { headers: Headers } | { frame: unknown },
   ): void {
-    // A vault token first: in vault mode it may sign in as the same ChatGPT
-    // account as Pi's own login, and the reading is the vault account's.
-    const vaultEntry = this.vaultTokens.get(token)
-    if (vaultEntry) {
-      if (frame)
-        this.vault.reportUsage(vaultEntry.id, { frame }, vaultEntry.receipt)
-      void this.vault.recordSnapshot(
-        vaultEntry.id,
-        snapshot,
-        true,
-        vaultEntry.receipt,
-      )
-      return
+    if (receipt) {
+      this.vault.reportUsage(accountId, reply, receipt)
+      void this.vault.recordSnapshot(accountId, snapshot, complete, receipt)
+    } else if (accountId === FORMER_MAIN_ID) {
+      this.main.record(snapshot, token, complete)
+    } else {
+      this.pool.recordSnapshot(accountId, snapshot, token, complete)
     }
-    if (this.main.record(snapshot, token, true)) return
-    const row = this.pool.rowForToken(token)
-    if (row) this.pool.recordSnapshot(row.id, snapshot, token, true)
   }
 
-  /** The handler a raw WebSocket hands its frames to. */
-  observeWebSocketMessage(headers: Record<string, string>, data: string): void {
+  /** Credit quota to the account and vault credential that sent this request, not the socket's opener. */
+  observeWebSocketMessage(dispatch: PiQuotaDispatch, data: string): void {
     if (!data.includes('codex.rate_limits')) return
-    const token = bearerOf(headers)
-    if (!token) return
     let event: unknown
     try {
       event = JSON.parse(data)
@@ -716,12 +665,13 @@ export class PiOpenAIRuntime {
       (event as { type?: unknown }).type !== 'codex.rate_limits'
     )
       return
-    this.recordRateLimitFrame(
-      token,
+    this.recordQuota(
+      dispatch,
       normalizeWsFrame(
         event as Parameters<typeof normalizeWsFrame>[0],
       ) as Record<string, unknown>,
-      event as Record<string, unknown>,
+      true,
+      { frame: event },
     )
   }
 
@@ -1042,37 +992,42 @@ export class PiOpenAIRuntime {
     let inner: AssistantMessageEventStream
     try {
       const send = options?.fetch ?? globalThis.fetch
+      const httpUrl = piCodexHttpUrl(model.baseUrl)
+      const quotaDispatch: PiQuotaDispatch = {
+        accountId,
+        token,
+        ...(receipt && { receipt }),
+      }
       // Pi's compaction and summary calls can carry the routing session id,
       // but disable caching. They must not pin or change conversation effort.
       const effortSessionId =
         options?.cacheRetention === 'none' ? undefined : options?.sessionId
-      inner = this.deps.streamSimple(model, context, {
+      const useWebSocketShim =
+        this.deps.installWebSocket && options?.transport !== 'sse'
+      const streamOptions: SimpleStreamOptions = {
         ...options,
         apiKey: token,
-        // pi-ai uses the transformed body for HTTP and to compute WebSocket deltas.
+        // On Bun, an explicit environment makes pi-ai read the current WebSocket
+        // constructor instead of reusing one cached before the shim was installed.
+        ...(useWebSocketShim &&
+          process.versions.bun && { env: options?.env ?? {} }),
+        // Effort updates belong in pi-ai's logical history; wire-only changes do not.
         onPayload: async (payload, payloadModel) => {
           const replacement = await options?.onPayload?.(payload, payloadModel)
           const source = replacement === undefined ? payload : replacement
-          if (!isRecord(source)) return source
-          const input = restoreReplayedCallStatus(source.input, source.model)
-          if (
-            !effortSessionId &&
-            input === source.input &&
-            (typeof source.instructions !== 'string' ||
-              source.instructions.length === 0)
-          )
-            return source
+          if (!effortSessionId || !isRecord(source)) return source
           const body = { ...source }
-          if (input !== source.input) body.input = input
-          if (effortSessionId) this.applyEffort(body, effortSessionId)
-          moveInstructionsToDeveloperMessage(body)
+          this.applyEffort(body, effortSessionId)
           return body
         },
         // Scrub before pi-ai parses errors into its shared partial message objects.
         fetch: Object.assign(
           async (input: RequestInfo | URL, init?: RequestInit) => {
             try {
-              const response = await send(input, init)
+              const response = await send(
+                input,
+                input === httpUrl ? shapePiCodexHttpRequest(init) : init,
+              )
               // Never read an SSE success body: it may be an unbounded stream.
               // The clone leaves the SDK's error bytes and response untouched.
               if (response.status >= 400) {
@@ -1096,7 +1051,7 @@ export class PiOpenAIRuntime {
         ),
         onResponse: async (response, responseModel) => {
           status = response.status
-          this.recordHeaders(accountId, token, response.headers)
+          this.recordHeaders(quotaDispatch, response.headers)
           const observedAt = this.now()
           const headersReading = normalizeQuotaHeaders(
             new Headers(response.headers),
@@ -1155,7 +1110,20 @@ export class PiOpenAIRuntime {
           }
           await options?.onResponse?.(response, responseModel)
         },
-      })
+      }
+      const start = () => this.deps.streamSimple(model, context, streamOptions)
+      inner = useWebSocketShim
+        ? withPiCodexWebSocketAttempt(
+            {
+              url: piCodexWebSocketUrl(httpUrl),
+              token,
+              owner: this,
+              onMessage: (data) =>
+                this.observeWebSocketMessage(quotaDispatch, data),
+            },
+            start,
+          )
+        : start()
     } catch (error) {
       billing?.end(false, false, status)
       return {
@@ -1264,20 +1232,6 @@ export class PiOpenAIRuntime {
     const response = await this.vault.send(
       accountId,
       async (token, attempt) => {
-        // Only the receipt's attribution fields are kept, never the token.
-        this.rememberVaultToken(token, {
-          id: accountId,
-          receipt: {
-            credentialId: attempt.credentialId,
-            accountIdentitySource: attempt.accountIdentitySource,
-            ...(attempt.accountIdentity !== undefined
-              ? { accountIdentity: attempt.accountIdentity }
-              : {}),
-            ...(attempt.expectedAccountIdentity !== undefined
-              ? { expectedAccountIdentity: attempt.expectedAccountIdentity }
-              : {}),
-          },
-        })
         // An attempt the vault retries is dropped unread: it ended without
         // streaming, so nothing of it reached Pi.
         last = await this.attempt(

@@ -33,6 +33,7 @@ import {
   createAssistantMessageEventStream,
   type Model,
 } from '@earendil-works/pi-ai'
+import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
 import {
   chatgptAccessToken,
@@ -42,6 +43,8 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import * as vaultRouting from '../../../core/src/vault-routing.ts'
 import { createPiMenu } from '../commands.ts'
+import { installRawCodexWebSocket } from '../index.ts'
+import { RawWebSocket } from '../raw-ws-node.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 import { VAULT_PLACEHOLDER_KEY } from '../vault-slot.ts'
@@ -163,10 +166,11 @@ function vault(): OpenAiVault {
   })
 }
 
-function runtimeWith(target: OpenAiVault): PiOpenAIRuntime {
+function runtimeWith(target: OpenAiVault, webSocket = false): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
     createStream: createAssistantMessageEventStream,
+    ...(webSocket && { installWebSocket: installRawCodexWebSocket }),
     paths: () => paths,
     fetchImpl: fakeFetch,
     firstReadingWaitMs: 0,
@@ -492,7 +496,7 @@ describe('Pi and the Claustrum vault', () => {
       expect(events.at(-1)).toMatchObject({ type: 'done' })
       expect(codexTokens).toEqual([localAccess])
       runtime.observeWebSocketMessage(
-        { authorization: `Bearer ${localAccess}` },
+        { accountId: 'local', token: localAccess },
         JSON.stringify({
           type: 'codex.rate_limits',
           rate_limits: { primary: { used_percent: 43 } },
@@ -1005,6 +1009,7 @@ describe('Pi and the Claustrum vault', () => {
     async function served(): Promise<{
       target: OpenAiVault
       runtime: PiOpenAIRuntime
+      dispatch: Parameters<PiOpenAIRuntime['observeWebSocketMessage']>[0]
     }> {
       daemon = await startMockDaemon({
         directory: dir,
@@ -1018,20 +1023,25 @@ describe('Pi and the Claustrum vault', () => {
       await send(runtime)
       expect(codexTokens).toEqual([VAULT_ACCESS])
       expect(primaryUsed(target)).toEqual([10])
-      return { target, runtime }
+      const accountId = target.routes()[0]!.id
+      const receipt = await target.authorize(accountId)
+      if (!receipt)
+        throw new Error('Expected a quota receipt for the vault route')
+      return {
+        target,
+        runtime,
+        dispatch: { accountId, token: VAULT_ACCESS, receipt },
+      }
     }
 
     test('is recorded on the vault account with the receipt the token was served under', async () => {
-      const { target, runtime } = await served()
+      const { target, runtime, dispatch } = await served()
       const report = spyOn(
         ClaustrumConsumer.prototype,
         'reportUsage',
       ).mockImplementation(() => {})
       try {
-        runtime.observeWebSocketMessage(
-          { Authorization: `Bearer ${VAULT_ACCESS}` },
-          frame,
-        )
+        runtime.observeWebSocketMessage(dispatch, frame)
 
         for (let i = 0; i < 200 && primaryUsed(target)[0] !== 77; i++)
           await Bun.sleep(5)
@@ -1057,22 +1067,162 @@ describe('Pi and the Claustrum vault', () => {
     })
 
     test('is dropped once the vault credential signs in as another account', async () => {
-      const { target, runtime } = await served()
+      const { target, runtime, dispatch } = await served()
       // The vault now serves the same credential for a different ChatGPT
       // account: a frame from the socket the old account's token opened
       // describes the old account and must not land on the new one.
       daemon.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-other')
       await target.refresh()
 
-      runtime.observeWebSocketMessage(
-        { Authorization: `Bearer ${VAULT_ACCESS}` },
-        frame,
-      )
+      runtime.observeWebSocketMessage(dispatch, frame)
 
       await Bun.sleep(50)
       expect(primaryUsed(target)).not.toContain(77)
       target.close()
     })
+  })
+
+  test('Pi attributes quota and billing to each turn on a reused vault WebSocket', async () => {
+    const credential = 'oauth:openai:vault'
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        [credential]: vaultLogin('chatgpt-vault', { record_version: 1 }),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target, true)
+    const sessionId = 'pi-vault-reused-socket'
+    const reports: { session: string; payload: Record<string, unknown> }[] = []
+    Reflect.set(globalThis, routingKey, (session: string) => ({
+      report(payload: Record<string, unknown>) {
+        if (payload.kind === 'billing') reports.push({ session, payload })
+      },
+    }))
+    const rawSend = RawWebSocket.prototype.send
+    const rawFrames: string[] = []
+    const seam = spyOn(RawWebSocket.prototype, 'send').mockImplementation(
+      function (this: RawWebSocket, data: string) {
+        expect(globalThis.WebSocket.name).toBe('PiRawCodexWebSocket')
+        expect(this).toBeInstanceOf(globalThis.WebSocket)
+        rawFrames.push(data)
+        rawSend.call(this, data)
+      },
+    )
+    const usage = spyOn(target, 'reportUsage')
+    const wireFrames: string[] = []
+    const upgrades: (string | null)[] = []
+    const firstResponse = (await sseOk().text())
+      .trim()
+      .split('\n\n')
+      .map((line) => line.slice('data: '.length))
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(request, server) {
+        const authorization = request.headers.get('authorization')
+        if (server.upgrade(request)) {
+          upgrades.push(authorization)
+          return
+        }
+        return new Response(null, { status: 400 })
+      },
+      websocket: {
+        message(socket, frame) {
+          wireFrames.push(frame.toString())
+          const turn = wireFrames.length
+          socket.send(
+            JSON.stringify({
+              type: 'codex.rate_limits',
+              rate_limits: {
+                primary: { used_percent: turn * 10 + 5, window_minutes: 300 },
+              },
+            }),
+          )
+          for (const event of firstResponse)
+            socket.send(event.replace('"id":"r1"', `"id":"r${turn}"`))
+        },
+      },
+    })
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      const model = { ...MODEL, baseUrl: server.url.href }
+      const options = {
+        transport: 'websocket-cached',
+        sessionId,
+        apiKey: VAULT_PLACEHOLDER_KEY,
+        fetch: fakeFetch,
+      } as const
+      const firstStream = runtime.stream(model, CONTEXT, options)
+      await Array.fromAsync(firstStream)
+      const first = await firstStream.result()
+      expect(first.responseId).toBe('r1')
+      daemon.credentials[credential] = vaultLogin('chatgpt-vault', {
+        record_version: 2,
+      })
+      await target.refresh()
+      const secondStream = runtime.stream(
+        model,
+        {
+          messages: [
+            ...CONTEXT.messages,
+            first,
+            { role: 'user', content: 'next', timestamp: 2 },
+          ],
+        },
+        options,
+      )
+      await Array.fromAsync(secondStream)
+      const second = await secondStream.result()
+      expect(second.responseId).toBe('r2')
+      expect(upgrades).toEqual([`Bearer ${VAULT_ACCESS}`])
+      expect(wireFrames).toEqual(rawFrames)
+      expect(
+        wireFrames.map((frame) => JSON.parse(frame).previous_response_id),
+      ).toEqual([undefined, 'r1'])
+      expect(
+        usage.mock.calls.map(([id, reply, receipt]) => ({
+          id,
+          frame: 'frame' in reply ? reply.frame : null,
+          version: (receipt as { recordVersion?: number }).recordVersion,
+        })),
+      ).toEqual(
+        [15, 25].map((used_percent, i) => ({
+          id: target.routes()[0]!.id,
+          frame: {
+            type: 'codex.rate_limits',
+            rate_limits: { primary: { used_percent, window_minutes: 300 } },
+          },
+          version: i + 1,
+        })),
+      )
+      expect(
+        reports.map(({ session, payload }) => [
+          session,
+          payload.credential_id,
+          payload.provider_response_id,
+          payload.outcome,
+        ]),
+      ).toEqual([
+        [sessionId, credential, 'r1', 'completed'],
+        [sessionId, credential, 'r2', 'completed'],
+      ])
+      expect(reports[0]!.payload.attempt_id).not.toBe(
+        reports[1]!.payload.attempt_id,
+      )
+      expect(codexTokens).toEqual([])
+    } finally {
+      usage.mockRestore()
+      seam.mockRestore()
+      closeOpenAICodexWebSocketSessions(sessionId)
+      await Promise.all([
+        server.stop(true),
+        runtime.pool.dispose(),
+        target.dispose(),
+      ])
+    }
   })
 
   test('a 401 on a vault account is reported to the vault with the version it was served', async () => {

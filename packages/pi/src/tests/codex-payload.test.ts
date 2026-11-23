@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,9 +8,11 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
+import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
 import { chatgptAccessToken } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { installRawCodexWebSocket } from '../index.ts'
+import { RawWebSocket } from '../raw-ws-node.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 
 const model: Model<'openai-codex-responses'> = {
@@ -67,7 +69,39 @@ function developerMessage(text: string, id?: string) {
   }
 }
 
-function responseEvents(turn: number) {
+function responseEvents(turn: number, functionCall = false) {
+  if (functionCall) {
+    const item = {
+      type: 'function_call',
+      id: `fc_${turn}`,
+      call_id: `call_${turn}`,
+      name: 'read',
+    }
+    return [
+      {
+        type: 'response.output_item.added',
+        output_index: 0,
+        item: { ...item, status: 'in_progress', arguments: '' },
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          ...item,
+          status: 'completed',
+          arguments: '{"path":"README.md"}',
+        },
+      },
+      {
+        type: 'response.completed',
+        response: {
+          id: `resp_${turn}`,
+          status: 'completed',
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      },
+    ]
+  }
   const item = { type: 'message', id: `msg_${turn}`, role: 'assistant' }
   return [
     {
@@ -106,16 +140,36 @@ function mockFetch(
 
 let dir: string
 let runtime: PiOpenAIRuntime
+let sdkHttpEncodings: (string | null)[]
+let wireHttpEncodings: (string | null)[]
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'pi-codex-payload-'))
-  runtime = new PiOpenAIRuntime({
-    streamSimple,
+  sdkHttpEncodings = []
+  wireHttpEncodings = []
+  runtime = makeRuntime(dir)
+})
+
+function makeRuntime(directory: string) {
+  return new PiOpenAIRuntime({
+    streamSimple(model, context, options) {
+      const fetch = options?.fetch
+      return streamSimple(model, context, {
+        ...options,
+        fetch: mockFetch(async (input, init) => {
+          sdkHttpEncodings.push(
+            new Headers(init?.headers).get('content-encoding'),
+          )
+          if (!fetch) throw new Error('Missing transport wrapper')
+          return fetch(input, init)
+        }),
+      })
+    },
     createStream: createAssistantMessageEventStream,
     installWebSocket: installRawCodexWebSocket,
     paths: () => ({
-      configPath: join(dir, 'openai-auth.json'),
-      statePath: join(dir, 'openai-auth-state.json'),
+      configPath: join(directory, 'openai-auth.json'),
+      statePath: join(directory, 'openai-auth-state.json'),
     }),
     fetchImpl: mockFetch(async () =>
       Response.json({
@@ -129,7 +183,7 @@ beforeEach(() => {
       }),
     ),
   })
-})
+}
 
 afterEach(async () => {
   await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
@@ -153,6 +207,7 @@ async function httpBody(
       fetch: mockFetch(async (_input, init) => {
         const payload = new Response(init?.body)
         const encoded = new Headers(init?.headers).get('content-encoding')
+        wireHttpEncodings.push(encoded)
         const json =
           encoded === 'zstd'
             ? new TextDecoder().decode(
@@ -178,6 +233,16 @@ async function httpBody(
   if (!body) throw new Error('No captured HTTP body')
   return body
 }
+
+test('Pi sends uncompressed JSON after pi-ai zstd-encodes the HTTP request', async () => {
+  const sent = await httpBody({ sessionId })
+  expect(sdkHttpEncodings).toEqual(['zstd'])
+  expect(wireHttpEncodings).toEqual([null])
+  expect(sent.input).toEqual([
+    developerMessage(systemPrompt, systemId),
+    userItem(firstUser.content),
+  ])
+})
 
 test('Pi restores GPT-6.2 replayed call status without instructions and keeps GPT-6.1 bytes', async () => {
   for (const id of ['gpt-6.1-sol', 'gpt-6.2-sol']) {
@@ -236,6 +301,10 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
           }
           sdkInput = body.input
           expect(sdkInput[1]).toEqual(replayed)
+          body.input = [
+            ...sdkInput,
+            { ...replayed, id: 'fc_explicit', status: 'incomplete' },
+          ]
           sdkBytes = JSON.stringify(body)
           return body
         },
@@ -250,6 +319,7 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
           sdkInput[0],
           { ...replayed, status: 'completed' },
           sdkInput[2],
+          { ...replayed, id: 'fc_explicit', status: 'incomplete' },
         ]),
       )
       expect(sdkInput[1]).toEqual(replayed)
@@ -395,9 +465,28 @@ test('Codex transforms in-place onPayload edits without mutating the SDK body', 
   expect(sdkBody?.input).toHaveLength(1)
 })
 
-async function captureWebSocketFrames(run: (url: string) => Promise<void>) {
+function spyOnRawCodexFrames() {
+  const frames: string[] = []
+  const rawSend = RawWebSocket.prototype.send
+  const seam = spyOn(RawWebSocket.prototype, 'send').mockImplementation(
+    function (this: RawWebSocket, data: string) {
+      expect(globalThis.WebSocket.name).toBe('PiRawCodexWebSocket')
+      expect(this).toBeInstanceOf(globalThis.WebSocket)
+      frames.push(data)
+      rawSend.call(this, data)
+    },
+  )
+  return { frames, restore: () => seam.mockRestore() }
+}
+
+async function captureWebSocketFrames(
+  run: (url: string) => Promise<void>,
+  events = responseEvents,
+) {
   const frames: Record<string, unknown>[] = []
+  const wireFrames: string[] = []
   let connections = 0
+  const seam = spyOnRawCodexFrames()
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -410,16 +499,19 @@ async function captureWebSocketFrames(run: (url: string) => Promise<void>) {
         connections++
       },
       message(socket, frame) {
+        wireFrames.push(frame.toString())
         frames.push(JSON.parse(frame.toString()))
-        for (const event of responseEvents(frames.length))
+        for (const event of events(frames.length))
           socket.send(JSON.stringify(event))
       },
     },
   })
   try {
     await run(server.url.href)
+    expect(wireFrames).toEqual(seam.frames)
     return { frames, connections }
   } finally {
+    seam.restore()
     await server.stop(true)
   }
 }
@@ -532,4 +624,417 @@ test('Pi keeps gpt-6.2-sol WebSocket turns chained after injecting an effort upd
     [userItem(thirdUser.content)],
   ])
   expect(payloads.map((input) => input.length)).toEqual([1, 3, 5])
+})
+
+function cachedWebSocketOptions(): SimpleStreamOptions {
+  return {
+    apiKey,
+    transport: 'websocket-cached',
+    sessionId,
+    fetch: mockFetch(async () => {
+      throw new Error('Expected to send over the WebSocket')
+    }),
+  }
+}
+
+const readTool = {
+  name: 'read',
+  description: 'Read a file',
+  parameters: { type: 'object', properties: { path: { type: 'string' } } },
+}
+
+test('Pi chains GPT-6.2 after a completed call and restores statuses on full WebSocket sends', async () => {
+  const toolOutput = (id: string): Context['messages'][number] => ({
+    role: 'toolResult',
+    toolCallId: id,
+    toolName: 'read',
+    content: [{ type: 'text', text: 'Read result.' }],
+    isError: false,
+    timestamp: 3,
+  })
+  const { frames, connections } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const socketModel = { ...effortModel, baseUrl }
+      const seed: Context['messages'][number] = {
+        role: 'assistant',
+        api: model.api,
+        provider: model.provider,
+        model: socketModel.id,
+        content: [
+          {
+            type: 'toolCall',
+            id: 'call_seed|fc_seed',
+            name: 'read',
+            arguments: { path: 'seed' },
+          },
+          {
+            type: 'toolCall',
+            id: 'call_explicit|fc_explicit',
+            name: 'read',
+            arguments: { path: 'explicit' },
+          },
+        ],
+        stopReason: 'toolUse',
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { ...model.cost, total: 0 },
+        },
+        timestamp: 2,
+      }
+      const history: Context['messages'] = [
+        firstUser,
+        seed,
+        toolOutput('call_seed|fc_seed'),
+        toolOutput('call_explicit|fc_explicit'),
+      ]
+      const options: SimpleStreamOptions = {
+        ...cachedWebSocketOptions(),
+        onPayload(raw) {
+          const body = raw as { input: Record<string, unknown>[] }
+          const explicit = body.input.find((item) => item.id === 'fc_explicit')
+          if (!explicit) throw new Error('Missing explicit-status fixture')
+          explicit.status = 'incomplete'
+        },
+      }
+      const send = () =>
+        runtime
+          .stream(
+            socketModel,
+            {
+              systemPrompt,
+              messages: [...history],
+              tools: [readTool],
+            },
+            options,
+          )
+          .result()
+
+      const first = await send()
+      expect(first.stopReason).toBe('toolUse')
+      expect(first.content).toEqual([
+        {
+          type: 'toolCall',
+          id: 'call_1|fc_1',
+          name: 'read',
+          arguments: { path: 'README.md' },
+        },
+      ])
+      history.push(first, toolOutput('call_1|fc_1'))
+      const second = await send()
+      expect(second.responseId).toBe('resp_2')
+      history.push(second, thirdUser)
+      const third = await send()
+      expect(third.responseId).toBe('resp_3')
+      closeOpenAICodexWebSocketSessions(sessionId)
+      const resend = await send()
+      expect(resend.responseId).toBe('resp_4')
+    },
+    (turn) => responseEvents(turn, turn === 1),
+  )
+  expect(connections).toBe(2)
+  expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+    undefined,
+    'resp_1',
+    'resp_2',
+    undefined,
+  ])
+  for (const frame of frames) expect(frame).not.toHaveProperty('instructions')
+  const [full, toolDelta, userDelta, resend] = frames.map(
+    (frame) => frame.input as Record<string, unknown>[],
+  )
+  expect(toolDelta).toEqual([
+    { type: 'function_call_output', call_id: 'call_1', output: 'Read result.' },
+  ])
+  expect(userDelta).toEqual([userItem(thirdUser.content)])
+  for (const input of [full!, resend!]) {
+    expect(input[0]).toEqual(developerMessage(systemPrompt, systemId))
+    expect(input.filter((item) => item.role === 'developer')).toEqual([
+      developerMessage(systemPrompt, systemId),
+    ])
+  }
+  const callStatuses = (input: Record<string, unknown>[]) =>
+    input
+      .filter((item) => item.type === 'function_call')
+      .map(({ id, status }) => [id, status])
+  expect(callStatuses(full!)).toEqual([
+    ['fc_seed', 'completed'],
+    ['fc_explicit', 'incomplete'],
+  ])
+  expect(callStatuses(resend!)).toEqual([
+    ['fc_seed', 'completed'],
+    ['fc_explicit', 'incomplete'],
+    ['fc_1', 'completed'],
+  ])
+})
+
+test.each(['prefix', 'tools', 'instructions'] as const)(
+  'Pi sends the full WebSocket request if %s changed',
+  async (change) => {
+    const { frames, connections } = await captureWebSocketFrames(
+      async (baseUrl) => {
+        const socketModel = { ...model, baseUrl }
+        const options = cachedWebSocketOptions()
+        const first = await runtime
+          .stream(socketModel, context, options)
+          .result()
+        expect(first.responseId).toBe('resp_1')
+        const next = await runtime
+          .stream(
+            socketModel,
+            {
+              systemPrompt:
+                change === 'instructions'
+                  ? 'A replacement prompt.'
+                  : systemPrompt,
+              messages: [
+                change === 'prefix'
+                  ? { ...firstUser, content: 'Edited user message' }
+                  : firstUser,
+                first,
+                secondUser,
+              ],
+              ...(change === 'tools' ? { tools: [readTool] } : {}),
+            },
+            options,
+          )
+          .result()
+        expect(next.responseId).toBe('resp_2')
+      },
+    )
+    expect(connections).toBe(1)
+    expect(frames).toHaveLength(2)
+    expect(frames[1]).not.toHaveProperty('previous_response_id')
+    expect(frames[1]).not.toHaveProperty('instructions')
+    expect(frames[1]?.input).toMatchObject([
+      {
+        role: 'developer',
+        content: [
+          {
+            type: 'input_text',
+            text:
+              change === 'instructions'
+                ? 'A replacement prompt.'
+                : systemPrompt,
+          },
+        ],
+      },
+      userItem(change === 'prefix' ? 'Edited user message' : firstUser.content),
+      { role: 'assistant' },
+      userItem(secondUser.content),
+    ])
+    if (change === 'tools')
+      expect(frames[1]?.tools).toMatchObject([{ name: 'read' }])
+  },
+)
+
+function rateLimitsFrame(usedPercent: number) {
+  return {
+    type: 'codex.rate_limits',
+    rate_limits: {
+      primary: { used_percent: usedPercent, window_minutes: 300 },
+    },
+  }
+}
+
+test('Pi binds overlapping Codex sockets by attempt, URL and bearer and leaves foreign sockets untouched', async () => {
+  const other = makeRuntime(join(dir, 'other'))
+  const original = globalThis.WebSocket
+  const seam = spyOnRawCodexFrames()
+  const firstObserver = spyOn(runtime, 'observeWebSocketMessage')
+  const otherObserver = spyOn(other, 'observeWebSocketMessage')
+  const seen: {
+    label: string
+    path: string
+    authorization: string | null
+    data: string
+  }[] = []
+  const quota = {
+    priming: 11,
+    first: 21,
+    other: 37,
+    'foreign-bearer': 82,
+    'foreign-path': 93,
+  }
+  type Label = keyof typeof quota
+  const server = Bun.serve<{
+    label: Label
+    path: string
+    authorization: string | null
+  }>({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request, server) {
+      const label = request.headers.get('x-fixture-socket') as Label
+      const path = new URL(request.url).pathname
+      const authorization = request.headers.get('authorization')
+      if (server.upgrade(request, { data: { label, path, authorization } }))
+        return
+      return new Response(null, { status: 400 })
+    },
+    websocket: {
+      message(socket, frame) {
+        const { label } = socket.data
+        seen.push({ ...socket.data, data: frame.toString() })
+        socket.send(JSON.stringify(rateLimitsFrame(quota[label])))
+        if (label === 'first' || label === 'other' || label === 'priming') {
+          const turn = label === 'first' ? 1 : label === 'other' ? 2 : 0
+          for (const event of responseEvents(turn))
+            socket.send(JSON.stringify(event))
+        }
+      },
+    },
+  })
+  const codexPath = '/codex/responses'
+  const socketModel = { ...model, baseUrl: server.url.href }
+  const otherToken = chatgptAccessToken('other-payload-test-account')
+  const foreignBody = JSON.stringify({
+    type: 'response.create',
+    model: 'gpt-6.2',
+    instructions: 'Foreign bytes',
+    input: [],
+  })
+  const foreignSockets: { native: boolean; url: string; response: string }[] =
+    []
+  const awaitingOther = Promise.withResolvers<void>()
+  const foreignDone = Promise.withResolvers<void>()
+  async function sendForeign(label: Label, path: string, token: string) {
+    const url = new URL(path, server.url)
+    url.protocol = 'ws:'
+    const socket = Reflect.construct(globalThis.WebSocket, [
+      url,
+      {
+        headers: {
+          'x-fixture-socket': label,
+          authorization: `Bearer ${token}`,
+        },
+      },
+    ]) as WebSocket
+    try {
+      const response = await new Promise<string>((resolve, reject) => {
+        socket.addEventListener('open', () => socket.send(foreignBody))
+        socket.addEventListener('message', (event) => resolve(event.data))
+        socket.addEventListener('error', () =>
+          reject(new Error('Foreign socket failed')),
+        )
+      })
+      foreignSockets.push({
+        native: socket instanceof original,
+        url: socket.url,
+        response,
+      })
+    } finally {
+      socket.close()
+    }
+  }
+  try {
+    const options = cachedWebSocketOptions()
+    // An unrelated SDK call can cache Bun's constructor while no shim is installed.
+    const priming = await streamSimple(socketModel, context, {
+      ...options,
+      cacheRetention: 'none',
+      headers: { 'x-fixture-socket': 'priming' },
+    }).result()
+    expect(priming.responseId).toBe('resp_0')
+    expect(seam.frames).toEqual([])
+    const first = runtime.stream(socketModel, context, {
+      ...options,
+      headers: { 'x-fixture-socket': 'first' },
+      async onPayload() {
+        await awaitingOther.promise
+        try {
+          await sendForeign('foreign-bearer', codexPath, 'foreign-token')
+          await sendForeign('foreign-path', '/sentinel', apiKey)
+        } finally {
+          foreignDone.resolve()
+        }
+      },
+    })
+    const second = other.stream(socketModel, context, {
+      ...options,
+      sessionId: `${sessionId}-other`,
+      apiKey: otherToken,
+      headers: { 'x-fixture-socket': 'other' },
+      async onPayload() {
+        awaitingOther.resolve()
+        await foreignDone.promise
+      },
+    })
+    expect(
+      (await Promise.all([first.result(), second.result()])).map(
+        (result) => result.responseId,
+      ),
+    ).toEqual(['resp_1', 'resp_2'])
+
+    const owned = seen.filter(
+      ({ label }) => label === 'first' || label === 'other',
+    )
+    expect(owned.map(({ data }) => data).sort()).toEqual(
+      [...seam.frames].sort(),
+    )
+    expect(
+      owned
+        .map(({ label, path, authorization, data }) => [
+          label,
+          path,
+          authorization,
+          JSON.parse(data).prompt_cache_key,
+        ])
+        .sort(),
+    ).toEqual([
+      ['first', codexPath, `Bearer ${apiKey}`, sessionId],
+      ['other', codexPath, `Bearer ${otherToken}`, `${sessionId}-other`],
+    ])
+    const observedLimits = (observer: typeof firstObserver) =>
+      observer.mock.calls
+        .map(([{ token }, data]) => [token, JSON.parse(data)] as const)
+        .filter(([, frame]) => frame.type === 'codex.rate_limits')
+    expect(observedLimits(firstObserver)).toEqual([
+      [apiKey, rateLimitsFrame(21)],
+    ])
+    expect(observedLimits(otherObserver)).toEqual([
+      [otherToken, rateLimitsFrame(37)],
+    ])
+    expect(seen.filter(({ label }) => label.startsWith('foreign-'))).toEqual([
+      {
+        label: 'foreign-bearer',
+        path: codexPath,
+        authorization: 'Bearer foreign-token',
+        data: foreignBody,
+      },
+      {
+        label: 'foreign-path',
+        path: '/sentinel',
+        authorization: `Bearer ${apiKey}`,
+        data: foreignBody,
+      },
+    ])
+    const wsOrigin = server.url.origin.replace(/^http:/, 'ws:')
+    expect(foreignSockets).toEqual([
+      {
+        native: true,
+        url: `${wsOrigin}${codexPath}`,
+        response: JSON.stringify(rateLimitsFrame(82)),
+      },
+      {
+        native: true,
+        url: `${wsOrigin}/sentinel`,
+        response: JSON.stringify(rateLimitsFrame(93)),
+      },
+    ])
+  } finally {
+    firstObserver.mockRestore()
+    otherObserver.mockRestore()
+    seam.restore()
+    closeOpenAICodexWebSocketSessions(sessionId)
+    closeOpenAICodexWebSocketSessions(`${sessionId}-other`)
+    await Promise.all([
+      server.stop(true),
+      other.pool.dispose(),
+      other.vault.dispose(),
+    ])
+  }
 })

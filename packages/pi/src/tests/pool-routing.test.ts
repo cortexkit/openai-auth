@@ -979,12 +979,12 @@ describe('Pi requests on the account pool', () => {
     ).toBe(10)
   })
 
-  test('a codex.rate_limits WebSocket frame lands on the account whose token opened the socket', async () => {
+  test('a codex.rate_limits WebSocket frame lands on the account that sent the request', async () => {
     const runtime = makeRuntime()
     await ready(runtime)
 
     runtime.observeWebSocketMessage(
-      { Authorization: `Bearer ${BETA_TOKEN}` },
+      { accountId: 'beta', token: BETA_TOKEN },
       JSON.stringify({
         type: 'codex.rate_limits',
         rate_limits: {
