@@ -63,7 +63,10 @@ import {
   type VaultRoutingFeedback,
 } from '@cortexkit/openai-auth-core/internal'
 
-import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
+import {
+  resetCreditsOfQuota,
+  windowsFromQuotaMap,
+} from '@cortexkit/openai-auth-core/pool-quota'
 import {
   type AdmissionTier,
   admitSticky,
@@ -774,7 +777,7 @@ async function routeSticky<A extends RouteAttempt>(
   sessionId: string,
 ): Promise<PiRouteResult<A> | undefined> {
   const requestBytes = ctx.requestBytes
-  const byId = new Map(accounts.map((account) => [account.id, account]))
+  let byId = new Map(accounts.map((account) => [account.id, account]))
   let routing = routingInput(ctx, accounts)
   let sticky = admitSticky(routing)
   const tiers = ctx.captureAdmissionTier
@@ -789,7 +792,10 @@ async function routeSticky<A extends RouteAttempt>(
         ctx.storage,
         id === FORMER_MAIN_ID ? undefined : id,
       ),
-    resetCredits: () => undefined,
+    resetCredits: (id) => {
+      const account = byId.get(id)
+      return account?.vault ? undefined : resetCreditsOfQuota(account?.quota)
+    },
     onEmptyWeightedSet: () => {
       ctx.log?.debug(
         'sticky routing: no fresh weighted candidates; using configured order',
@@ -894,6 +900,7 @@ async function routeSticky<A extends RouteAttempt>(
     // The response's own quota has just been recorded, so judge the break on
     // the accounts as they are now.
     const current = ctx.accounts()
+    byId = new Map(current.map((account) => [account.id, account]))
     routing = routingInput(ctx, current)
     sticky = admitSticky(routing)
     place = placer(routing, sticky, current)

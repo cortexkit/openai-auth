@@ -20,7 +20,10 @@ export const BACKGROUND_QUOTA_REFRESH_LOCK_TTL_MS = 120_000
 type TimerHandle = ReturnType<typeof setInterval>
 
 interface BackgroundQuotaRefreshOptions {
-  setIntervalFn?: (callback: () => void, intervalMs: number) => TimerHandle
+  setIntervalFn?: (
+    callback: () => void | Promise<void>,
+    intervalMs: number,
+  ) => TimerHandle
   clearIntervalFn?: (timer: TimerHandle) => void
   random?: () => number
   onError?: (error: unknown) => void
@@ -89,18 +92,20 @@ function claimBackgroundRefresh(
  * Runs one background pass while holding the cross-process
  * `bg-quota-refresh` lease. When another live process holds it, the pass is
  * skipped and `skipped` is returned: that process polls for everyone and
- * writes the shared files. A failure of the lock mechanism itself fails
- * open and runs the pass anyway.
+ * writes the shared files. A failure of the lock mechanism normally runs
+ * the pass anyway; callers that require the lease can opt out.
  */
 export async function runUnderBackgroundLease<T>(
   run: () => Promise<T>,
   acquireLock: BackgroundLockAcquirer,
   skipped: T,
+  { failOpen = true } = {},
 ): Promise<T> {
   let lock: BackgroundLockHandle | null | undefined
   try {
     lock = await acquireLock()
-  } catch {
+  } catch (error) {
+    if (!failOpen) throw error
     lock = undefined
   }
   if (lock === null) return skipped
@@ -113,7 +118,6 @@ export async function runUnderBackgroundLease<T>(
 
 /** What the background pass of a migrated install needs from the account pool. */
 export interface PoolBackgroundSource {
-  active(): Promise<boolean>
   refreshDueTokens(storage: AccountStorage | null): Promise<void>
   pollRows(
     storage: AccountStorage | null,
@@ -127,22 +131,28 @@ export interface PoolBackgroundSource {
  * of every row whose reading is older than `BACKGROUND_QUOTA_FRESHNESS_MS`,
  * all through the pool source (the legacy refreshers never touch a pool
  * row). Resolves to the rows it polled, or to an empty list when another
- * process holds the lease.
+ * process holds the lease. A guarded pass also skips when it loses authority,
+ * and reports a broken lease instead of polling without it.
  */
 export function refreshPoolInBackground(
   source: PoolBackgroundSource,
   storage: AccountStorage | null,
   acquireLock: BackgroundLockAcquirer,
+  canPoll?: () => Promise<boolean>,
 ): Promise<Array<{ id: string; ok: boolean; error?: string }>> {
   return runUnderBackgroundLease(
     async () => {
+      if (canPoll && !(await canPoll())) return []
       await source.refreshDueTokens(storage)
+      // Enrollment or shutdown may have changed while a token was refreshing.
+      if (canPoll && !(await canPoll())) return []
       return source.pollRows(storage, {
         skipReadWithinMs: BACKGROUND_QUOTA_FRESHNESS_MS,
       })
     },
     acquireLock,
     [],
+    { failOpen: !canPoll },
   )
 }
 
@@ -192,6 +202,7 @@ export class BackgroundQuotaRefresh {
           if (this.tickPromise === tickPromise) this.tickPromise = undefined
         })
       this.tickPromise = tickPromise
+      return tickPromise
     }, BACKGROUND_QUOTA_REFRESH_INTERVAL_MS + jitter)
     if ('unref' in this.timer) this.timer.unref()
   }

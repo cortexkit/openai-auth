@@ -662,7 +662,9 @@ export function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 }
 
-function normalizeResetState(value: unknown): ResetStateByAccount | undefined {
+export function normalizeResetState(
+  value: unknown,
+): ResetStateByAccount | undefined {
   if (!isRecord(value)) return undefined
 
   const normalized = Object.create(null) as ResetStateByAccount

@@ -1,9 +1,16 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { LimitDecision, PolicyFacts } from '@cortexkit/common-auth/limits'
 import {
+  isQuotaMap,
   projectQuota,
   type QuotaMap,
   quotaCodec,
@@ -11,6 +18,8 @@ import {
 import { openPoolStore, type PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
+  BACKGROUND_QUOTA_REFRESH_INTERVAL_MS,
+  loadAccounts,
   mutateAccounts,
   normalizeQuotaHeaders,
   type RoutingMode,
@@ -47,7 +56,7 @@ import {
 } from '../runtime.ts'
 import { isolatePiAgentDir } from './test-isolation.ts'
 
-isolatePiAgentDir()
+const agentDir = isolatePiAgentDir()
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -102,7 +111,7 @@ function sseOk(headers: Record<string, string> = {}): Response {
   })
 }
 
-function whamOk(usedPercent = 10): Response {
+function whamOk(usedPercent = 10, balance?: number): Response {
   const resetAt = Math.floor((Date.now() + 2 * HOUR_MS) / 1000)
   return Response.json({
     rate_limit: {
@@ -117,6 +126,14 @@ function whamOk(usedPercent = 10): Response {
         reset_at: resetAt + 86_400,
       },
     },
+    ...(balance === undefined
+      ? {}
+      : {
+          rate_limit_reset_credits: {
+            available_count: balance,
+            applicable_available_count: balance,
+          },
+        }),
   })
 }
 
@@ -126,6 +143,10 @@ let calls: Call[]
 let codexHandler: Handler
 let whamHandler: Handler
 let tokenHandler: Handler
+let resetHandler: Handler
+const RESET_URL =
+  'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
+const CONSUME_URL = `${RESET_URL}/consume`
 
 const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input)
@@ -140,6 +161,7 @@ const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url === CODEX_URL) return codexHandler(call)
   if (url === WHAM_URL) return whamHandler(call)
   if (url.endsWith('/oauth/token')) return tokenHandler(call)
+  if (url === RESET_URL || url === CONSUME_URL) return resetHandler(call)
   return new Response('unexpected', { status: 500 })
 }) as typeof fetch
 
@@ -229,6 +251,7 @@ beforeEach(async () => {
   codexHandler = () => sseOk()
   whamHandler = () => whamOk()
   tokenHandler = () => new Response('unexpected refresh', { status: 500 })
+  resetHandler = () => new Response('unexpected reset', { status: 500 })
   await addRow('alpha', ALPHA_TOKEN, 'acct-alpha')
   await addRow('beta', BETA_TOKEN, 'acct-beta')
 })
@@ -752,6 +775,332 @@ describe('Pi pre-publication policy evidence', () => {
 afterEach(() => {
   clearPiStickyRouting('session-1')
   rmSync(tempDir, { recursive: true, force: true })
+})
+
+async function resetCommand(
+  runtime: PiOpenAIRuntime,
+  picks: string[],
+  confirm: boolean,
+  token?: string,
+) {
+  let handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> =
+    async () => {
+      throw new Error('/openai not registered')
+    }
+  registerCommands(
+    {
+      registerCommand: (_name, registration) => {
+        handler = registration.handler
+      },
+    } as Pick<ExtensionAPI, 'registerCommand'> as ExtensionAPI,
+    { pool: runtime.commandSupport() },
+  )
+  const seen: string[] = []
+  const notices: string[] = []
+  const prompts: string[] = []
+  await handler('', {
+    ui: {
+      select: async (_title: string, options: string[]) => {
+        seen.push(...options)
+        const next = picks.shift()
+        if (next === undefined) return undefined
+        const match = options.find((option) => option.startsWith(next))
+        if (!match)
+          throw new Error(`${next} missing from ${options.join(', ')}`)
+        return match
+      },
+      confirm: async (title: string) => {
+        prompts.push(title)
+        return confirm
+      },
+      notify: (message: string) => notices.push(message),
+    },
+    sessionManager: { getSessionId: () => 'session-1' },
+    modelRegistry: { getApiKeyForProvider: async () => token, refresh() {} },
+  } as unknown as ExtensionCommandContext)
+  expect(picks).toEqual([])
+  return { seen, notices, prompts }
+}
+
+function resetAvailable() {
+  return Response.json({
+    credits: [
+      {
+        id: 'credit-1',
+        status: 'available',
+        expires_at: new Date(Date.now() + HOUR_MS).toISOString(),
+        reset_type: 'codex_rate_limits',
+        is_supported_by_plan: true,
+      },
+    ],
+    available_count: 1,
+  })
+}
+
+describe('Pi reset credits', () => {
+  test('cancelled preview spends nothing; the confirmed balance breaks an admitted sticky tie', async () => {
+    let now = Date.now()
+    await setMode('sticky-balanced')
+    const runtime = makeRuntime(0, { now: () => now })
+    try {
+      whamHandler = () => whamOk(10, 0)
+      await runtime.start()
+      await runtime.pool.settled()
+      now += 20 * 60_000
+      await send(runtime, { apiKey: undefined, sessionId: 'session-1' })
+      expect(codexTokens()).toEqual([ALPHA_TOKEN])
+      clearPiStickyRouting('session-1')
+
+      whamHandler = ({ token }) =>
+        token === BETA_TOKEN ? whamOk(100, 1) : whamOk(10, 0)
+      resetHandler = ({ url }) => {
+        if (url === RESET_URL) return resetAvailable()
+        whamHandler = ({ token }) => whamOk(10, token === BETA_TOKEN ? 2 : 0)
+        return Response.json({ code: 'reset' })
+      }
+      const cancelled = await resetCommand(
+        runtime,
+        ['Reset credits', 'beta', 'Preview', 'beta', 'Spend a reset credit'],
+        false,
+      )
+      expect(cancelled.prompts).toHaveLength(1)
+      expect(calls.filter(({ url }) => url === RESET_URL)).toHaveLength(1)
+      expect(calls.filter(({ url }) => url === CONSUME_URL)).toEqual([])
+      expect((await loadAccounts(paths))?.reset).toBeUndefined()
+
+      const confirmed = await resetCommand(
+        runtime,
+        ['Reset credits', 'beta', 'Spend a reset credit'],
+        true,
+      )
+      expect(confirmed.notices.join('\n')).toContain(
+        'Remaining applicable credits: **2**',
+      )
+      expect(calls.filter(({ url }) => url === CONSUME_URL)).toEqual([
+        { url: CONSUME_URL, token: BETA_TOKEN, accountId: 'acct-beta' },
+      ])
+      expect((await loadAccounts(paths))?.reset?.beta?.lastOutcome?.code).toBe(
+        'reset',
+      )
+
+      now += 20 * 60_000
+      await send(runtime, { apiKey: undefined, sessionId: 'session-1' })
+      expect(codexTokens()).toEqual([ALPHA_TOKEN, BETA_TOKEN])
+      clearPiStickyRouting('session-1')
+      await store().disable('beta', 'fixture')
+      await send(runtime, { apiKey: undefined, sessionId: 'session-1' })
+      expect(codexTokens()).toEqual([ALPHA_TOKEN, BETA_TOKEN, ALPHA_TOKEN])
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  test('native main redeems without an account header or an auth.json write', async () => {
+    rmSync(paths.configPath)
+    rmSync(paths.statePath)
+    const authPath = join(agentDir(), 'auth.json')
+    const auth = Buffer.from(
+      `${JSON.stringify(
+        {
+          'openai-codex': {
+            type: 'oauth',
+            access: MAIN_TOKEN,
+            refresh: 'native-refresh',
+            expires: Date.now() + HOUR_MS,
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    writeFileSync(authPath, auth, { mode: 0o600 })
+    const runtime = makeRuntime()
+    try {
+      whamHandler = () => whamOk(100, 1)
+      resetHandler = ({ url }) => {
+        if (url === RESET_URL) return resetAvailable()
+        whamHandler = () => whamOk(10, 0)
+        return Response.json({ code: 'reset' })
+      }
+      await resetCommand(
+        runtime,
+        ['Reset credits', 'Main account', 'Spend a reset credit'],
+        true,
+        MAIN_TOKEN,
+      )
+      expect(
+        calls
+          .filter(({ url }) => url === RESET_URL || url === CONSUME_URL)
+          .map(({ url, token, accountId }) => [url, token, accountId]),
+      ).toEqual([
+        [RESET_URL, MAIN_TOKEN, undefined],
+        [RESET_URL, MAIN_TOKEN, undefined],
+        [CONSUME_URL, MAIN_TOKEN, undefined],
+      ])
+      expect(
+        JSON.parse(readFileSync(paths.configPath, 'utf8')).reset.main
+          .lastOutcome.code,
+      ).toBe('reset')
+      expect(readFileSync(authPath)).toEqual(auth)
+      const noToken = await resetCommand(runtime, ['Reset credits'], false)
+      expect(
+        noToken.seen.some((option) => option.startsWith('Main account')),
+      ).toBe(false)
+      expect(calls.filter(({ url }) => url.endsWith('/oauth/token'))).toEqual(
+        [],
+      )
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  for (const authority of ['enrolled', 'hosted'] as const) {
+    test(`${authority} Pi hides reset credits and refuses a confirmed local spend`, async () => {
+      const runtime = makeRuntime()
+      try {
+        if (authority === 'enrolled') {
+          const path = runtime.vault.paths.tokenPath
+          mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+          writeFileSync(
+            path,
+            JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+            { mode: 0o600 },
+          )
+        } else process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+        const command = createPiMenu(runtime.commandSupport())
+        const invocation = { notify() {} }
+        expect(
+          (await command.open(invocation)).menu.sections.map(({ id }) => id),
+        ).not.toContain('reset')
+        const result = await command.apply(
+          {
+            command: 'openai',
+            sectionId: 'reset',
+            itemId: 'beta',
+            actionId: 'spend',
+            confirmed: true,
+          },
+          invocation,
+        )
+        expect(result).toMatchObject({ ok: false, code: 'vault-local-action' })
+        expect(result.menu.sections.map(({ id }) => id)).not.toContain('reset')
+        expect(
+          calls.filter(({ url }) => url === RESET_URL || url === CONSUME_URL),
+        ).toEqual([])
+        expect((await loadAccounts(paths))?.reset).toBeUndefined()
+      } finally {
+        delete process.env.CORTEXKIT_VAULT_HOST
+        await runtime.dispose()
+      }
+    })
+  }
+})
+
+function idleQuotaTimer() {
+  let tick: (() => void | Promise<void>) | undefined
+  const clear = { count: 0 }
+  const backgroundQuota: NonNullable<PiOpenAIRuntimeDeps['backgroundQuota']> = {
+    setIntervalFn(callback, interval) {
+      expect(interval).toBe(BACKGROUND_QUOTA_REFRESH_INTERVAL_MS)
+      tick = callback
+      return { unref() {} } as ReturnType<typeof setInterval>
+    },
+    clearIntervalFn: () => {
+      clear.count++
+    },
+    random: () => 0.5,
+  }
+  return {
+    backgroundQuota,
+    clear,
+    tick: async () => {
+      expect(tick).toBeDefined()
+      await tick?.()
+    },
+  }
+}
+
+describe('Pi idle quota refresh', () => {
+  test('two Pi owners refresh a shared store once without polling native main', async () => {
+    let now = Date.now()
+    const a = idleQuotaTimer()
+    const b = idleQuotaTimer()
+    const first = makeRuntime(0, { ...a, now: () => now })
+    const second = makeRuntime(0, { ...b, now: () => now })
+    try {
+      await ready(first)
+      await ready(second)
+      calls.length = 0
+      now += BACKGROUND_QUOTA_REFRESH_INTERVAL_MS
+      whamHandler = () => whamOk(40)
+      await Promise.all([a.tick(), b.tick()])
+      await b.tick()
+      expect(
+        calls.map(({ url, accountId }) => `${url} ${accountId}`).sort(),
+      ).toEqual([`${WHAM_URL} acct-alpha`, `${WHAM_URL} acct-beta`])
+      const loaded = await store().read()
+      const quota =
+        loaded.status === 'ready' ? loaded.rows[0]?.quota : undefined
+      expect(isQuotaMap(quota) && projectQuota(quota).limits[0]).toMatchObject({
+        usedPercent: 40,
+        checkedAt: now,
+      })
+    } finally {
+      await Promise.all([first.dispose(), second.dispose()])
+    }
+    expect(a.clear.count).toBe(1)
+    await a.tick()
+    expect(calls).toHaveLength(2)
+  })
+
+  for (const stop of ['enrolled', 'shutdown'] as const) {
+    test(`a Pi idle tick that overlaps ${stop} starts no quota poll`, async () => {
+      let now = Date.now()
+      const timer = idleQuotaTimer()
+      const runtime = makeRuntime(0, { ...timer, now: () => now })
+      const entered = Promise.withResolvers<void>()
+      const resume = Promise.withResolvers<void>()
+      let closing: Promise<void> | undefined
+      try {
+        await store().remove('beta')
+        await ready(runtime)
+        calls.length = 0
+        now += 10 * 24 * HOUR_MS - 60_000
+        tokenHandler = async () => {
+          entered.resolve()
+          await resume.promise
+          return Response.json({ error: 'invalid_grant' }, { status: 400 })
+        }
+        const pending = timer.tick()
+        // If the timer is not wired, the tick settles without starting refresh.
+        expect(
+          await Promise.race([
+            entered.promise.then(() => true),
+            pending.then(() => false),
+          ]),
+        ).toBe(true)
+        if (stop === 'enrolled') {
+          const path = runtime.vault.paths.tokenPath
+          mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+          writeFileSync(
+            path,
+            JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+            { mode: 0o600 },
+          )
+          expect(await runtime.readAuthority()).toBe('vault')
+        } else closing = runtime.dispose()
+        resume.resolve()
+        await pending
+        await timer.tick()
+        expect(calls.map(({ url }) => new URL(url).pathname)).toEqual([
+          '/oauth/token',
+        ])
+      } finally {
+        resume.resolve()
+        await (closing ?? runtime.dispose())
+      }
+    })
+  }
 })
 
 describe('Pi requests on the account pool', () => {

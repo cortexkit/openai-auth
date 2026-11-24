@@ -71,6 +71,10 @@ On Pi, `openai-auth.json` lives in Pi's agent folder (`PI_CODING_AGENT_DIR`, els
 
 **Pi.** Pi hands each `openai-codex` request to the extension with the token of Pi's own login. That login is routed as row `main` and the pool rows are fallbacks (`packages/pi/src/main-account.ts`). The runtime picks the account and streams through pi-ai's Codex stream with that account's token; pi-ai derives `chatgpt-account-id` from the token. In vault mode Pi's slot holds a placeholder and only vault routes serve.
 
+**Idle quota.** Each host uses the same renewable lease per account store for background quota refresh. The lease holder saves new pool readings before releasing it, so the next process can skip recently read accounts. OpenCode 2 and Pi recheck local authority during each pass and stop their timers at shutdown. Pi's idle pass never resolves, refreshes or polls its native login.
+
+**Pi reset credits.** In local mode, `/openai` previews and redeems reset credits for enabled OAuth pool accounts and for native `main` when Pi has supplied its token. The reset ledger lives in the plugin's account store, not Pi's `auth.json`. Sticky routing uses the balance returned by the subsequent quota check only among accounts that passed admission.
+
 ## Codex wire shape
 
 `prepareCodexRequest` (`packages/opencode/src/codex-request.ts`) makes a request look like it came from the official Codex CLI: Codex headers and client version (`CODEX_VERSION`), a UUIDv7 thread id per host session and turn id per user turn, turn metadata, and Codex's body key order. The thread id doubles as the prompt-cache key, so `codex-sessions.ts` stores it per session (thread ids only, never a token) and a restart keeps the cache.

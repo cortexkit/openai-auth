@@ -6,7 +6,7 @@ The Pi package of [CortexKit OpenAI Auth](https://github.com/cortexkit/openai-au
 
 ## Install
 
-Requires Pi 1.0.1 or newer. See [Install](https://github.com/cortexkit/openai-auth#install) in the repository README; installing with Pi's own package manager is described in [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#installing-on-pi).
+Requires Pi 1.0.1 or newer. The extension is tested with Pi 1.5.2, the version pinned in the workspace lockfile. See [Install](https://github.com/cortexkit/openai-auth#install) in the repository README; installing with Pi's own package manager is described in [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#installing-on-pi).
 
 ## Documentation
 

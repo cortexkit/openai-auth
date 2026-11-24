@@ -56,7 +56,10 @@ import {
   refreshBeforeExpiryMs,
   rememberPoolObservation,
 } from '@cortexkit/openai-auth-core/internal'
-import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
+import {
+  observationFromSnapshot,
+  quotaReadAt,
+} from '@cortexkit/openai-auth-core/pool-quota'
 import { identityOfToken } from './main-account.ts'
 
 /**
@@ -116,6 +119,10 @@ export interface PiPoolSourceDeps {
 
 type Snapshot = PiPoolView & { key: string | undefined; readAt: number }
 
+type PollResultForCredential = Pick<PoolRow, 'credentialEpoch' | 'identity'> & {
+  snapshot: OAuthQuotaSnapshot
+}
+
 /** How one row's quota poll ended, for the `/openai` quota check. */
 export interface PoolPollResult {
   id: string
@@ -165,7 +172,8 @@ export class PiPoolSource {
     readAt: 0,
   }
   private inflightRead: { key: string; promise: Promise<Snapshot> } | undefined
-  private store: { configPath: string; store: PoolStore } | undefined
+  private store: (AccountPaths & { store: PoolStore }) | undefined
+  private immediateStore: typeof this.store
   private readonly stores = new Set<PoolStore>()
   private disposal: Promise<void> | undefined
   private initializing:
@@ -183,6 +191,7 @@ export class PiPoolSource {
   >()
   private readonly polled = new Set<string>()
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
+  private readonly polledSnapshots = new Map<string, PollResultForCredential>()
   private disposed = false
 
   constructor(deps: PiPoolSourceDeps) {
@@ -232,14 +241,19 @@ export class PiPoolSource {
     return `${paths.configPath}|${fileKey(paths.configPath)}|${fileKey(paths.statePath)}`
   }
 
-  private storeFor(paths: AccountPaths): PoolStore {
-    if (this.store?.configPath === paths.configPath) return this.store.store
+  private storeFor(paths: AccountPaths, persistQuota = false): PoolStore {
+    const cached = persistQuota ? this.immediateStore : this.store
+    if (
+      cached?.configPath === paths.configPath &&
+      cached.statePath === paths.statePath
+    )
+      return cached.store
     const store = openPoolStore({
       provider: 'openai',
       configPath: paths.configPath,
       statePath: paths.statePath,
       quota: quotaCodec,
-      coalesceQuota: true,
+      coalesceQuota: !persistQuota,
       now: this.now,
       pull: (request) => this.coalescedPull(request),
       onPullFailure: (rowId, error) => {
@@ -273,7 +287,9 @@ export class PiPoolSource {
           )
       },
     })
-    this.store = { configPath: paths.configPath, store }
+    const entry = { ...paths, store }
+    if (persistQuota) this.immediateStore = entry
+    else this.store = entry
     this.stores.add(store)
     return store
   }
@@ -411,8 +427,13 @@ export class PiPoolSource {
    * it refuses for want of a reading. First-reading admission may join the
    * returned promise; callers with an existing reading remain nonblocking.
    */
-  requestReading(id: string, force = false): Promise<void> | undefined {
+  requestReading(
+    id: string,
+    force = false,
+    store?: PoolStore,
+  ): Promise<void> | undefined {
     if (this.disposed || this.setAside()) return
+    store ??= this.poolStore()
     const now = this.now()
     const last = this.lastPull.get(id)
     if (
@@ -420,9 +441,8 @@ export class PiPoolSource {
       last !== undefined &&
       now - last < (this.deps.pullRetryMs ?? POOL_PULL_RETRY_MS)
     )
-      return this.storeFor(this.deps.paths()).pullsSettled()
+      return store.pullsSettled()
     this.lastPull.set(id, now)
-    const store = this.storeFor(this.deps.paths())
     store.requestReading(id)
     return store.pullsSettled()
   }
@@ -464,6 +484,11 @@ export class PiPoolSource {
       row.credentialEpoch === request.credentialEpoch &&
       row.identity === request.identity
     ) {
+      this.polledSnapshots.set(request.id, {
+        credentialEpoch: row.credentialEpoch,
+        identity: row.identity,
+        snapshot: poll.snapshot,
+      })
       this.applyObservation(row, poll.observation)
     }
     return poll.observation
@@ -563,7 +588,7 @@ export class PiPoolSource {
     settings: AccountStorage | null,
     { waitForAll = false } = {},
   ): Promise<void> {
-    if (this.setAside()) return Promise.resolve()
+    if (this.disposed || this.setAside()) return Promise.resolve()
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(settings)
     const runs: Promise<void>[] = []
@@ -702,20 +727,34 @@ export class PiPoolSource {
    * pull path the first and admission polls take, and resolves once every
    * poll has ended. Due tokens are refreshed first.
    */
-  async pollRows(settings: AccountStorage | null): Promise<PoolPollResult[]> {
+  async pollRows(
+    settings: AccountStorage | null,
+    options: { ids?: readonly string[]; skipReadWithinMs?: number } = {},
+  ): Promise<PoolPollResult[]> {
     if (this.setAside()) return []
     const view = await this.load()
     if (!view.active || this.disposed) return []
-    const targets = view.rows.filter(
-      (row) => row.candidate && row.type === 'oauth',
-    )
+    const now = this.now()
+    const targets = view.rows.filter((row) => {
+      if (!row.candidate || row.type !== 'oauth') return false
+      if (options.ids && !options.ids.includes(row.id)) return false
+      if (options.skipReadWithinMs === undefined) return true
+      const readAt = quotaReadAt(row)
+      return readAt === undefined || now - readAt >= options.skipReadWithinMs
+    })
     if (targets.length === 0) return []
     await this.refreshDueTokens(targets, settings)
+    // The next lease holder must see these readings on disk. Reset checks
+    // also save the returned balance before giving control back to the menu.
+    const store = this.storeFor(
+      this.deps.paths(),
+      options.skipReadWithinMs !== undefined || options.ids !== undefined,
+    )
     for (const row of targets) {
       this.pollOutcomes.delete(row.id)
-      this.requestReading(row.id, true)
+      this.requestReading(row.id, true, store)
     }
-    await this.poolStore().pullsSettled()
+    await store.pullsSettled()
     return targets.map(
       (row) =>
         this.pollOutcomes.get(row.id) ?? {
@@ -724,6 +763,19 @@ export class PiPoolSource {
           error: 'the quota poll did not run',
         },
     )
+  }
+
+  /** The last provider poll attributed to this row's current login. */
+  polledQuota(id: string): OAuthQuotaSnapshot | undefined {
+    const row = this.snapshot.rows.find((value) => value.id === id)
+    const poll = this.polledSnapshots.get(id)
+    if (
+      row &&
+      poll &&
+      row.credentialEpoch === poll.credentialEpoch &&
+      row.identity === poll.identity
+    )
+      return poll.snapshot
   }
 
   // -------------------------------------------------------------------------
@@ -754,7 +806,7 @@ export class PiPoolSource {
         ...(this.initializing ? [this.initializing.promise] : []),
       ]
       await Promise.allSettled(pending)
-      await this.store?.store.pullsSettled()
+      await Promise.all([...this.stores].map((store) => store.pullsSettled()))
       if (this.writes.size === 0 && this.refreshing.size === 0) {
         await this.disposal
         return

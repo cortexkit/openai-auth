@@ -111,6 +111,17 @@ export class PiMainAccount {
     return this.token
   }
 
+  /** A fresh lookup from Pi found no login; do not offer the previous one. */
+  clearToken(): void {
+    this.token = undefined
+    this.identity = undefined
+    this.quota = undefined
+    this.snapshot = undefined
+    this.firstPolledFor = undefined
+    this.lastPull = undefined
+    this.inflight = undefined
+  }
+
   currentIdentity(): string | undefined {
     return this.identity
   }
@@ -131,6 +142,9 @@ export class PiMainAccount {
     return {
       ...(this.snapshot?.resetCreditsAvailable !== undefined
         ? { resetCreditsAvailable: this.snapshot.resetCreditsAvailable }
+        : {}),
+      ...(this.snapshot?.resetCreditsApplicable !== undefined
+        ? { resetCreditsApplicable: this.snapshot.resetCreditsApplicable }
         : {}),
       ...(this.snapshot?.spendControl
         ? { spendControl: this.snapshot.spendControl }

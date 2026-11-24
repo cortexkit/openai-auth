@@ -23,6 +23,7 @@ import {
   createOpenAiMenu,
   OPENAI_COMMAND_NAME,
   OPENAI_MENU_TITLE,
+  resetCreditsSection,
   sessionSection,
   vaultSection,
 } from '@cortexkit/openai-auth-core'
@@ -113,6 +114,7 @@ export function createPiMenu(
   const begin = dependencies.beginAccountLogin ?? beginAccountLogin
   const version = dependencies.packageVersion ?? packageJson.version
   const startup = dependencies.settingsStartup
+  const reset = pool.resetCredits?.()
   const vaultMenu = vaultSection({
     vault: pool.vault,
     changed: dependencies.afterApply,
@@ -167,6 +169,7 @@ export function createPiMenu(
         )
     },
     extras: [
+      ...(reset ? [resetCreditsSection(reset)] : []),
       piLoginSection(() => pool.mainQuota()),
       sessionSection({
         getPin: async (sessionId) => getPiStickyRouting(sessionId),
@@ -260,15 +263,29 @@ export function createPiMenu(
       return pool.reload()
     },
   })
+  const hideLocalReset = <T extends Awaited<ReturnType<CommandMenu['open']>>>(
+    result: T,
+  ): T =>
+    pool.vaultMode()
+      ? {
+          ...result,
+          menu: {
+            ...result.menu,
+            sections: result.menu.sections.filter(
+              (section) => section.id !== 'reset',
+            ),
+          },
+        }
+      : result
   return {
     command: menu.command,
     open: async (invocation) => {
       await pool.readAuthority()
-      return menu.open(invocation)
+      return hideLocalReset(await menu.open(invocation))
     },
     apply: async (request, invocation) => {
       await pool.readAuthority()
-      return menu.apply(request, invocation)
+      return hideLocalReset(await menu.apply(request, invocation))
     },
   }
 }
@@ -321,6 +338,7 @@ async function runOpenAiCommand(
       )
     } catch {
       // No login: the menu shows the pool's rows alone.
+      await pool.observeLogin(undefined)
     }
   }
   await runPiCommandMenu(createPiMenu(pool, dependencies), ctx.ui, {

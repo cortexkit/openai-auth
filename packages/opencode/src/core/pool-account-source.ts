@@ -31,12 +31,7 @@
 
 import { readFileSync } from 'node:fs'
 import type { IdentityBinding } from '@cortexkit/common-auth/limits'
-import {
-  isQuotaMap,
-  projectQuota,
-  type QuotaObservation,
-  quotaCodec,
-} from '@cortexkit/common-auth/quota'
+import { type QuotaObservation, quotaCodec } from '@cortexkit/common-auth/quota'
 import {
   type OpenPoolStoreOptions,
   openPoolStore,
@@ -75,7 +70,9 @@ import {
   readPoolMigrationBookkeeping,
   refreshPoolRow,
 } from './pool-migration'
-import { observationFromSnapshot } from './pool-quota'
+import { observationFromSnapshot, quotaReadAt } from './pool-quota'
+
+export { quotaReadAt } from './pool-quota'
 
 /**
  * A request waits for a refresh only when its token has less than this left;
@@ -190,18 +187,6 @@ export interface PoolPollResult {
   error?: string
 }
 
-/**
- * The time of a row's oldest quota reading, or undefined when it has none: a
- * row is only as fresh as its stalest window.
- */
-export function quotaReadAt(row: Pick<PoolRow, 'quota'>): number | undefined {
-  if (!isQuotaMap(row.quota)) return undefined
-  const projection = projectQuota(row.quota)
-  return projection.limits.some((limit) => limit.kind === 'reading')
-    ? projection.checkedAt
-    : undefined
-}
-
 function identityOfToken(access: string | undefined): string | undefined {
   if (!access) return undefined
   const claims = parseJwtClaims(access)
@@ -251,6 +236,7 @@ export class PoolAccountSource {
   private store:
     | { configPath: string; statePath: string; store: PoolStore }
     | undefined
+  private immediateStore: typeof this.store
   private readonly stores = new Set<PoolStore>()
   private disposal: Promise<void> | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
@@ -368,18 +354,19 @@ export class PoolAccountSource {
     return `${paths.configPath}|${fileKey(paths.configPath)}|${fileKey(paths.statePath)}`
   }
 
-  private storeFor(paths: AccountPaths): PoolStore {
+  private storeFor(paths: AccountPaths, persistQuota = false): PoolStore {
+    const cached = persistQuota ? this.immediateStore : this.store
     if (
-      this.store?.configPath === paths.configPath &&
-      this.store.statePath === paths.statePath
+      cached?.configPath === paths.configPath &&
+      cached.statePath === paths.statePath
     )
-      return this.store.store
+      return cached.store
     const store = openPoolStore({
       provider: 'openai',
       configPath: paths.configPath,
       statePath: paths.statePath,
       quota: quotaCodec,
-      coalesceQuota: true,
+      coalesceQuota: !persistQuota,
       now: this.now,
       pull: (request) => this.coalescedPull(request),
       onPullFailure: (rowId, error) => {
@@ -411,11 +398,13 @@ export class PoolAccountSource {
           )
       },
     })
-    this.store = {
+    const entry = {
       configPath: paths.configPath,
       statePath: paths.statePath,
       store,
     }
+    if (persistQuota) this.immediateStore = entry
+    else this.store = entry
     this.stores.add(store)
     return store
   }
@@ -571,8 +560,13 @@ export class PoolAccountSource {
    * want of a reading. The returned promise lets first-reading admission join
    * the store's pending polls without blocking callers that do not await it.
    */
-  requestReading(id: string, force = false): Promise<void> | undefined {
+  requestReading(
+    id: string,
+    force = false,
+    store?: PoolStore,
+  ): Promise<void> | undefined {
     if (this.disposed || this.deps.vaultMode?.()) return
+    store ??= this.poolStore()
     const now = this.now()
     const last = this.lastPull.get(id)
     if (
@@ -580,9 +574,8 @@ export class PoolAccountSource {
       last !== undefined &&
       now - last < (this.deps.pullRetryMs ?? POOL_PULL_RETRY_MS)
     )
-      return this.storeFor(this.deps.paths()).pullsSettled()
+      return store.pullsSettled()
     this.lastPull.set(id, now)
-    const store = this.storeFor(this.deps.paths())
     store.requestReading(id)
     return store.pullsSettled()
   }
@@ -1022,11 +1015,17 @@ export class PoolAccountSource {
     })
     if (targets.length === 0) return []
     await this.prepareTokens(targets, storage, { waitForAll: true })
+    // An idle pass must publish before releasing its lease; otherwise the
+    // next owner can see the old reading and poll the same account again.
+    const store = this.storeFor(
+      this.deps.paths(),
+      options.skipReadWithinMs !== undefined,
+    )
     for (const row of targets) {
       this.pollOutcomes.delete(row.id)
-      this.requestReading(row.id, true)
+      this.requestReading(row.id, true, store)
     }
-    await this.poolStore().pullsSettled()
+    await store.pullsSettled()
     return targets.map(
       (row) =>
         this.pollOutcomes.get(row.id) ?? {
@@ -1118,7 +1117,7 @@ export class PoolAccountSource {
         ...(this.inflightRead ? [this.inflightRead.promise] : []),
       ]
       await Promise.allSettled(pending)
-      await this.store?.store.pullsSettled()
+      await Promise.all([...this.stores].map((store) => store.pullsSettled()))
       if (
         this.writes.size === 0 &&
         this.refreshing.size === 0 &&

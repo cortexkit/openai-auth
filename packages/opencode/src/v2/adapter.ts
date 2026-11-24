@@ -131,7 +131,10 @@ import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { VAULT_FIRST_ROSTER_WAIT_MS } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
-import { windowsFromQuotaMap } from '../core/pool-quota'
+import { resetCreditsOfQuota, windowsFromQuotaMap } from '../core/pool-quota'
+
+export { resetCreditsOfQuota } from '../core/pool-quota'
+
 import { routableRows } from '../core/pool-request'
 import {
   type AdmissionTier,
@@ -361,21 +364,6 @@ function waitForRoutingRetry(delayMs: number, signal?: AbortSignal) {
     }, delayMs)
     signal?.addEventListener('abort', abort, { once: true })
   })
-}
-
-/**
- * The reset-credit balance a pool row's or vault account's quota map holds
- * (`counters.resetCredits.value`), kept only when it is a finite number, as
- * OpenCode 1 reads its own saved balance. An explicit 0 stays 0; a missing or
- * malformed count is undefined.
- */
-export function resetCreditsOfQuota(quota: unknown): number | undefined {
-  const counters = isRecord(quota) ? quota.counters : undefined
-  const resetCredits = isRecord(counters) ? counters.resetCredits : undefined
-  const credits = isRecord(resetCredits) ? resetCredits.value : undefined
-  return typeof credits === 'number' && Number.isFinite(credits)
-    ? credits
-    : undefined
 }
 
 function parseJson(text: string): unknown {

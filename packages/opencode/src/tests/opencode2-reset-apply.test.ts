@@ -19,6 +19,7 @@ import {
 import { join } from 'node:path'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import {
+  BACKGROUND_QUOTA_REFRESH_INTERVAL_MS,
   VAULT_LOCAL_ACTION_REFUSAL,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
@@ -34,7 +35,7 @@ import { resetNotificationsForTest } from '../rpc/notifications'
 import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import type { ControlPlaneMenu } from '../v2/control-plane'
 import { opencode1HostSlot } from '../v2/host-slot'
-import { setupOpenAIAuth } from '../v2/setup'
+import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
   type PoolFiles,
@@ -198,6 +199,7 @@ interface StartOptions {
   slotReads?: { count: number }
   /** Connects this host to a stand-in vault holding one ChatGPT account. */
   vault?: boolean
+  backgroundQuota?: OpenAIAuthV2Options['backgroundQuota']
 }
 
 /** A stand-in vault daemon and an approved enrollment, as Connect leaves it. */
@@ -296,6 +298,9 @@ async function start(options: StartOptions = {}) {
     poolMigration: false,
     fetch: wire.fetch,
     now: () => clock,
+    ...(options.backgroundQuota
+      ? { backgroundQuota: options.backgroundQuota }
+      : {}),
     vault: {
       stateDir: vaultDir,
       pollIntervalMs: 0,
@@ -354,6 +359,70 @@ function expectNothingSpent(f: Awaited<ReturnType<typeof start>>) {
   expect(f.wire.posts()).toEqual([])
   expect(f.savedReset()).toEqual({})
 }
+
+test('idle OpenCode 2 locations refresh only their own stores and stop on shutdown', async () => {
+  const open = async () => {
+    let tick: (() => void | Promise<void>) | undefined
+    let cleared = false
+    const f = await start({
+      rows: [{ id: 'alpha' }],
+      backgroundQuota: {
+        setIntervalFn(callback, interval) {
+          expect(interval).toBe(BACKGROUND_QUOTA_REFRESH_INTERVAL_MS)
+          tick = callback
+          return { unref() {} } as ReturnType<typeof setInterval>
+        },
+        clearIntervalFn: () => {
+          cleared = true
+        },
+        random: () => 0.5,
+      },
+    })
+    const used = () =>
+      f.files.readConfig().commonAuthPool.rows.alpha?.quota?.limits?.[0]
+        ?.usedPercent
+    const deadline = Date.now() + 5_000
+    while (used() !== 100) {
+      if (Date.now() > deadline)
+        throw new Error('OpenCode 2 did not persist the initial reading')
+      await Bun.sleep(10)
+    }
+    return {
+      ...f,
+      used,
+      tick: async () => {
+        expect(tick).toBeDefined()
+        await tick?.()
+      },
+      cleared: () => cleared,
+    }
+  }
+  const first = await open()
+  const second = await open()
+  first.wire.calls.length = 0
+  second.wire.calls.length = 0
+  for (const [location, used] of [
+    [first, 31],
+    [second, 42],
+  ] as const) {
+    location.wire.accounts.get('alpha')!.used = used
+    location.advance(BACKGROUND_QUOTA_REFRESH_INTERVAL_MS)
+  }
+  await first.tick()
+  expect(first.used()).toBe(31)
+  expect(second.used()).toBe(100)
+  await second.tick()
+  expect(second.used()).toBe(42)
+  for (const location of [first, second]) {
+    await location.dispose()
+    expect(location.cleared()).toBe(true)
+    location.advance(BACKGROUND_QUOTA_REFRESH_INTERVAL_MS)
+    await location.tick()
+    expect(
+      location.wire.calls.map(({ path, account }) => [path, account]),
+    ).toEqual([['/backend-api/wham/usage', 'alpha']])
+  }
+})
 
 describe('OpenCode 2 reset credits menu', () => {
   test('opening /openai lists main and each enabled account with Preview, Spend and Retry, and spends nothing', async () => {

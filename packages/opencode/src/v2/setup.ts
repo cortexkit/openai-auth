@@ -52,6 +52,8 @@ import {
 } from '@cortexkit/common-auth/opencode2'
 import {
   type AccountPaths,
+  acquireBackgroundRefreshLock,
+  BackgroundQuotaRefresh,
   beginAccountLogin,
   codexRefreshFn,
   deferSessionCacheResponseTouch,
@@ -64,6 +66,7 @@ import {
   redactCredentialFrame,
   redactCredentialResponse,
   redactCredentialText,
+  refreshPoolInBackground,
   reportSessionCacheResponse,
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
@@ -175,6 +178,7 @@ const CLEANUP_PHASES = [
 
 type CleanupStep =
   | (typeof CLEANUP_PHASES)[number][number]
+  | 'background quota'
   | 'session events'
   | 'adapter'
   | 'vault lease'
@@ -201,6 +205,7 @@ function createSetupCleanup(log: Pick<OpenAIAdapterLogger, 'warn'>) {
   async function close(): Promise<void> {
     closing = true
     try {
+      await release('background quota')
       await release('session events')
       await release('adapter')
       // Drop the keep-warm hold before closing the pool and vault it uses.
@@ -264,6 +269,8 @@ export interface OpenAIAuthV2Options {
   >
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
+  /** Test seam for the idle pool refresh timer. */
+  backgroundQuota?: ConstructorParameters<typeof BackgroundQuotaRefresh>[0]
   /** OpenCode 1's login slot the migration reads; its `auth.json` by default. */
   slot?: HostSlotAdapter
   /** This build's version, for the heartbeat and the version fence. */
@@ -875,11 +882,23 @@ async function initializeOpenAIAuth(
   await vault.authority()
   setupTrace('after vault.authority', directory)
   const vaultFirstRoster = vaultLease.firstRoster
+  const canPollLocal = async () =>
+    !cleanup.closing &&
+    (await vault.authority()) === 'local' &&
+    !cleanup.closing
 
   const resetCounts = new ResetCreditCounts()
+  const pullQuota = createPoolQuotaPull({
+    fetchImpl,
+    now,
+    counts: resetCounts,
+    logger: logQ,
+  })
   const source = new PoolAccountSource({
     paths,
     refreshProvider: async (credential) => {
+      if (!(await canPollLocal()))
+        throw new Error('Local token refresh is unavailable')
       const tokens = await codexRefreshFn({
         refreshToken: credential.refresh,
         fetchImpl,
@@ -896,12 +915,8 @@ async function initializeOpenAIAuth(
     // the row's quota map (what routing reads). The poll's applicable count,
     // which the reset result reports and the map has no field for, goes
     // into `resetCounts`.
-    pullQuota: createPoolQuotaPull({
-      fetchImpl,
-      now,
-      counts: resetCounts,
-      logger: logQ,
-    }),
+    pullQuota: (request) =>
+      cleanup.closing ? Promise.resolve(undefined) : pullQuota(request),
     now,
     // One ChatGPT account has one owner. A local pool row signing in as an
     // account the vault holds for this host belongs to the vault, so this
@@ -926,6 +941,21 @@ async function initializeOpenAIAuth(
     await source.load()
     setupTrace('after source.load', directory)
   }
+  const backgroundQuota = new BackgroundQuotaRefresh(options.backgroundQuota)
+  cleanup.defer('background quota', () => backgroundQuota.stop())
+  backgroundQuota.start(
+    async () => {
+      if (!(await canPollLocal())) return
+      const accountPaths = paths()
+      await refreshPoolInBackground(
+        source,
+        await loadAccounts(accountPaths),
+        () => acquireBackgroundRefreshLock(accountPaths.configPath),
+        canPollLocal,
+      )
+    },
+    (error) => logQ.warn('Background pool quota refresh failed', { error }),
+  )
   // The limits source selects the pool or vault-roster namespace after a
   // pool-routed request waits for account readiness. Setup and polls acquire none.
   const limits = new OpenCodeLimitSource({

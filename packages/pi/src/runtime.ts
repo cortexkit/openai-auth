@@ -39,10 +39,13 @@ import {
 } from '@cortexkit/common-auth/limits'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
+import type { ResetCreditsDeps } from '@cortexkit/openai-auth-core'
 import {
   type AccountPaths,
   type AccountStorage,
+  acquireBackgroundRefreshLock,
   applyMidConversationEffort,
+  BackgroundQuotaRefresh,
   buildOpenAiQuotaRefusal,
   type CodexEffortState,
   chooseVaultRouting,
@@ -76,6 +79,7 @@ import {
   redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
+  refreshPoolInBackground,
   reportVaultRouting,
   reportVaultRoutingLimit,
   resolveCodexEndpoint,
@@ -149,6 +153,7 @@ import {
 } from './pool-request.ts'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { piQuotaStatusText } from './quota-status.ts'
+import { piResetCredits } from './reset-credits.ts'
 import { placePiStickyPin } from './routing.ts'
 import {
   openVaultSlot,
@@ -199,6 +204,8 @@ export interface PiOpenAIRuntimeDeps {
   installationID?: string
   firstReadingWaitMs?: number
   readBudgetMs?: number
+  /** Test seam for the idle pool refresh timer. */
+  backgroundQuota?: ConstructorParameters<typeof BackgroundQuotaRefresh>[0]
   /** Replaces Pi's connection to the Claustrum vault (tests); by default its files live next to the account files. */
   vault?: OpenAiVault
   /** Replaces the disk slot for isolated host-runtime tests. */
@@ -325,6 +332,8 @@ export class PiOpenAIRuntime {
   readonly vault: OpenAiVault
   readonly activity = createSessionActivityStore()
   private readonly cacheKeep: PiCacheKeep
+  private readonly backgroundQuota: BackgroundQuotaRefresh
+  private disposed = false
   private readonly primaryRequests = new Map<string, object>()
   private readonly effortBySession = new Map<string, CodexEffortState>()
   private readonly frameTurns = new FrameTurnState()
@@ -365,6 +374,7 @@ export class PiOpenAIRuntime {
   constructor(deps: PiOpenAIRuntimeDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
+    this.backgroundQuota = new BackgroundQuotaRefresh(deps.backgroundQuota)
     this.installationID = deps.installationID ?? crypto.randomUUID()
     // Keep cached sockets and their response ids on one endpoint until restart.
     this.codexEndpoint = resolveCodexEndpoint(
@@ -378,7 +388,7 @@ export class PiOpenAIRuntime {
     this.main = new PiMainAccount({
       now: this.now,
       poll: async (token, identity) => {
-        if ((await this.readAuthority()) !== 'local')
+        if (!(await this.canPollLocal()))
           throw new Error('Pi login quota polling is disabled while enrolled')
         const snapshot = await whamUsageFn({
           accessToken: token,
@@ -403,7 +413,7 @@ export class PiOpenAIRuntime {
       vaultMode: () => this.vaultMode(),
       vaultAuthority: () => this.readAuthority(),
       refreshProvider: async (credential) => {
-        if ((await this.readAuthority()) !== 'local')
+        if (!(await this.canPollLocal()))
           throw new Error('Local token refresh is disabled while enrolled')
         const tokens = await codexRefreshFn({
           refreshToken: credential.refresh,
@@ -418,7 +428,7 @@ export class PiOpenAIRuntime {
         return { ...tokens, ...(identity ? { identity } : {}) }
       },
       pullQuota: async (request) => {
-        if ((await this.readAuthority()) !== 'local')
+        if (!(await this.canPollLocal()))
           throw new Error('Local quota polling is disabled while enrolled')
         const credential = request.credential
         if (credential.type !== 'oauth' || !credential.access)
@@ -498,6 +508,14 @@ export class PiOpenAIRuntime {
   /** A fresh read of enrollment, through the vault so Pi and OpenCode share one rule and one cache. */
   readAuthority(): Promise<'host' | 'local' | 'vault' | 'unreadable'> {
     return this.vault.authority()
+  }
+
+  private async canPollLocal(): Promise<boolean> {
+    return (
+      !this.disposed &&
+      (await this.readAuthority()) === 'local' &&
+      !this.disposed
+    )
   }
 
   private vaultSlot(): PiSlot {
@@ -580,21 +598,43 @@ export class PiOpenAIRuntime {
     this.slotVaultMode = currentMode
   }
 
-  /**
-   * Reads the pool once, which starts every row's first quota poll, and
-   * starts the vault's background poll of Pi's vault accounts. Never
-   * rejects.
-   */
+  /** Starts the first readings and keeps idle pool rows up to date. */
   async start(): Promise<void> {
-    await this.readAuthority()
+    const local = await this.canPollLocal()
+    if (this.disposed) return
     this.vault.start()
-    return this.pool.load().then(
-      () => {},
-      () => {},
+    this.backgroundQuota.start(
+      async () => {
+        if (!(await this.canPollLocal())) return
+        const paths = this.paths()
+        // The lease covers pool rows only. Pi owns the native login; an
+        // idle tick neither resolves its token nor polls its usage.
+        await refreshPoolInBackground(
+          {
+            refreshDueTokens: async (settings) =>
+              this.pool.refreshDueTokens(
+                (await this.pool.load()).rows,
+                settings,
+              ),
+            pollRows: (settings, options) =>
+              this.pool.pollRows(settings, options),
+          },
+          this.settings(await loadAccounts(paths)),
+          () => acquireBackgroundRefreshLock(paths.configPath),
+          () => this.canPollLocal(),
+        )
+      },
+      (error) =>
+        createLogger('quota').warn('Background pool quota refresh failed', {
+          error,
+        }),
     )
+    if (local) await this.pool.load().catch(() => {})
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true
+    this.backgroundQuota.stop()
     this.bindQuotaStatus()
     this.resolveMainToken = undefined
     this.primaryRequests.clear()
@@ -1850,12 +1890,23 @@ export class PiOpenAIRuntime {
       // In vault mode Pi's login is not used, so it is not taken (taking a
       // new login starts a quota poll with it).
       observeLogin: async (token) => {
-        if ((await this.readAuthority()) === 'local')
-          this.main.observeToken(token)
+        if (!(await this.canPollLocal())) return
+        if (token) this.main.observeToken(token)
+        else this.main.clearToken()
       },
       store: () => this.pool.poolStore(),
       mainIdentity: () => this.main.currentIdentity(),
       mainQuota: () => this.main.quotaSnapshot(),
+      resetCredits: () =>
+        piResetCredits({
+          paths: this.paths(),
+          main: this.main,
+          pool: this.pool,
+          storage: async () => this.settings(await this.storage()),
+          isLocal: () => this.canPollLocal(),
+          fetchImpl: () => this.deps.fetchImpl ?? globalThis.fetch,
+          now: this.now,
+        }),
       reload: () => this.pool.load(),
       vault: this.vault,
       refreshAllQuota: async () => {
@@ -1910,6 +1961,7 @@ export interface PiPoolCommands {
   mainIdentity: () => string | undefined
   /** The last quota reading of Pi's own login, which is not a pool row. */
   mainQuota: () => OAuthQuotaSnapshot | undefined
+  resetCredits?: () => ResetCreditsDeps
   /** Re-reads the pool, so requests route across changed rows at once. */
   reload: () => Promise<unknown>
   /** Polls the quota of Pi's login, every pool row and every vault account now. */

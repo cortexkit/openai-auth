@@ -32,6 +32,23 @@ function finite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
 }
 
+/** The reset-credit balance saved with a quota reading, including an explicit zero. */
+export function resetCreditsOfQuota(quota: unknown): number | undefined {
+  const counters = isRecord(quota) ? quota.counters : undefined
+  const resetCredits = isRecord(counters) ? counters.resetCredits : undefined
+  const credits = isRecord(resetCredits) ? resetCredits.value : undefined
+  return finite(credits) ? credits : undefined
+}
+
+/** The time of the oldest quota reading; a row is only as fresh as its stalest window. */
+export function quotaReadAt(row: { quota?: unknown }): number | undefined {
+  if (!isQuotaMap(row.quota)) return undefined
+  const projection = projectQuota(row.quota)
+  return projection.limits.some((limit) => limit.kind === 'reading')
+    ? projection.checkedAt
+    : undefined
+}
+
 function readingFor(
   label: string,
   window: unknown,
