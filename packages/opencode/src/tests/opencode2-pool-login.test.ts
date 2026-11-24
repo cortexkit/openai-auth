@@ -81,6 +81,33 @@ test('two OpenCode 2 sign-ins that select empty main keep both credentials', asy
   expect(bobResult).toEqual({ id: 'bob', operation: 'added' })
 })
 
+test('an OpenCode 2 sign-in re-picks when add fills empty main at the same epoch', async () => {
+  const { files, store } = setupPool([{ id: 'main', identity: 'alice' }], true)
+  const gate = pauseFirstReplace(store)
+  const bob = writeLoginToPool(gate.store, files.paths(), {
+    id: 'bob',
+    accountId: 'bob',
+    refresh: 'bob-login',
+  })
+  let bobResult: Awaited<typeof bob>
+  try {
+    await Promise.race([gate.selected, bob])
+    expect(
+      await store.add({
+        id: 'main',
+        identity: 'alice',
+        credential: { type: 'oauth', refresh: 'alice-login' },
+      }),
+    ).toMatchObject({ outcome: 'completed', credentialEpoch: 1 })
+  } finally {
+    gate.resume()
+    bobResult = await bob
+  }
+  expect(files.readState().accounts.main?.refresh).toBe('alice-login')
+  expect(files.readState().accounts.bob?.refresh).toBe('bob-login')
+  expect(bobResult).toEqual({ id: 'bob', operation: 'added' })
+})
+
 test('an OpenCode 2 sign-in reselects a row after its holder changes account', async () => {
   const { files, store } = setupPool([{ id: 'main', identity: 'alice' }])
   const gate = pauseFirstReplace(store)

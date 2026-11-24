@@ -236,8 +236,8 @@ export async function writeLoginToPool(
     const target = holder ?? emptyMain ?? byId
     try {
       if (target) {
-        // A competing replace advances the epoch. This cannot detect another
-        // writer completing an empty row via add at the same epoch and identity.
+        // A store add can fill an empty row without changing its credential
+        // epoch or identity.
         const replaced = await store.replace(
           target.id,
           credential,
@@ -247,6 +247,9 @@ export async function writeLoginToPool(
               credentialEpoch: target.credentialEpoch ?? 1,
               ...(target.identity !== undefined
                 ? { identity: target.identity }
+                : {}),
+              ...(target.credential === undefined
+                ? { expect: { credential: 'absent' } }
                 : {}),
             },
           },
