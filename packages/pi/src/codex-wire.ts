@@ -107,6 +107,7 @@ function shapePiCodexBody(
   headers: Headers,
   session: PiCodexWireSession | undefined,
   websocket: boolean,
+  responsesLite = false,
 ) {
   if (session) {
     stampCodexSession({
@@ -124,7 +125,7 @@ function shapePiCodexBody(
   } else {
     clearPiCodexSession(headers, body)
   }
-  return shapeCodexRequest({ body, headers, websocket })
+  return shapeCodexRequest({ body, headers, websocket, responsesLite })
 }
 
 export function shapePiCodexWebSocketFrame(
@@ -140,6 +141,7 @@ export function shapePiCodexWebSocketFrame(
 export function shapePiCodexHttpRequest(
   init: RequestInit | undefined,
   session: PiCodexWireSession | undefined,
+  responsesLite: boolean,
 ): RequestInit | undefined {
   if (!init?.body) return init
   const headers = new Headers(init.headers)
@@ -159,7 +161,7 @@ export function shapePiCodexHttpRequest(
   const body: unknown = JSON.parse(json)
   if (!isRecord(body) && !compressed) return init
   const shaped = isRecord(body)
-    ? shapePiCodexBody(body, headers, session, false)
+    ? shapePiCodexBody(body, headers, session, false, responsesLite)
     : body
   // The standard Responses HTTP request no longer uses pi-ai's beta header.
   headers.delete('openai-beta')

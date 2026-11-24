@@ -13,7 +13,9 @@ type GlobalWebSocketSlot = { WebSocket?: unknown }
 const global = globalThis as unknown as GlobalWebSocketSlot
 
 type WebSocketAttempt = {
-  url: string
+  /** Match the SDK's original URL so other socket constructors pass through. */
+  sdkUrl: string
+  endpoint: string
   token: string
   owner: object
   session: PiCodexWireSession | undefined
@@ -70,14 +72,17 @@ let installCount = 0
 let originalWebSocket: unknown
 
 class PiRawCodexWebSocket extends RawWebSocket {
-  private readonly binding: Pick<WebSocketAttempt, 'url' | 'token' | 'owner'>
+  private readonly binding: Pick<
+    WebSocketAttempt,
+    'endpoint' | 'token' | 'owner'
+  >
   private readonly cacheKey?: string
   private activeAttempt?: ScopedAttempt
 
   constructor(attempt: ScopedAttempt, headers: Record<string, string>) {
-    const { url, token, owner, cacheKey } = attempt
-    super(url, shapePiCodexUpgrade(headers, attempt.session))
-    this.binding = { url, token, owner }
+    const { endpoint, token, owner, cacheKey } = attempt
+    super(endpoint, shapePiCodexUpgrade(headers, attempt.session))
+    this.binding = { endpoint, token, owner }
     // An open incumbent means pi-ai opened this as a temporary socket while
     // the cached connection was busy. It must not displace the cached one.
     if (cacheKey && cachedSockets.get(cacheKey)?.readyState !== 1) {
@@ -93,7 +98,7 @@ class PiRawCodexWebSocket extends RawWebSocket {
   private matches(attempt: WebSocketAttempt): boolean {
     return (
       attempt.owner === this.binding.owner &&
-      attempt.url === this.binding.url &&
+      attempt.endpoint === this.binding.endpoint &&
       attempt.token === this.binding.token
     )
   }
@@ -138,7 +143,7 @@ const shim: typeof PiRawCodexWebSocket = new Proxy(PiRawCodexWebSocket, {
   construct(target, args: WebSocketArgs, newTarget) {
     const [url, options] = args
     const attempt = attemptScope.getStore()
-    if (installCount && attempt && String(url) === attempt.url) {
+    if (installCount && attempt && String(url) === attempt.sdkUrl) {
       const headers =
         options && typeof options === 'object' && !Array.isArray(options)
           ? (options.headers ?? {})

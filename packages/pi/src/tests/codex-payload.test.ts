@@ -1,7 +1,18 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { openSettings } from '@cortexkit/common-auth/settings'
+import {
+  flushForTest,
+  initLogger,
+  resetLoggerForTest,
+} from '@cortexkit/openai-auth-core/internal'
+import { openaiSettings } from '@cortexkit/openai-auth-core/settings-definition'
+import {
+  createSettingsSnapshot,
+  type SettingsSnapshot,
+} from '@cortexkit/openai-auth-core/settings-snapshot'
 import {
   type Context,
   createAssistantMessageEventStream,
@@ -42,6 +53,9 @@ const firstUser = {
 } as const
 const context: Context = { systemPrompt, messages: [firstUser] }
 const effortModel = { ...model, id: 'gpt-6.2-sol' }
+const endpointEnv = 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT'
+const liteEnv = 'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE'
+const liteHeader = 'x-openai-internal-codex-responses-lite'
 const secondUser = {
   role: 'user',
   content: 'Name another.',
@@ -146,17 +160,23 @@ let dir: string
 let runtime: PiOpenAIRuntime
 let sdkHttpEncodings: (string | null)[]
 let wireHttpEncodings: (string | null)[]
+let savedEnv: [string, string | undefined][]
+let snapshots: SettingsSnapshot[]
 
 beforeEach(() => {
+  savedEnv = [endpointEnv, liteEnv].map((name) => [name, process.env[name]])
+  for (const [name] of savedEnv) delete process.env[name]
   dir = mkdtempSync(join(tmpdir(), 'pi-codex-payload-'))
   sdkHttpEncodings = []
   wireHttpEncodings = []
+  snapshots = []
   runtime = makeRuntime(dir)
 })
 
-function makeRuntime(directory: string) {
+function makeRuntime(directory: string, settings?: SettingsSnapshot) {
   let nextTurn = 0
   return new PiOpenAIRuntime({
+    ...(settings && { settings }),
     streamSimple(model, context, options) {
       const fetch = options?.fetch
       return streamSimple(model, context, {
@@ -194,8 +214,36 @@ function makeRuntime(directory: string) {
   })
 }
 
+function writeSettings(values: Record<string, unknown>) {
+  const file = join(dir, 'settings.jsonc')
+  writeFileSync(file, JSON.stringify({ schema_version: 1, ...values }))
+  return file
+}
+
+async function openPiSettings(values: Record<string, unknown>) {
+  const file = writeSettings(values)
+  const handle = openSettings(openaiSettings, {
+    file,
+    log: { info() {}, warn() {} },
+    separateInstall: false,
+  })
+  const snapshot = await createSettingsSnapshot({ handle, file, host: 'pi' })
+  snapshots.push(snapshot)
+  return snapshot
+}
+
+async function restartRuntime(settings: SettingsSnapshot) {
+  await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
+  runtime = makeRuntime(dir, settings)
+}
+
 afterEach(async () => {
   await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
+  for (const snapshot of snapshots) snapshot.dispose()
+  for (const [name, value] of savedEnv) {
+    if (value === undefined) delete process.env[name]
+    else process.env[name] = value
+  }
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -245,11 +293,9 @@ async function httpBody(...args: Parameters<typeof httpRequest>) {
   >
 }
 
-function sseResponse(turn: number) {
+function sseResponse(turn: number, events: unknown[] = responseEvents(turn)) {
   return new Response(
-    responseEvents(turn)
-      .map((event) => `data: ${JSON.stringify(event)}\n\n`)
-      .join(''),
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
     { headers: { 'content-type': 'text/event-stream' } },
   )
 }
@@ -370,6 +416,76 @@ test('Pi HTTP sends the OC1 body bytes and application headers with omitted and 
       ),
     })
   }
+})
+
+test('Pi HTTP sends the OC1 Responses Lite body and header for supported models', async () => {
+  await restartRuntime(
+    await openPiSettings({ responses_lite: { default: false, pi: true } }),
+  )
+  const { json, headers } = await httpRequest(
+    {
+      sessionId,
+      reasoning: 'low',
+      onPayload(raw) {
+        const body = raw as { input: unknown[]; tools: unknown[] }
+        body.input.push({
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: 'fixture.jpg', detail: 'high' },
+          ],
+        })
+        body.tools.push({ type: 'web_search' })
+      },
+    },
+    effortModel,
+    { ...context, tools: [readTool] },
+  )
+  expect(headers.get(liteHeader)).toBe('true')
+  expect(json).toBe(
+    JSON.stringify({
+      model: 'gpt-6.2-sol',
+      input: [
+        {
+          type: 'additional_tools',
+          role: 'developer',
+          tools: [expectedReadTool],
+        },
+        {
+          type: 'message',
+          id: systemId,
+          role: 'developer',
+          content: [{ type: 'input_text', text: systemPrompt }],
+          internal_chat_message_metadata_passthrough: {
+            content_item_kinds: ['model.base_instructions'],
+            content_item_metadata: [
+              { provenance: { type: 'harness', hook: false } },
+            ],
+          },
+        },
+        userItem('Name a colour.'),
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_image', image_url: 'fixture.jpg' }],
+        },
+      ],
+      parallel_tool_calls: false,
+      reasoning: { effort: 'low', summary: 'auto', context: 'all_turns' },
+      store: false,
+      stream: true,
+      include: ['reasoning.encrypted_content'],
+      prompt_cache_key: sessionId,
+      client_metadata: {
+        'x-codex-installation-id': installationID,
+        'x-codex-window-id': `${sessionId}:0`,
+      },
+    }),
+  )
+
+  const unsupported = await httpRequest()
+  expect(unsupported.headers.has(liteHeader)).toBe(false)
+  expect(JSON.parse(unsupported.json).parallel_tool_calls).toBe(true)
 })
 
 test('Pi shapes a helper without sending any primary cache identity', async () => {
@@ -657,10 +773,12 @@ function spyOnRawCodexFrames() {
 async function captureWebSocketFrames(
   run: (url: string) => Promise<void>,
   events: (turn: number) => unknown[] | undefined = responseEvents,
+  http?: (request: Request) => Response,
 ) {
   const frames: Record<string, unknown>[] = []
   const wireFrames: string[] = []
   const upgrades: Headers[] = []
+  const upgradeUrls: string[] = []
   let connections = 0
   const seam = spyOnRawCodexFrames()
   const server = Bun.serve({
@@ -668,11 +786,13 @@ async function captureWebSocketFrames(
     port: 0,
     fetch(request, server) {
       const headers = new Headers(request.headers)
+      const url = request.url
       if (server.upgrade(request)) {
         upgrades.push(headers)
+        upgradeUrls.push(url)
         return
       }
-      return new Response(null, { status: 400 })
+      return http?.(request) ?? new Response(null, { status: 400 })
     },
     websocket: {
       open() {
@@ -689,7 +809,7 @@ async function captureWebSocketFrames(
   try {
     await run(server.url.href)
     expect(wireFrames).toEqual(seam.frames)
-    return { frames, connections, upgrades }
+    return { frames, connections, upgrades, upgradeUrls }
   } finally {
     seam.restore()
     await server.stop(true)
@@ -712,6 +832,154 @@ function applicationUpgradeHeaders(upgrade: Headers) {
 function frameMetadata(frame: Record<string, unknown> | undefined) {
   return frame?.client_metadata as Record<string, string> | undefined
 }
+
+test('Pi uses the startup Codex endpoint for HTTP and WebSocket until restart, with env taking precedence', async () => {
+  const httpUrls: string[] = []
+  const { upgrades, upgradeUrls, frames } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const initial = `${baseUrl}configured/responses`
+      const updated = `${baseUrl}updated/responses?relay=pi`
+      const override = `${baseUrl}override/responses`
+      const snapshot = await openPiSettings({
+        codex_api_endpoint: {
+          default: 'https://opencode.invalid',
+          pi: initial,
+        },
+      })
+      await restartRuntime(snapshot)
+      const fetch = mockFetch(async (input, init) => {
+        // A broken rewrite must not send the fixture token to ChatGPT.
+        if (typeof input !== 'string' || !input.startsWith(baseUrl))
+          return new Response(null, { status: 400 })
+        return globalThis.fetch(input, init)
+      })
+      const history = [...context.messages]
+      const sendBoth = async (expected: string, turn: number) => {
+        const http = await runtime
+          .stream(model, context, { apiKey, transport: 'sse', fetch })
+          .result()
+        expect(httpUrls.at(-1)).toBe(expected)
+        expect(http.responseId).toBe(`resp_${turn + 10}`)
+        const ws = await runtime
+          .stream(
+            model,
+            { systemPrompt, messages: [...history] },
+            {
+              apiKey,
+              sessionId,
+              transport: 'auto',
+              fetch,
+            },
+          )
+          .result()
+        expect(ws.responseId).toBe(`resp_${turn}`)
+        history.push(ws, { ...secondUser, content: `Turn ${turn + 1}` })
+      }
+
+      await sendBoth(initial, 1)
+      writeSettings({ codex_api_endpoint: { pi: updated } })
+      await snapshot.refresh()
+      expect(snapshot.get('codex_api_endpoint')).toBe(updated)
+      await sendBoth(initial, 2)
+
+      await restartRuntime(snapshot)
+      await sendBoth(updated, 3)
+      process.env[endpointEnv] = ` ${override} `
+      await restartRuntime(snapshot)
+      await sendBoth(override, 4)
+    },
+    responseEvents,
+    (request) => {
+      httpUrls.push(request.url)
+      return sseResponse(httpUrls.length + 10)
+    },
+  )
+  expect(httpUrls).toHaveLength(4)
+  expect(
+    upgradeUrls.map((url) => {
+      const { pathname, search } = new URL(url)
+      return pathname + search
+    }),
+  ).toEqual([
+    '/configured/responses',
+    '/updated/responses?relay=pi',
+    '/override/responses',
+  ])
+  expect(upgrades.map((headers) => headers.get('authorization'))).toEqual(
+    Array(3).fill(`Bearer ${apiKey}`),
+  )
+  expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+    undefined,
+    'resp_1',
+    undefined,
+    undefined,
+  ])
+})
+
+test('Pi logs Codex transformed input items on HTTP and WebSocket completion', async () => {
+  const file = join(dir, 'pi.log')
+  initLogger({ file, level: 'info' })
+  const events = (turn: number) =>
+    responseEvents(turn).map((event) =>
+      event.type === 'response.completed'
+        ? {
+            ...event,
+            response: {
+              ...event.response,
+              model: model.id,
+              input_transformations: [
+                {
+                  action: 'removed',
+                  type: 'reasoning',
+                  reason: 'prefix_mismatch',
+                  id: 'private-reasoning-id',
+                },
+              ],
+            },
+          }
+        : event,
+    )
+  try {
+    const http = await runtime
+      .stream(model, context, {
+        apiKey,
+        transport: 'sse',
+        fetch: mockFetch(async () => sseResponse(1, events(1))),
+      })
+      .result()
+    expect(http.responseId).toBe('resp_1')
+    await captureWebSocketFrames(async (baseUrl) => {
+      const ws = await runtime
+        .stream({ ...model, baseUrl }, context, cachedWebSocketOptions())
+        .result()
+      expect(ws.responseId).toBe('resp_1')
+    }, events)
+
+    await flushForTest()
+    const logFile = Bun.file(file)
+    const log = (await logFile.exists()) ? await logFile.text() : ''
+    const message = 'Codex transformed input items '
+    const records = log
+      .split('\n')
+      .filter((line) => line.includes(message))
+      .map((line) =>
+        JSON.parse(line.slice(line.indexOf(message) + message.length)),
+      )
+    expect(records).toEqual(
+      ['http', 'websocket'].map((transport) => ({
+        model: model.id,
+        count: 1,
+        items: { 'removed:reasoning': 1 },
+        reasons: { prefix_mismatch: 1 },
+        transport,
+        host: 'pi',
+      })),
+    )
+    expect(log).not.toContain('private-reasoning-id')
+  } finally {
+    resetLoggerForTest()
+  }
+})
 
 test('Pi sends helper WebSocket frames without cache or turn metadata', async () => {
   const { frames, upgrades } = await captureWebSocketFrames(async (baseUrl) => {
@@ -744,12 +1012,13 @@ test('Pi sends helper WebSocket frames without cache or turn metadata', async ()
   expect(frames[0]?.tools).toEqual([expectedReadTool])
 })
 
-test('Pi keeps the turn when a chained WebSocket send falls back to full HTTP', async () => {
+test('Pi keeps the turn when a standard chained WebSocket send falls back to Lite HTTP', async () => {
+  await restartRuntime(await openPiSettings({ responses_lite: { pi: true } }))
   const fallbackSession = 'pi-codex-fallback-wire'
   const http: { headers: Headers; body: Record<string, unknown> }[] = []
-  const { frames, connections } = await captureWebSocketFrames(
+  const { frames, connections, upgrades } = await captureWebSocketFrames(
     async (baseUrl) => {
-      const socketModel = { ...model, baseUrl }
+      const socketModel = { ...effortModel, baseUrl }
       const options: SimpleStreamOptions = {
         apiKey,
         transport: 'auto',
@@ -782,16 +1051,29 @@ test('Pi keeps the turn when a chained WebSocket send falls back to full HTTP', 
   )
 
   expect(connections).toBe(1)
+  expect(upgrades[0]?.has(liteHeader)).toBe(false)
   expect(frames).toHaveLength(2)
+  for (const frame of frames) {
+    expect(frame.parallel_tool_calls).toBe(true)
+    expect(frame.reasoning).not.toHaveProperty('context')
+  }
   const delta = frames[1]
   expect(delta?.previous_response_id).toBe('resp_1')
   expect(delta?.input).toEqual([userItem('Name another.')])
   expect(http).toHaveLength(1)
   const fallback = http[0]
+  expect(fallback?.headers.get(liteHeader)).toBe('true')
+  expect(fallback?.body.parallel_tool_calls).toBe(false)
   expect(fallback?.body).not.toHaveProperty('previous_response_id')
   expect(fallback?.body.prompt_cache_key).toBe(fallbackSession)
   const fullInput = fallback?.body.input as Record<string, unknown>[]
+  expect(fullInput[0]).toEqual({
+    type: 'additional_tools',
+    role: 'developer',
+    tools: [],
+  })
   expect(fullInput.map((item) => item.role)).toEqual([
+    'developer',
     'developer',
     'user',
     'assistant',

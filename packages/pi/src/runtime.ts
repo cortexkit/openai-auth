@@ -50,6 +50,7 @@ import {
   codexRefreshFn,
   createLogger,
   createSessionActivityStore,
+  DEFAULT_CODEX_API_ENDPOINT,
   deferSessionCacheResponseTouch,
   extractAccountId,
   type FrameTurnRecord,
@@ -60,6 +61,7 @@ import {
   isVaultHosted,
   limitAccountKey,
   loadAccounts,
+  logInputTransformations,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OAuthQuotaSnapshot,
@@ -75,6 +77,8 @@ import {
   redactCredentialText,
   reportVaultRouting,
   reportVaultRoutingLimit,
+  resolveCodexEndpoint,
+  resolveResponsesLite,
   type SessionDispatch,
   sessionCacheKeepPlan,
   startVaultRoutingWait,
@@ -163,7 +167,11 @@ type StreamSimple = (
 ) => AssistantMessageEventStream
 
 type RefreshAllQuotaResults = RefreshAllQuotaResult[]
-type PiRequestSettings = AccountStorage & { waitForReset?: boolean }
+type PiRequestSettings = AccountStorage & {
+  waitForReset?: boolean
+  codexApiEndpoint?: string
+  responsesLite?: boolean
+}
 
 export interface PiOpenAIRuntimeDeps {
   /** Sends one attempt of a request: pi-ai's Codex stream. */
@@ -309,6 +317,7 @@ export class PiOpenAIRuntime {
   private readonly effortBySession = new Map<string, CodexEffortState>()
   private readonly frameTurns = new FrameTurnState()
   private readonly installationID: string
+  private readonly codexEndpoint: string
   /** Captured from a live Pi context; absent in headless hosts. */
   setWorkingMessage: ((message?: string) => void) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
@@ -334,6 +343,10 @@ export class PiOpenAIRuntime {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.installationID = deps.installationID ?? crypto.randomUUID()
+    // Keep cached sockets and their response ids on one endpoint until restart.
+    this.codexEndpoint = resolveCodexEndpoint(
+      deps.settings?.view().codexApiEndpoint,
+    )
     this.paths = deps.paths ?? getPiAccountPaths
     const fetchImpl = () => deps.fetchImpl ?? globalThis.fetch
     this.main = new PiMainAccount({
@@ -1244,6 +1257,11 @@ export class PiOpenAIRuntime {
     try {
       const send = options?.fetch ?? globalThis.fetch
       const httpUrl = piCodexHttpUrl(model.baseUrl)
+      const endpoint =
+        httpUrl === DEFAULT_CODEX_API_ENDPOINT ? this.codexEndpoint : httpUrl
+      const responsesLite = resolveResponsesLite(
+        this.deps.settings?.view().responsesLite,
+      )
       const quotaDispatch: PiQuotaDispatch = {
         accountId,
         token,
@@ -1280,10 +1298,11 @@ export class PiOpenAIRuntime {
           async (input: RequestInfo | URL, init?: RequestInit) => {
             beginSend()
             try {
+              const isCodexRequest = input === httpUrl
               const response = await send(
-                input,
-                input === httpUrl
-                  ? shapePiCodexHttpRequest(init, wireSession)
+                isCodexRequest ? endpoint : input,
+                isCodexRequest
+                  ? shapePiCodexHttpRequest(init, wireSession, responsesLite)
                   : init,
               )
               const safe = await redactCredentialResponse(
@@ -1331,12 +1350,14 @@ export class PiOpenAIRuntime {
           await options?.onResponse?.(response, responseModel)
         },
         onProviderStreamEvent: async (event, eventModel) => {
-          if (
-            httpStatus === undefined &&
-            isRecord(event) &&
-            event.type === 'response.completed'
-          )
-            wsCompleted = true
+          if (isRecord(event) && event.type === 'response.completed') {
+            if (httpStatus === undefined) wsCompleted = true
+            logInputTransformations(
+              event.response,
+              httpStatus === undefined ? 'websocket' : 'http',
+              'pi',
+            )
+          }
           // The bound WebSocket records quota before pi-ai dispatches this callback.
           if (httpStatus !== undefined || !useWebSocketShim)
             mergeReading(this.recordQuotaEvent(quotaDispatch, event))
@@ -1365,7 +1386,8 @@ export class PiOpenAIRuntime {
       inner = useWebSocketShim
         ? withPiCodexWebSocketAttempt(
             {
-              url: piCodexWebSocketUrl(httpUrl),
+              sdkUrl: piCodexWebSocketUrl(httpUrl),
+              endpoint: piCodexWebSocketUrl(endpoint),
               token,
               owner: this,
               session: wireSession,
