@@ -1,12 +1,6 @@
-// The turn a WebSocket `response.create` frame belongs to, kept apart from
-// the session's HTTP turn state.
-//
-// OpenCode 1 does the same: its WebSocket pool entry owns its own turn id and
-// turn start (`advanceTurn` in ws-pool.ts), so a title or compaction request
-// sent over HTTP never moves a WebSocket turn. Here the HTTP turn lives in
-// `CodexSessionMetadata` (written by `prepareCodexRequest` for every HTTP
-// request kind, exactly as on OpenCode 1) and the frame turn lives in
-// `FrameTurnState`. Only the frame rule below advances a frame turn.
+// OpenCode 2 tracks WebSocket turns apart from its HTTP history. Pi uses
+// the frame rule for both transports, once per routing attempt, so a change
+// of transport cannot change which turn that attempt belongs to.
 //
 // The state per session is fixed-size and holds no message text: the turn id,
 // its start time, whether the last frame completed, a SHA-256 fingerprint of
@@ -67,9 +61,8 @@ export function userMessageFingerprint(item: unknown): string {
 /**
  * The frame turn of each session.
  *
- * Call `advance` once for every `response.create` frame sent, with the
- * host's frame body, and `completed` when that frame's `response.completed`
- * arrives. The rule:
+ * Call `advance` with the unshaped first send for an attempt (full or
+ * chained). Call `completed` when that send or its retry succeeds. The rule:
  *
  * - A chained frame (one with `previous_response_id`) starts a new turn
  *   exactly when its `input` holds a user message. The host's deltas carry
@@ -154,10 +147,11 @@ export class FrameTurnState {
     return turn
   }
 
-  /** Records that the session's last frame got `response.completed`. */
-  completed(sessionID: string): void {
+  /** Complete a send without marking a newer send, even within the same turn. */
+  completed(sessionID: string, expected?: FrameTurnRecord): void {
     const record = this.#sessions.get(sessionID)
-    if (record) this.#set(sessionID, { ...record, completed: true })
+    if (record && (!expected || record === expected))
+      this.#set(sessionID, { ...record, completed: true })
   }
 
   get(sessionID: string): FrameTurnRecord | undefined {

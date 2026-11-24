@@ -202,6 +202,20 @@ export function stampCodexSession(input: CodexSessionStamp): void {
   stampCodexBodyMetadata(input, turnMetadata)
 }
 
+/** Set stable thread headers without attaching a turn to the connection. */
+export function stampCodexThreadHeaders(
+  headers: Headers,
+  metadata: Pick<CodexSessionMetadata, 'threadID' | 'windowID'>,
+): void {
+  headers.set('session-id', metadata.threadID)
+  headers.delete('x-session-id')
+  headers.delete('x-session-affinity')
+  headers.set('thread-id', metadata.threadID)
+  headers.set('x-codex-window-id', metadata.windowID)
+  // Codex uses the thread UUID, not a new per-request UUID.
+  headers.set('x-client-request-id', metadata.threadID)
+}
+
 function stampCodexSessionIdentity(input: CodexSessionStamp): string {
   const { headers, metadata, body } = input
   const turnMetadata = JSON.stringify({
@@ -214,13 +228,7 @@ function stampCodexSessionIdentity(input: CodexSessionStamp): string {
     request_kind: 'turn',
     window_id: metadata.windowID,
   })
-  headers.set('session-id', metadata.threadID)
-  headers.delete('x-session-id')
-  headers.delete('x-session-affinity')
-  headers.set('thread-id', metadata.threadID)
-  headers.set('x-codex-window-id', metadata.windowID)
-  // Codex uses the thread UUID, not a new per-request UUID.
-  headers.set('x-client-request-id', metadata.threadID)
+  stampCodexThreadHeaders(headers, metadata)
   headers.set('x-codex-turn-metadata', turnMetadata)
   if (body) body.prompt_cache_key = metadata.threadID
   return turnMetadata

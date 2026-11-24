@@ -52,6 +52,8 @@ import {
   createSessionActivityStore,
   deferSessionCacheResponseTouch,
   extractAccountId,
+  type FrameTurnRecord,
+  FrameTurnState,
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   isRecord,
@@ -77,6 +79,7 @@ import {
   sessionCacheKeepPlan,
   startVaultRoutingWait,
   ttlForModel,
+  uuidV7,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   VAULT_ROUTING_REFUSAL_MESSAGE,
   VaultBillingAttempt,
@@ -116,6 +119,8 @@ import {
   withPiCodexWebSocketAttempt,
 } from './codex-websocket.ts'
 import {
+  omitPiCodexDefaults,
+  type PiCodexWireSession,
   piCodexHttpUrl,
   piCodexWebSocketUrl,
   shapePiCodexHttpRequest,
@@ -173,6 +178,9 @@ export interface PiOpenAIRuntimeDeps {
   /** Used for quota polls and token refreshes; read at call time by default. */
   fetchImpl?: typeof fetch
   now?: () => number
+  /** Wire identifiers may be seeded in request captures. */
+  turnUuid?: () => string
+  installationID?: string
   firstReadingWaitMs?: number
   readBudgetMs?: number
   /** Replaces Pi's connection to the Claustrum vault (tests); by default its files live next to the account files. */
@@ -299,6 +307,8 @@ export class PiOpenAIRuntime {
   readonly vault: OpenAiVault
   readonly activity = createSessionActivityStore()
   private readonly effortBySession = new Map<string, CodexEffortState>()
+  private readonly frameTurns = new FrameTurnState()
+  private readonly installationID: string
   /** Captured from a live Pi context; absent in headless hosts. */
   setWorkingMessage: ((message?: string) => void) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
@@ -323,6 +333,7 @@ export class PiOpenAIRuntime {
   constructor(deps: PiOpenAIRuntimeDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
+    this.installationID = deps.installationID ?? crypto.randomUUID()
     this.paths = deps.paths ?? getPiAccountPaths
     const fetchImpl = () => deps.fetchImpl ?? globalThis.fetch
     this.main = new PiMainAccount({
@@ -1108,6 +1119,26 @@ export class PiOpenAIRuntime {
     const kind = piRequestKind(options)
     const sessionId = options?.sessionId
     const cacheSessionId = kind === 'primary' ? sessionId : undefined
+    let sentTurn: FrameTurnRecord | undefined
+    const wireSession: PiCodexWireSession | undefined = cacheSessionId
+      ? {
+          threadID: cacheSessionId,
+          windowID: `${cacheSessionId}:0`,
+          installationID: this.installationID,
+          now: this.now,
+          turn: (body) => {
+            // Choose from the first unshaped send. Retries and HTTP fallback
+            // can use a different body, but still belong to the same attempt.
+            if (sentTurn) return sentTurn
+            const turn = this.frameTurns.advance(cacheSessionId, body, {
+              now: this.now,
+              uuid: this.deps.turnUuid ?? uuidV7,
+            })
+            sentTurn = this.frameTurns.get(cacheSessionId)
+            return turn
+          },
+        }
+      : undefined
     let billing: VaultBillingAttempt | undefined
     if (
       receipt?.credentialId &&
@@ -1232,8 +1263,9 @@ export class PiOpenAIRuntime {
           process.versions.bun && { env: options?.env ?? {} }),
         // Effort updates belong in pi-ai's logical history; wire-only changes do not.
         onPayload: async (payload, payloadModel) => {
-          const replacement = await options?.onPayload?.(payload, payloadModel)
-          let source = replacement === undefined ? payload : replacement
+          const logical = omitPiCodexDefaults(payload, options)
+          const replacement = await options?.onPayload?.(logical, payloadModel)
+          let source = replacement === undefined ? logical : replacement
           if (effortSessionId && isRecord(source)) {
             const body = { ...source }
             this.applyEffort(body, effortSessionId)
@@ -1250,7 +1282,9 @@ export class PiOpenAIRuntime {
             try {
               const response = await send(
                 input,
-                input === httpUrl ? shapePiCodexHttpRequest(init) : init,
+                input === httpUrl
+                  ? shapePiCodexHttpRequest(init, wireSession)
+                  : init,
               )
               const safe = await redactCredentialResponse(
                 response,
@@ -1334,7 +1368,7 @@ export class PiOpenAIRuntime {
               url: piCodexWebSocketUrl(httpUrl),
               token,
               owner: this,
-              sessionId: effortSessionId,
+              session: wireSession,
               onSend: beginSend,
               onMessage: (data) =>
                 mergeReading(this.observeWebSocketMessage(quotaDispatch, data)),
@@ -1403,6 +1437,8 @@ export class PiOpenAIRuntime {
             completedStatus >= 200 &&
             completedStatus < 300
           ) {
+            if (cacheSessionId && sentTurn)
+              runtime.frameTurns.completed(cacheSessionId, sentTurn)
             reportVaultRouting(sessionId, receipt, {
               status: completedStatus,
               headers: headers ?? new Headers(),

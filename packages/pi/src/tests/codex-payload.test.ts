@@ -6,6 +6,7 @@ import {
   type Context,
   createAssistantMessageEventStream,
   type Model,
+  type OpenAICodexResponsesOptions,
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
@@ -31,6 +32,9 @@ const apiKey = chatgptAccessToken('payload-test-account')
 const systemPrompt = '  Answer tersely.\nPreserve punctuation: café.\n'
 const sessionId = 'pi-codex-payload-session'
 const systemId = 'msg_9e4fd0b8-1a27-5801-9e64-f9a84d591bcc'
+const wireNow = 1_800_000_000_000
+const installationID = '00000000-0000-4000-8000-000000000100'
+const firstTurnID = '00000000-0000-7000-8000-000000000001'
 const firstUser = {
   role: 'user',
   content: 'Name a colour.',
@@ -151,6 +155,7 @@ beforeEach(() => {
 })
 
 function makeRuntime(directory: string) {
+  let nextTurn = 0
   return new PiOpenAIRuntime({
     streamSimple(model, context, options) {
       const fetch = options?.fetch
@@ -167,6 +172,10 @@ function makeRuntime(directory: string) {
     },
     createStream: createAssistantMessageEventStream,
     installWebSocket: installRawCodexWebSocket,
+    now: () => wireNow,
+    installationID,
+    turnUuid: () =>
+      `00000000-0000-7000-8000-${String(++nextTurn).padStart(12, '0')}`,
     paths: () => ({
       configPath: join(directory, 'openai-auth.json'),
       statePath: join(directory, 'openai-auth-state.json'),
@@ -177,7 +186,7 @@ function makeRuntime(directory: string) {
           primary_window: {
             used_percent: 10,
             limit_window_seconds: 18_000,
-            reset_at: Math.floor(Date.now() / 1000) + 7200,
+            reset_at: wireNow / 1000 + 7200,
           },
         },
       }),
@@ -190,15 +199,16 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-async function httpBody(
+async function httpRequest(
   options?: Pick<
     SimpleStreamOptions,
-    'cacheRetention' | 'onPayload' | 'reasoning' | 'sessionId'
-  >,
+    'cacheRetention' | 'onPayload' | 'reasoning' | 'sessionId' | 'toolChoice'
+  > &
+    Pick<OpenAICodexResponsesOptions, 'textVerbosity'>,
   requestModel = model,
   requestContext = context,
 ) {
-  const bodies: Record<string, unknown>[] = []
+  const requests: { json: string; headers: Headers }[] = []
   const result = await runtime
     .stream(requestModel, requestContext, {
       apiKey,
@@ -206,7 +216,8 @@ async function httpBody(
       ...options,
       fetch: mockFetch(async (_input, init) => {
         const payload = new Response(init?.body)
-        const encoded = new Headers(init?.headers).get('content-encoding')
+        const headers = new Headers(init?.headers)
+        const encoded = headers.get('content-encoding')
         wireHttpEncodings.push(encoded)
         const json =
           encoded === 'zstd'
@@ -214,25 +225,188 @@ async function httpBody(
                 Bun.zstdDecompressSync(await payload.arrayBuffer()),
               )
             : await payload.text()
-        bodies.push(JSON.parse(json))
-        return new Response(
-          responseEvents(1)
-            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
-            .join(''),
-          {
-            headers: { 'content-type': 'text/event-stream' },
-          },
-        )
+        requests.push({ json, headers })
+        return sseResponse(1)
       }),
     })
     .result()
   expect(result.errorMessage).toBeUndefined()
   expect(result.stopReason).toBe('stop')
-  expect(bodies).toHaveLength(1)
-  const [body] = bodies
-  if (!body) throw new Error('No captured HTTP body')
-  return body
+  expect(requests).toHaveLength(1)
+  const [request] = requests
+  if (!request) throw new Error('No captured HTTP request')
+  return request
 }
+
+async function httpBody(...args: Parameters<typeof httpRequest>) {
+  return JSON.parse((await httpRequest(...args)).json) as Record<
+    string,
+    unknown
+  >
+}
+
+function sseResponse(turn: number) {
+  return new Response(
+    responseEvents(turn)
+      .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+      .join(''),
+    { headers: { 'content-type': 'text/event-stream' } },
+  )
+}
+
+const fixtureUserAgent =
+  'codex_exec/0.166.0 (<platform>) unknown (codex_exec; 0.166.0)'
+
+function normalizeUserAgent(
+  headers: Headers,
+): Record<string, string | undefined> {
+  return {
+    ...Object.fromEntries(headers),
+    'user-agent': headers
+      .get('user-agent')
+      ?.replace(/^(\S+ \()[^)]+\)/, '$1<platform>)'),
+  }
+}
+
+function expectedTurn(turn_id: string) {
+  return {
+    session_id: 'pi-codex-payload-session',
+    thread_id: 'pi-codex-payload-session',
+    thread_source: 'user',
+    turn_id,
+    sandbox: 'seccomp',
+    turn_started_at_unix_ms: 1_800_000_000_000,
+    request_kind: 'turn',
+    window_id: 'pi-codex-payload-session:0',
+  }
+}
+
+const clientAndAccountHeaders = {
+  authorization: `Bearer ${apiKey}`,
+  'chatgpt-account-id': 'payload-test-account',
+  originator: 'codex_exec',
+  version: '0.166.0',
+  'user-agent': fixtureUserAgent,
+  'x-codex-beta-features': 'terminal_resize_reflow',
+}
+const primaryIdentityHeaders = {
+  'session-id': 'pi-codex-payload-session',
+  'thread-id': 'pi-codex-payload-session',
+  'x-client-request-id': 'pi-codex-payload-session',
+  'x-codex-window-id': 'pi-codex-payload-session:0',
+}
+const expectedReadTool = {
+  type: 'function',
+  name: 'read',
+  description: 'Read a file',
+  strict: false,
+  parameters: { type: 'object', properties: { path: { type: 'string' } } },
+}
+
+test('Pi HTTP sends the OC1 body bytes and application headers with omitted and explicit fields', async () => {
+  for (const explicit of [false, true]) {
+    const { json, headers } = await httpRequest(
+      {
+        sessionId,
+        ...(explicit && {
+          toolChoice: 'auto' as const,
+          textVerbosity: 'medium' as const,
+          onPayload(raw: unknown) {
+            const body = raw as { tools: Record<string, unknown>[] }
+            const tool = body.tools[0]
+            if (!tool) throw new Error('Missing test tool')
+            tool.strict = true
+          },
+        }),
+      },
+      model,
+      {
+        ...context,
+        tools: [
+          {
+            ...readTool,
+            parameters: { ...readTool.parameters, $schema: 'dialect' },
+          },
+        ],
+      },
+    )
+    expect(json).toBe(
+      JSON.stringify({
+        model: 'gpt-5.4',
+        input: [
+          developerMessage(
+            '  Answer tersely.\nPreserve punctuation: café.\n',
+            'msg_9e4fd0b8-1a27-5801-9e64-f9a84d591bcc',
+          ),
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Name a colour.' }],
+          },
+        ],
+        tools: [{ ...expectedReadTool, strict: explicit }],
+        ...(explicit && { tool_choice: 'auto' }),
+        parallel_tool_calls: true,
+        reasoning: { effort: 'none' },
+        store: false,
+        stream: true,
+        include: ['reasoning.encrypted_content'],
+        prompt_cache_key: 'pi-codex-payload-session',
+        ...(explicit && { text: { verbosity: 'medium' } }),
+        client_metadata: {
+          'x-codex-installation-id': '00000000-0000-4000-8000-000000000100',
+          'x-codex-window-id': 'pi-codex-payload-session:0',
+        },
+      }),
+    )
+    expect(normalizeUserAgent(headers)).toEqual({
+      ...clientAndAccountHeaders,
+      accept: 'text/event-stream',
+      'content-type': 'application/json',
+      ...primaryIdentityHeaders,
+      'x-codex-turn-metadata': JSON.stringify(
+        expectedTurn(
+          explicit ? '00000000-0000-7000-8000-000000000002' : firstTurnID,
+        ),
+      ),
+    })
+  }
+})
+
+test('Pi shapes a helper without sending any primary cache identity', async () => {
+  const { json, headers } = await httpRequest(
+    {
+      sessionId,
+      cacheRetention: 'none',
+      onPayload(raw) {
+        const body = raw as Record<string, unknown>
+        body.text = { verbosity: 'low' }
+        body.tool_choice = 'required'
+        body.prompt_cache_key = 'do-not-use-for-helper'
+      },
+    },
+    model,
+    { ...context, tools: [readTool] },
+  )
+  expect(json).toBe(
+    JSON.stringify({
+      model: 'gpt-5.4',
+      input: [developerMessage(systemPrompt), userItem('Name a colour.')],
+      tools: [expectedReadTool],
+      tool_choice: 'required',
+      parallel_tool_calls: true,
+      reasoning: { effort: 'none' },
+      store: false,
+      stream: true,
+      include: ['reasoning.encrypted_content'],
+      text: { verbosity: 'low' },
+    }),
+  )
+  expect(normalizeUserAgent(headers)).toEqual({
+    ...clientAndAccountHeaders,
+    accept: 'text/event-stream',
+    'content-type': 'application/json',
+  })
+})
 
 test('Pi sends uncompressed JSON after pi-ai zstd-encodes the HTTP request', async () => {
   const sent = await httpBody({ sessionId })
@@ -244,7 +418,7 @@ test('Pi sends uncompressed JSON after pi-ai zstd-encodes the HTTP request', asy
   ])
 })
 
-test('Pi restores GPT-6.2 replayed call status without instructions and keeps GPT-6.1 bytes', async () => {
+test('Pi restores GPT-6.2 replayed call status without instructions and keeps GPT-6.1 input bytes', async () => {
   for (const id of ['gpt-6.1-sol', 'gpt-6.2-sol']) {
     const requestContext: Context = {
       messages: [
@@ -291,7 +465,7 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
       arguments: '{"path":"README.md"}',
     }
     let sdkInput: readonly unknown[] = []
-    let sdkBytes = ''
+    let sdkInputBytes = ''
     const sent = await httpBody(
       {
         onPayload(raw) {
@@ -305,14 +479,15 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
             ...sdkInput,
             { ...replayed, id: 'fc_explicit', status: 'incomplete' },
           ]
-          sdkBytes = JSON.stringify(body)
+          sdkInputBytes = JSON.stringify(body.input)
           return body
         },
       },
       { ...model, id },
       requestContext,
     )
-    if (id === 'gpt-6.1-sol') expect(JSON.stringify(sent)).toBe(sdkBytes)
+    if (id === 'gpt-6.1-sol')
+      expect(JSON.stringify(sent.input)).toBe(sdkInputBytes)
     else {
       expect(JSON.stringify(sent.input)).toBe(
         JSON.stringify([
@@ -481,17 +656,22 @@ function spyOnRawCodexFrames() {
 
 async function captureWebSocketFrames(
   run: (url: string) => Promise<void>,
-  events = responseEvents,
+  events: (turn: number) => unknown[] | undefined = responseEvents,
 ) {
   const frames: Record<string, unknown>[] = []
   const wireFrames: string[] = []
+  const upgrades: Headers[] = []
   let connections = 0
   const seam = spyOnRawCodexFrames()
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
     fetch(request, server) {
-      if (server.upgrade(request)) return
+      const headers = new Headers(request.headers)
+      if (server.upgrade(request)) {
+        upgrades.push(headers)
+        return
+      }
       return new Response(null, { status: 400 })
     },
     websocket: {
@@ -501,20 +681,175 @@ async function captureWebSocketFrames(
       message(socket, frame) {
         wireFrames.push(frame.toString())
         frames.push(JSON.parse(frame.toString()))
-        for (const event of events(frames.length))
-          socket.send(JSON.stringify(event))
+        const reply = events(frames.length)
+        for (const event of reply ?? []) socket.send(JSON.stringify(event))
       },
     },
   })
   try {
     await run(server.url.href)
     expect(wireFrames).toEqual(seam.frames)
-    return { frames, connections }
+    return { frames, connections, upgrades }
   } finally {
     seam.restore()
     await server.stop(true)
   }
 }
+
+function applicationUpgradeHeaders(upgrade: Headers) {
+  const application = new Headers(upgrade)
+  for (const name of [
+    'connection',
+    'host',
+    'upgrade',
+    'sec-websocket-key',
+    'sec-websocket-version',
+  ])
+    application.delete(name)
+  return normalizeUserAgent(application)
+}
+
+function frameMetadata(frame: Record<string, unknown> | undefined) {
+  return frame?.client_metadata as Record<string, string> | undefined
+}
+
+test('Pi sends helper WebSocket frames without cache or turn metadata', async () => {
+  const { frames, upgrades } = await captureWebSocketFrames(async (baseUrl) => {
+    const result = await runtime
+      .stream(
+        { ...model, baseUrl },
+        { ...context, tools: [readTool] },
+        {
+          ...cachedWebSocketOptions(),
+          cacheRetention: 'none',
+        },
+      )
+      .result()
+    expect(result.responseId).toBe('resp_1')
+  })
+  expect(upgrades.map(applicationUpgradeHeaders)).toEqual([
+    {
+      ...clientAndAccountHeaders,
+      'openai-beta': 'responses_websockets=2026-02-06',
+    },
+  ])
+  expect(frames).toHaveLength(1)
+  expect(frames[0]).not.toHaveProperty('prompt_cache_key')
+  expect(frames[0]).not.toHaveProperty('client_metadata')
+  expect(frames[0]).not.toHaveProperty('instructions')
+  expect(frames[0]?.input).toEqual([
+    developerMessage(systemPrompt),
+    userItem('Name a colour.'),
+  ])
+  expect(frames[0]?.tools).toEqual([expectedReadTool])
+})
+
+test('Pi keeps the turn when a chained WebSocket send falls back to full HTTP', async () => {
+  const fallbackSession = 'pi-codex-fallback-wire'
+  const http: { headers: Headers; body: Record<string, unknown> }[] = []
+  const { frames, connections } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const socketModel = { ...model, baseUrl }
+      const options: SimpleStreamOptions = {
+        apiKey,
+        transport: 'auto',
+        sessionId: fallbackSession,
+        // The server withholds all events for the delta, so pi-ai uses SSE.
+        timeoutMs: 500,
+        fetch: mockFetch(async (_input, init) => {
+          http.push({
+            headers: new Headers(init?.headers),
+            body: JSON.parse(await new Response(init?.body).text()),
+          })
+          return sseResponse(2)
+        }),
+      }
+      const first = await runtime.stream(socketModel, context, options).result()
+      expect(first.responseId).toBe('resp_1')
+      const second = await runtime
+        .stream(
+          socketModel,
+          {
+            systemPrompt,
+            messages: [firstUser, first, secondUser],
+          },
+          options,
+        )
+        .result()
+      expect(second.responseId).toBe('resp_2')
+    },
+    (turn) => (turn === 1 ? responseEvents(1) : undefined),
+  )
+
+  expect(connections).toBe(1)
+  expect(frames).toHaveLength(2)
+  const delta = frames[1]
+  expect(delta?.previous_response_id).toBe('resp_1')
+  expect(delta?.input).toEqual([userItem('Name another.')])
+  expect(http).toHaveLength(1)
+  const fallback = http[0]
+  expect(fallback?.body).not.toHaveProperty('previous_response_id')
+  expect(fallback?.body.prompt_cache_key).toBe(fallbackSession)
+  const fullInput = fallback?.body.input as Record<string, unknown>[]
+  expect(fullInput.map((item) => item.role)).toEqual([
+    'developer',
+    'user',
+    'assistant',
+    'user',
+  ])
+  expect(fullInput.at(-1)).toEqual(userItem('Name another.'))
+  const turn = frameMetadata(delta)?.['x-codex-turn-metadata']
+  expect(JSON.parse(turn ?? 'null')?.turn_id).toBe(
+    '00000000-0000-7000-8000-000000000002',
+  )
+  expect(fallback?.headers.get('x-codex-turn-metadata')).toBe(turn)
+})
+
+test('Pi does not complete a newer turn when a superseded attempt succeeds late', async () => {
+  const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+  const releaseOlder = Promise.withResolvers<void>()
+  const rejectNewer = Promise.withResolvers<void>()
+  const sentTurns: unknown[] = []
+  const options: SimpleStreamOptions = {
+    apiKey,
+    sessionId: 'pi-codex-overlapping-attempts',
+    transport: 'sse',
+    maxRetries: 0,
+    fetch: mockFetch(async (_input, init) => {
+      const i = sentTurns.length
+      const turn = new Headers(init?.headers).get('x-codex-turn-metadata')
+      sentTurns.push(JSON.parse(turn ?? 'null')?.turn_id)
+      entered[i]?.resolve()
+      if (i === 0) await releaseOlder.promise
+      if (i === 1) {
+        await rejectNewer.promise
+        return new Response('{"error":{"message":"Rejected fixture send"}}', {
+          status: 400,
+        })
+      }
+      return sseResponse(i + 1)
+    }),
+  }
+  const nextContext = { systemPrompt, messages: [firstUser, secondUser] }
+  try {
+    const older = runtime.stream(model, context, options)
+    await entered[0]?.promise
+    const newer = runtime.stream(model, nextContext, options)
+    await entered[1]?.promise
+    releaseOlder.resolve()
+    expect((await older.result()).responseId).toBe('resp_1')
+    rejectNewer.resolve()
+    expect((await newer.result()).stopReason).toBe('error')
+    expect(
+      (await runtime.stream(model, nextContext, options).result()).responseId,
+    ).toBe('resp_3')
+    const secondTurnID = '00000000-0000-7000-8000-000000000002'
+    expect(sentTurns).toEqual([firstTurnID, secondTurnID, secondTurnID])
+  } finally {
+    releaseOlder.resolve()
+    rejectNewer.resolve()
+  }
+})
 
 test('Codex cached WebSocket sends the developer message once and only new input on turn two', async () => {
   const { frames, connections } = await captureWebSocketFrames(
@@ -652,7 +987,7 @@ test('Pi chains GPT-6.2 after a completed call and restores statuses on full Web
     isError: false,
     timestamp: 3,
   })
-  const { frames, connections } = await captureWebSocketFrames(
+  const { frames, connections, upgrades } = await captureWebSocketFrames(
     async (baseUrl) => {
       const socketModel = { ...effortModel, baseUrl }
       const seed: Context['messages'][number] = {
@@ -742,6 +1077,22 @@ test('Pi chains GPT-6.2 after a completed call and restores statuses on full Web
     'resp_2',
     undefined,
   ])
+  const upgrade = {
+    ...clientAndAccountHeaders,
+    'openai-beta': 'responses_websockets=2026-02-06',
+    ...primaryIdentityHeaders,
+  }
+  expect(upgrades.map(applicationUpgradeHeaders)).toEqual([upgrade, upgrade])
+  expect(frames.slice(0, 3).map(frameMetadata)).toEqual(
+    [firstTurnID, firstTurnID, '00000000-0000-7000-8000-000000000002'].map(
+      (id) => ({
+        'x-codex-installation-id': '00000000-0000-4000-8000-000000000100',
+        'x-codex-window-id': 'pi-codex-payload-session:0',
+        'x-codex-turn-metadata': JSON.stringify(expectedTurn(id)),
+        'x-codex-ws-stream-request-start-ms': '1800000000000',
+      }),
+    ),
+  )
   for (const frame of frames) expect(frame).not.toHaveProperty('instructions')
   const [full, toolDelta, userDelta, resend] = frames.map(
     (frame) => frame.input as Record<string, unknown>[],

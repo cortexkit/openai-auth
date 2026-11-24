@@ -1,6 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { parseJwtClaims } from '@cortexkit/openai-auth-core/internal'
-import { shapePiCodexWebSocketFrame } from './codex-wire.ts'
+import {
+  type PiCodexWireSession,
+  shapePiCodexUpgrade,
+  shapePiCodexWebSocketFrame,
+} from './codex-wire.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
 
 type WebSocketOptions = string | string[] | { headers?: Record<string, string> }
@@ -12,7 +16,7 @@ type WebSocketAttempt = {
   url: string
   token: string
   owner: object
-  sessionId?: string | undefined
+  session: PiCodexWireSession | undefined
   onSend(): void
   onMessage(data: string): void
 }
@@ -25,14 +29,14 @@ type ScopedAttempt = WebSocketAttempt & {
 const attemptScope = new AsyncLocalStorage<ScopedAttempt>()
 const cachedSockets = new Map<string, PiRawCodexWebSocket>()
 
-function cacheKey({ sessionId, token }: WebSocketAttempt): string | undefined {
-  if (!sessionId) return
+function cacheKey({ session, token }: WebSocketAttempt): string | undefined {
+  if (!session) return
   // pi-ai keys the cache by the original session ID and the nested JWT claim,
   // not by the prompt_cache_key sent on the wire or the plugin's routing account ID.
   const accountId =
     parseJwtClaims(token)?.['https://api.openai.com/auth']?.chatgpt_account_id
   if (typeof accountId === 'string' && accountId)
-    return JSON.stringify([sessionId, accountId])
+    return JSON.stringify([session.threadID, accountId])
 }
 
 export function retireIdlePiCodexWebSocket(): void {
@@ -72,7 +76,7 @@ class PiRawCodexWebSocket extends RawWebSocket {
 
   constructor(attempt: ScopedAttempt, headers: Record<string, string>) {
     const { url, token, owner, cacheKey } = attempt
-    super(url, headers)
+    super(url, shapePiCodexUpgrade(headers, attempt.session))
     this.binding = { url, token, owner }
     // An open incumbent means pi-ai opened this as a temporary socket while
     // the cached connection was busy. It must not displace the cached one.
@@ -126,7 +130,7 @@ class PiRawCodexWebSocket extends RawWebSocket {
       cachedSockets.set(this.cacheKey, this)
     this.activeAttempt = attempt
     attempt.onSend()
-    super.send(shapePiCodexWebSocketFrame(data))
+    super.send(shapePiCodexWebSocketFrame(data, attempt.session))
   }
 }
 
