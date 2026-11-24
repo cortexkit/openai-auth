@@ -41,6 +41,8 @@ export function quotaMap(usedPercent: number, checkedAt = Date.now()) {
 
 export interface PoolRowSeed {
   id: string
+  identity?: string | null
+  access?: string
   quota?: ReturnType<typeof quotaMap>
   expires?: number
   enabled?: boolean
@@ -65,7 +67,9 @@ export function seedPool(
         type: 'oauth',
         label: row.id,
         enabled: row.enabled ?? true,
-        accountId: `chatgpt-${row.id}`,
+        ...(row.identity === null
+          ? {}
+          : { accountId: row.identity ?? `chatgpt-${row.id}` }),
         addedAt: 1,
       })),
       commonAuthPool: {
@@ -92,7 +96,7 @@ export function seedPool(
         rows.map((row) => [
           row.id,
           {
-            access: `${row.id}-token`,
+            access: row.access ?? `${row.id}-token`,
             refresh: `${row.id}-refresh`,
             expires: row.expires ?? Date.now() + 24 * HOUR,
           },

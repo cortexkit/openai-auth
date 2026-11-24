@@ -31,6 +31,7 @@ export {
   type OpenAICacheKeepManagerOptions,
   type OpenAICacheKeepMeta,
   openaiCacheKeepProfile,
+  resolveCacheKeepAccountIdentity,
 } from './cachekeep'
 export * from './codex-body'
 export * from './codex-call-status'

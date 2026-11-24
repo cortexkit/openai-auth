@@ -22,7 +22,9 @@ import { PoolAccountSource } from '../core/pool-account-source'
 import { buildPoolSidebarMachineState } from '../core/pool-sidebar'
 import {
   __bootQuotaSeedPromiseForTest,
+  __menuContextForTest,
   __resetBootQuotaSeedForTest,
+  CodexAuthPlugin,
   createResetTargetResolver,
 } from '../index.ts'
 import {
@@ -35,12 +37,15 @@ import {
   HOUR,
   installWire,
   loadPlugin,
+  mockPluginInput,
+  PLACEHOLDER,
   quotaMap,
   readJson,
   seedPool,
   usageBody,
   waitFor,
 } from './fixtures/pool-install'
+import { jwt } from './fixtures/pool-migration-harness'
 import { poolQuotaTimer } from './fixtures/pool-quota-timer'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
@@ -632,6 +637,100 @@ describe('cachekeep and reset credits on a migrated install', () => {
     expires: Date.now() + 24 * HOUR,
   }
 
+  for (const freshIdentity of ['same-login', 'other-login']) {
+    it(`cachekeep for a pool row with no stored identity and a fresh ${freshIdentity} token`, async () => {
+      const foregroundToken = jwt('same-login', 'foreground')
+      const freshToken = jwt(freshIdentity, 'warm')
+      seedPool(
+        files,
+        [
+          {
+            id: 'main',
+            identity: null,
+            access: foregroundToken,
+            quota: quotaMap(10),
+          },
+        ],
+        { cacheKeep: { enabled: true } },
+      )
+      installWire()
+      const network = globalThis.fetch
+      const sends: [string | null, string | null][] = []
+      globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+        const [url, init] = args
+        if (String(url).endsWith('/responses')) {
+          const headers = new Headers(init?.headers)
+          sends.push([
+            headers.get('authorization'),
+            headers.get('chatgpt-account-id'),
+          ])
+        }
+        return network(...args)
+      }) as typeof fetch
+
+      hooks = await CodexAuthPlugin(mockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const loaded = await hooks.auth?.loader?.(
+        async () => ({ ...PLACEHOLDER }),
+        { id: 'openai', label: 'OpenAI', models: [] } as never,
+      )
+      if (!loaded || !('fetch' in loaded) || typeof loaded.fetch !== 'function')
+        throw new Error('No fetch in loader result')
+      const response = await scope.wrap(loaded.fetch)(
+        'https://api.openai.com/v1/responses',
+        {
+          method: 'POST',
+          headers: { 'session-id': 'sess-no-stored-identity' },
+          body: '{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}]}',
+        },
+      )
+      if (!(response instanceof Response)) throw new Error('No model response')
+      await response.text()
+      expect(sends).toEqual([[`Bearer ${foregroundToken}`, null]])
+      await drainSidebarWrites()
+
+      const manager = __menuContextForTest()?.cacheKeepManager as
+        | OpenAICacheKeepManager
+        | undefined
+      if (!manager) throw new Error('No cachekeep manager')
+      const targets = (
+        manager as unknown as {
+          targets: Map<string, { cacheExpiresAt: number }>
+        }
+      ).targets
+      expect(targets.size).toBe(1)
+      for (const target of targets.values())
+        target.cacheExpiresAt = Date.now() + 1_000
+      const accessFor = PoolAccountSource.prototype.accessFor
+      const resolved: Array<{ token: string; identity: string | undefined }> =
+        []
+      const fresh = spyOn(
+        PoolAccountSource.prototype,
+        'accessFor',
+      ).mockImplementation(async function (this: PoolAccountSource, ...args) {
+        const access = await accessFor.call(this, ...args)
+        if (!access) return undefined
+        resolved.push({ token: access.token, identity: access.row.identity })
+        return { ...access, token: freshToken }
+      })
+      restores.push(() => fresh.mockRestore())
+      await manager.tick()
+      expect(fresh).toHaveBeenCalledTimes(1)
+      expect(resolved).toEqual([
+        { token: foregroundToken, identity: undefined },
+      ])
+      expect(sends).toEqual(
+        freshIdentity === 'same-login'
+          ? [
+              [`Bearer ${foregroundToken}`, null],
+              [`Bearer ${freshToken}`, null],
+            ]
+          : [[`Bearer ${foregroundToken}`, null]],
+      )
+    })
+  }
+
   it('cachekeep warms main with row main token, never the slot', async () => {
     seedPool(files, [
       { id: 'main', quota: quotaMap(10) },
@@ -659,7 +758,7 @@ describe('cachekeep and reset credits on a migrated install', () => {
         sessionKey: `warm-${accountId}`,
         bodyText: body,
         accountId,
-        meta: { replayHeaders: {} },
+        meta: { replayHeaders: {}, chatgptAccountId: `chatgpt-${accountId}` },
       })
     }
     const targets = (

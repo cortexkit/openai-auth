@@ -43,6 +43,7 @@ import {
   type SidebarState,
 } from '../sidebar-state.ts'
 import { expectedBaseInstructions } from './fixtures/codex-instructions'
+import { jwt } from './fixtures/pool-migration-harness'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -3744,7 +3745,7 @@ describe('integration: active fallback routing', () => {
     }
   }
 
-  function seedStickyBalancedAccounts() {
+  function seedStickyBalancedAccounts(fallback2Access = 'fallback-2-token') {
     const checkedAt = Date.now()
     writeFileSync(
       configFile,
@@ -3767,7 +3768,7 @@ describe('integration: active fallback routing', () => {
             id: 'fallback-2',
             type: 'oauth',
             enabled: true,
-            access: 'fallback-2-token',
+            access: fallback2Access,
             refresh: 'fallback-2-refresh',
             expires: Date.now() + 24 * 3600_000,
             accountId: 'acc-fallback-2',
@@ -4824,7 +4825,9 @@ describe('integration: active fallback routing', () => {
     // The manager reads the clock it was built with, so the override has to be
     // in place before the loader runs.
     Date.now = () => now
-    seedStickyBalancedAccounts()
+    const fallback2Access = jwt('acc-fallback-2')
+    const fallback2Bearer = `Bearer ${fallback2Access}`
+    seedStickyBalancedAccounts(fallback2Access)
     const sends: string[] = []
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
       if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
@@ -4843,14 +4846,14 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
       await drainSidebarWrites()
-      seedStickyBalancedAccounts()
+      seedStickyBalancedAccounts(fallback2Access)
       await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'moved-session' }),
       )
       await drainSidebarWrites()
-      expect(sends).toEqual(['Bearer fallback-2-token'])
+      expect(sends).toEqual([fallback2Bearer])
       const manager = (
         globalThis as typeof globalThis & {
           __openaiAuthCacheKeepManagers?: Map<
@@ -4867,10 +4870,7 @@ describe('integration: active fallback routing', () => {
       // target is never warmed after its cache has expired.
       now += 4 * 60_000
       await manager.tick()
-      expect(sends).toEqual([
-        'Bearer fallback-2-token',
-        'Bearer fallback-2-token',
-      ])
+      expect(sends).toEqual([fallback2Bearer, fallback2Bearer])
 
       // Another process moves the session's pin to fallback-1, so the prompt
       // cache on fallback-2 is no longer the one its next request will use.

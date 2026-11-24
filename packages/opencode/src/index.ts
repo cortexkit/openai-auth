@@ -75,6 +75,7 @@ import {
   refreshPoolInBackground,
   refreshQuotaInBackground,
   reportSessionCacheResponse,
+  resolveCacheKeepAccountIdentity,
   resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
   shouldCaptureSessionCache,
@@ -2908,25 +2909,35 @@ export async function CodexAuthPlugin(
               sessionId: keepwarmHeaders.get('session-id'),
             })
           }
+          const trackWarmRequest = () => {
+            if (!keepwarmEnabled || !keepwarmCapture) return
+            const chatgptAccountId =
+              keepwarmHeaders.get('chatgpt-account-id') ?? undefined
+            cacheKeepManager.track({
+              sessionKey: keepwarmCapture.sessionKey,
+              bodyText: keepwarmCapture.bodyText,
+              accountId: keepwarmAccountKey,
+              isSubagent: keepwarmCapture.isSubagent,
+              meta: {
+                replayHeaders: keepwarmCapture.replayHeaders,
+                chatgptAccountId,
+                ...(chatgptAccountId === undefined
+                  ? {
+                      effectiveAccountId:
+                        resolveCacheKeepAccountIdentity(accessToken),
+                    }
+                  : {}),
+                routingSessionId: sessionID,
+              },
+            })
+          }
           if (websocketFetch && useWebSocket) {
             logT.debug('WS transport', {
               pid: process.pid,
               pathname: parsed.pathname,
               accountId: keepwarmAccountKey,
             })
-            if (keepwarmEnabled && keepwarmCapture) {
-              cacheKeepManager.track({
-                sessionKey: keepwarmCapture.sessionKey,
-                bodyText: keepwarmCapture.bodyText,
-                accountId: keepwarmAccountKey,
-                isSubagent: keepwarmCapture.isSubagent,
-                meta: {
-                  replayHeaders: keepwarmCapture.replayHeaders,
-                  chatgptAccountId: accountId,
-                  routingSessionId: sessionID,
-                },
-              })
-            }
+            trackWarmRequest()
             const key = `stream:${randomUUID()}`
             streams.set(key, stream)
             const scopedHeaders = new Headers(requestInit?.headers)
@@ -3005,19 +3016,7 @@ export async function CodexAuthPlugin(
           }
 
           // Store the finalized agent request, never a title or history rewrite.
-          if (keepwarmEnabled && keepwarmCapture) {
-            cacheKeepManager.track({
-              sessionKey: keepwarmCapture.sessionKey,
-              bodyText: keepwarmCapture.bodyText,
-              accountId: keepwarmAccountKey,
-              isSubagent: keepwarmCapture.isSubagent,
-              meta: {
-                replayHeaders: keepwarmCapture.replayHeaders,
-                chatgptAccountId: accountId,
-                routingSessionId: sessionID,
-              },
-            })
-          }
+          trackWarmRequest()
 
           logT.debug('HTTP transport', {
             pid: process.pid,

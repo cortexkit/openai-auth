@@ -67,8 +67,10 @@ export {
 export interface OpenAICacheKeepMeta {
   /** Captured request headers; only cache identity and Lite can be replayed. */
   replayHeaders: Record<string, string>
-  /** ChatGPT identity of the captured request, used to check the fresh credential. */
+  /** The ChatGPT account header sent by the captured request, if any. */
   chatgptAccountId?: string
+  /** Identity from the sent bearer when the host did not send an account header. */
+  effectiveAccountId?: string
   /**
    * The session id the router keyed this request's routing by. It can differ
    * from the target's session key: the captured body is the prepared request,
@@ -408,7 +410,11 @@ export type CacheKeepLocalCredentialOptions =
 export type OpenAICacheKeepAdapterOptions = OpenAICacheKeepAdapterBaseOptions &
   CacheKeepLocalCredentialOptions
 
-function identityOfToken(token: string): string | undefined {
+export function resolveCacheKeepAccountIdentity(
+  token: string,
+  knownIdentity?: string,
+): string | undefined {
+  if (knownIdentity !== undefined) return knownIdentity
   const claims = parseJwtClaims(token)
   return claims ? extractAccountIdFromClaims(claims) : undefined
 }
@@ -440,12 +446,15 @@ export function createOpenAICacheKeepAdapter(
         const check: CacheKeepCredentialCheck = {
           target,
           mode: vaultAttempt ? 'vault' : 'local',
-          identity:
-            (vaultAttempt ? vaultAttempt.accountIdentity : localIdentity) ??
-            identityOfToken(accessToken),
+          identity: resolveCacheKeepAccountIdentity(
+            accessToken,
+            vaultAttempt ? vaultAttempt.accountIdentity : localIdentity,
+          ),
         }
         await options.verifyCredential?.(check)
-        if (check.identity !== target.meta.chatgptAccountId) {
+        const capturedIdentity =
+          target.meta.chatgptAccountId ?? target.meta.effectiveAccountId
+        if (check.identity !== capturedIdentity) {
           dropChangedIdentity?.(target.sessionKey)
           throw new Error('the account signs in as another login now')
         }
@@ -485,16 +494,22 @@ export function createOpenAICacheKeepAdapter(
           // Diagnostic logging must never block the warm.
         }
         try {
+          // Matching the account does not mean the foreground sent a header.
+          // Preserve that omission even when the fresh token names the account.
+          const headerIdentity =
+            target.meta.chatgptAccountId === undefined
+              ? undefined
+              : check.identity
           const request = buildKeepwarmRequest({
             body,
             replayHeaders: target.meta.replayHeaders,
-            credential: { token: accessToken, identity: check.identity },
+            credential: { token: accessToken, identity: headerIdentity },
             signal,
           })
           log?.debug('cachekeep warm request', {
             ...warmBodyShape,
             headerKeys: [...new Headers(request.headers).keys()],
-            hasChatGptAccountId: check.identity !== undefined,
+            hasChatGptAccountId: headerIdentity !== undefined,
           })
           const received = await options.fetchImpl(
             target.meta.url ?? options.codexResponsesUrl,
