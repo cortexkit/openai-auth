@@ -823,7 +823,10 @@ export function streamResponsesWebSocket(
     if (event.type === 'response.completed' || event.type === 'response.done') {
       completed = true
       if (event.type === 'response.completed')
-        logInputTransformations(event.response, 'websocket', 'opencode1')
+        logInputTransformations(event.response, 'websocket', 'opencode1', {
+          warm: false,
+          chained: 'previous_response_id' in options.body,
+        })
       // Belt-and-suspenders: the completed frame may carry the full output list;
       // fold any finalized function_call ids it lists into the streamed set.
       collectFinalizedFromResponse(event, finalizedFunctionCallIds)

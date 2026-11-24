@@ -617,6 +617,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   >()
   const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
   let transformationLogs: WeakSet<Attempt<OpenAIAttemptData>> | undefined
+  const chainedRequests = new WeakMap<Attempt<OpenAIAttemptData>, boolean>()
   const billingCounts = new Map<string, number>()
   const observeBillingModel = (
     attempt: Attempt<OpenAIAttemptData> | undefined,
@@ -648,6 +649,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           attempt.data?.kind === 'vault' && attempt.data.freeQuota,
         ),
       )
+    }
+  }
+  const observeRequest = (attempt: Attempt<OpenAIAttemptData> | undefined) => {
+    if (!attempt) return undefined
+    const bill = observeBillingModel(attempt)
+    return (body: Record<string, unknown>) => {
+      chainedRequests.set(attempt, 'previous_response_id' in body)
+      transformationLogs?.delete(attempt)
+      if (typeof body.model === 'string') bill?.(body.model)
     }
   }
   const { source, pins } = deps
@@ -2470,7 +2480,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           effort,
           deps.responsesLite?.() ?? false,
           undefined,
-          observeBillingModel(attempt),
+          observeRequest(attempt),
         )) ?? routed
       return rewritten
     },
@@ -2483,7 +2493,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         frame,
         { sessionID, kind },
         effort,
-        observeBillingModel(attempt),
+        observeRequest(attempt),
       ),
     quotaFromHeaders: (headers, status, attempt) => {
       if (attempt.data?.kind === 'vault')
@@ -2581,6 +2591,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             event.response,
             transport === 'ws' ? 'websocket' : 'http',
             'opencode2',
+            { warm: false, chained: chainedRequests.get(attempt) },
           )
         ) {
           transformationLogs ??= new WeakSet()

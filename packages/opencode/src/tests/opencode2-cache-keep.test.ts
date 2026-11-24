@@ -1022,21 +1022,28 @@ async function websocket(
       ...headers,
     },
   })
+  const receive = (event: Record<string, unknown>) =>
+    location.host.fire('experimental.ws.receive', {
+      ...scope(sessionID),
+      frame: JSON.stringify(event),
+    })
   return {
     send: async (body: Record<string, unknown>) => {
       const draft = { ...scope(sessionID), frame: JSON.stringify(body) }
       await location.host.fire('experimental.ws.send', draft)
       return JSON.parse(draft.frame)
     },
-    complete: async (id: string, output: unknown[] = []) => {
-      for (const item of output)
-        await location.host.fire('experimental.ws.receive', {
-          ...scope(sessionID),
-          frame: JSON.stringify({ type: 'response.output_item.done', item }),
-        })
-      await location.host.fire('experimental.ws.receive', {
-        ...scope(sessionID),
-        frame: JSON.stringify({ type: 'response.completed', response: { id } }),
+    complete: async (
+      id: string,
+      output: unknown[] = [],
+      done = output.map((item, output_index) => ({ item, output_index })),
+      responseFields: Record<string, unknown> = {},
+    ) => {
+      for (const event of done)
+        await receive({ type: 'response.output_item.done', ...event })
+      await receive({
+        type: 'response.completed',
+        response: { id, output, ...responseFields },
       })
     },
   }
@@ -1169,6 +1176,9 @@ describe('OpenCode 2 WebSocket keep-warm', () => {
     const next = await ws.send({
       type: 'response.create',
       model: 'gpt-5.5',
+      instructions: 'help',
+      tools: [],
+      store: true,
       previous_response_id: 'r1',
       input: delta,
     })
@@ -1213,6 +1223,166 @@ describe('OpenCode 2 WebSocket keep-warm', () => {
     shared.clock.now += 4 * MINUTE
     await managerOf(files)!.tick()
     expect(location.warms).toHaveLength(1)
+  })
+
+  test.each([
+    'native completion',
+    'reordered done events',
+    'completion-only reasoning',
+    'different done call shape',
+    're-encrypted completion reasoning',
+    'changed chain fields',
+    'provider-transformed input',
+  ] as const)('WebSocket keep-warm prefix: %s', async (scenario) => {
+    const files = keepWarmPool()
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const location = await startLocation(files, shared)
+    const ws = await websocket(location)
+    const reasoning = {
+      id: 'rs_1',
+      type: 'reasoning',
+      summary: [],
+      encrypted_content: 'opaque-original',
+    }
+    const message = {
+      id: 'msg_1',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [
+        { type: 'output_text', text: 'Reading files.', annotations: [] },
+      ],
+    }
+    const read = {
+      id: 'fc_1',
+      type: 'function_call',
+      call_id: 'call_read',
+      name: 'read',
+      arguments: '{"z": 1, "a":2}',
+      status: 'completed',
+    }
+    const list = {
+      ...read,
+      id: 'fc_2',
+      call_id: 'call_list',
+      name: 'list',
+      arguments: '{ "path": "." }',
+    }
+    const native = [reasoning, message, read, list]
+    const done: { item: unknown; output_index: number }[] = native.map(
+      (item, output_index) => ({ item, output_index }),
+    )
+    const completed = [...native]
+    if (scenario === 'reordered done events') done.reverse()
+    if (scenario === 'completion-only reasoning') done.shift()
+    if (scenario === 'different done call shape') {
+      const { status: _status, ...call } = read
+      done[2] = {
+        item: { ...call, arguments: '{"z":1,"a":2}' },
+        output_index: 2,
+      }
+    }
+    if (scenario === 're-encrypted completion reasoning') {
+      completed[0] = { ...reasoning, encrypted_content: 'opaque-reencrypted' }
+    }
+
+    const { status: _status, ...historicalCall } = {
+      ...read,
+      id: 'fc_previous',
+      call_id: 'call_previous',
+    }
+    const user = { role: 'user', content: 'Read the files' }
+    const followup = { role: 'user', content: 'Summarize.' }
+    const fields = {
+      type: 'response.create',
+      model: 'gpt-6.2-sol',
+      instructions: 'help',
+      tools: ['read', 'list'].map((name) => ({ type: 'function', name })),
+      reasoning: { effort: 'medium', summary: 'auto' },
+      include: ['reasoning.encrypted_content'],
+    }
+    const first = await ws.send({ ...fields, input: [historicalCall, user] })
+    expect(first.input).toEqual([
+      { ...historicalCall, status: 'completed' },
+      user,
+    ])
+    await ws.complete(
+      'r1',
+      completed,
+      done,
+      scenario === 'provider-transformed input'
+        ? {
+            input_transformations: [
+              { action: 'removed', type: 'function_call' },
+            ],
+          }
+        : {},
+    )
+    const toolOutputs = [read, list].map(({ call_id }) => ({
+      type: 'function_call_output',
+      call_id,
+      output: 'ok',
+    }))
+    await ws.send({
+      ...fields,
+      tools:
+        scenario === 'changed chain fields'
+          ? [...fields.tools].reverse()
+          : fields.tools,
+      previous_response_id: 'r1',
+      input: toolOutputs,
+    })
+    await ws.complete('r2')
+    const next = await ws.send({
+      ...fields,
+      reasoning: { ...fields.reasoning, effort: 'high' },
+      previous_response_id: 'r2',
+      input: [followup],
+    })
+    expect(next.reasoning).toEqual(first.reasoning)
+    expect(next.input).toEqual([
+      { type: 'configuration_update', reasoning: { effort: 'high' } },
+      followup,
+    ])
+    await ws.complete('r3')
+
+    shared.clock.now += 29 * MINUTE
+    const manager = managerOf(files)!
+    await manager.tick()
+    if (
+      scenario === 'changed chain fields' ||
+      scenario === 'provider-transformed input'
+    ) {
+      expect(location.warms).toHaveLength(0)
+      expect(manager.status().tracked).toBe(0)
+      await ws.send({ ...fields, input: [followup] })
+      await ws.complete('r4')
+      shared.clock.now += 29 * MINUTE
+      await manager.tick()
+      expect(location.warms).toHaveLength(1)
+      expect(location.warms[0]?.body.input).toEqual([followup])
+    } else {
+      expect(location.warms).toHaveLength(1)
+      const warm = location.warms[0]!.body
+      expect(JSON.stringify(warm.input)).toBe(
+        JSON.stringify([
+          ...first.input,
+          ...native,
+          ...toolOutputs,
+          ...next.input,
+        ]),
+      )
+      expect(warm).toMatchObject({
+        model: fields.model,
+        instructions: fields.instructions,
+        tools: first.tools,
+        reasoning: first.reasoning,
+        include: fields.include,
+        prompt_cache_key: first.prompt_cache_key,
+        stream: true,
+        store: false,
+      })
+    }
   })
 
   test('a rerouted WebSocket session never warms the old captured account', async () => {

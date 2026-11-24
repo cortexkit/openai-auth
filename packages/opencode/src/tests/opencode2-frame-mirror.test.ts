@@ -18,8 +18,19 @@ const full = (input: unknown[], fields = {}) =>
     input,
     ...fields,
   })
-const delta = (previous: string, input: unknown[]) =>
-  full(input, { previous_response_id: previous })
+const delta = (previous: string, input: unknown[], fields = {}) =>
+  full(input, { ...fields, previous_response_id: previous })
+function done(
+  mirror: FrameMirror,
+  sessionID: string,
+  item: unknown,
+  output_index: number,
+) {
+  mirror.receive(
+    sessionID,
+    JSON.stringify({ type: 'response.output_item.done', item, output_index }),
+  )
+}
 function complete(
   mirror: FrameMirror,
   sessionID: string,
@@ -27,12 +38,8 @@ function complete(
   output: unknown[] = [],
   track?: (capture: FrameMirrorCapture) => void,
 ) {
-  for (const item of output)
-    mirror.receive(
-      sessionID,
-      JSON.stringify({ type: 'response.output_item.done', item }),
-      track,
-    )
+  for (const [index, item] of output.entries())
+    done(mirror, sessionID, item, index)
   mirror.receive(
     sessionID,
     JSON.stringify({ type: 'response.completed', response: { id } }),
@@ -101,6 +108,7 @@ describe('OpenCode 2 frame mirror', () => {
     const output = Array.from({ length: 50 }, (_, i) =>
       JSON.stringify({
         type: 'response.output_item.done',
+        output_index: i,
         item: text(`item-${i}`),
       }),
     )
@@ -180,7 +188,7 @@ describe('OpenCode 2 frame mirror', () => {
       input: host,
       stream: true,
     })
-    mirror.send('ses', delta('r1', [toolOutput]))
+    mirror.send('ses', delta('r1', [toolOutput], fields))
     complete(mirror, 'ses', 'r2', [text('done')], track)
     host = [...host, toolOutput, text('done')]
     expect(replay(mirror)?.input).toEqual(host)
@@ -192,7 +200,10 @@ describe('OpenCode 2 frame mirror', () => {
     complete(mirror, 'ses', 'r3', [text('three')], track)
     host = [...host, text('three')]
     expect(replay(mirror)?.input).toEqual(host)
-    mirror.send('ses', delta('r3', [user('fail over')]))
+    mirror.send(
+      'ses',
+      delta('r3', [user('fail over')], { instructions: 'new system' }),
+    )
     // The refused pending send is replaced by a full resend on another account.
     host = [...host, user('fail over')]
     mirror.send('ses', full(host))
@@ -249,6 +260,118 @@ describe('OpenCode 2 frame mirror', () => {
       text('two'),
     ])
   })
+
+  test('without terminal output, replays done items by their output indices', () => {
+    const mirror = new FrameMirror(true)
+    mirror.send('ses', full([user('hello')]))
+    done(mirror, 'ses', text('second'), 1)
+    done(mirror, 'ses', text('first'), 0)
+    complete(mirror, 'ses', 'r1')
+    expect(replay(mirror)?.input).toEqual([
+      user('hello'),
+      text('first'),
+      text('second'),
+    ])
+  })
+
+  test('an explicitly empty terminal output takes precedence over done items', () => {
+    const mirror = new FrameMirror(true)
+    mirror.send('ses', full([user('hello')]))
+    done(mirror, 'ses', text('not in the completed output'), 0)
+    mirror.receive(
+      'ses',
+      '{"type":"response.completed","response":{"id":"r1","output":[]}}',
+    )
+    expect(replay(mirror)?.input).toEqual([user('hello')])
+  })
+
+  test.each([
+    ['holes', [0, 2]],
+    ['duplicates', [0, 0]],
+    ['missing indices', [0, undefined]],
+  ] as const)(
+    'without terminal output, rejects done items with %s',
+    (_name, indices) => {
+      const mirror = new FrameMirror(true)
+      mirror.send('ses', full([user('hello')]))
+      complete(mirror, 'ses', 'r0')
+      mirror.send('ses', delta('r0', [user('continue')]))
+      indices.forEach((output_index) => {
+        mirror.receive(
+          'ses',
+          JSON.stringify({
+            type: 'response.output_item.done',
+            item: text('hi'),
+            output_index,
+          }),
+        )
+      })
+      complete(mirror, 'ses', 'r1')
+      expect(replay(mirror)).toBeUndefined()
+      mirror.send('ses', delta('r1', [user('still a delta')]))
+      complete(mirror, 'ses', 'r2')
+      expect(replay(mirror)).toBeUndefined()
+    },
+  )
+
+  test('warm envelope overrides and WS timing stamps do not invalidate the snapshot', () => {
+    const mirror = new FrameMirror(true)
+    const timing = (stamp: string) => ({
+      'x-codex-turn-metadata': stamp,
+      'x-codex-ws-stream-request-start-ms': stamp,
+      extension: 'keep',
+    })
+    const userInput = [user('hello')]
+    mirror.send(
+      'ses',
+      full(userInput, {
+        stream: false,
+        store: true,
+        max_output_tokens: 12,
+        max_tokens: 13,
+        max_completion_tokens: 14,
+        client_metadata: timing('first'),
+      }),
+    )
+    complete(mirror, 'ses', 'r1')
+    const suffix = [user('continue')]
+    mirror.send(
+      'ses',
+      delta('r1', suffix, {
+        stream: true,
+        store: false,
+        client_metadata: timing('second'),
+      }),
+    )
+    complete(mirror, 'ses', 'r2')
+    expect(replay(mirror)?.input).toEqual([...userInput, ...suffix])
+  })
+
+  test.each([
+    ['missing instructions', { instructions: undefined }],
+    ['changed reasoning', { reasoning: { effort: 'high' } }],
+    ['changed include', { include: [] }],
+    ['changed client metadata', { client_metadata: { unknown: 'changed' } }],
+  ] as const)(
+    'a chained frame with %s invalidates the snapshot',
+    (_name, changed) => {
+      const mirror = new FrameMirror(true)
+      const fields = {
+        instructions: 'system',
+        reasoning: { effort: 'medium' },
+        include: ['reasoning.encrypted_content'],
+        client_metadata: { unknown: 'keep' },
+      }
+      mirror.send('ses', full([user('hello')], fields))
+      complete(mirror, 'ses', 'r0')
+      mirror.send(
+        'ses',
+        delta('r0', [user('continue')], { ...fields, ...changed }),
+      )
+      complete(mirror, 'ses', 'r1')
+      expect(replay(mirror)).toBeUndefined()
+    },
+  )
 
   test('an unavailable baseline stores no delta or output until a full frame recovers', () => {
     const mirror = new FrameMirror(true)
@@ -412,19 +535,23 @@ describe('OpenCode 2 frame mirror', () => {
     expect(mirror.status().bytes).toBe(
       size({ fields, pending: { input, output: [], responseID: 'r密' } }),
     )
-    for (const item of output)
-      mirror.receive(
-        'ses',
-        JSON.stringify({ type: 'response.output_item.done', item }),
-      )
+    for (const [index, item] of output.entries())
+      done(mirror, 'ses', item, index)
     expect(mirror.status().bytes).toBe(
-      size({ fields, pending: { input, output, responseID: 'r密' } }),
+      size({
+        fields,
+        pending: {
+          input,
+          output: output.map((item, index) => ({ index, item })),
+          responseID: 'r密',
+        },
+      }),
     )
     complete(mirror, 'ses', 'r密')
     const head = { responseID: 'r密', input: [...input, ...output] }
     expect(mirror.status().bytes).toBe(size({ fields, head }))
     const added = [user('next')]
-    mirror.send('ses', delta('r密', added))
+    mirror.send('ses', delta('r密', added, fields))
     expect(mirror.status().bytes).toBe(
       size({ fields, head, pending: { input: added, output: [] } }),
     )

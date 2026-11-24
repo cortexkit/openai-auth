@@ -12,16 +12,24 @@ function category(value: unknown): string {
     : 'other'
 }
 
-/** Log only the model and category counts from an already parsed completion. */
+/** The provider reports changes to accepted input on the response object. */
+export function inputTransformationsOf(
+  response: unknown,
+): unknown[] | undefined {
+  if (!isRecord(response)) return undefined
+  const items = response.input_transformations
+  return Array.isArray(items) && items.length > 0 ? items : undefined
+}
+
+/** Log category counts and known request context without conversation data. */
 export function logInputTransformations(
   response: unknown,
   transport: 'http' | 'websocket',
   host: 'opencode1' | 'opencode2' | 'pi',
+  context?: { warm?: boolean; chained?: boolean },
 ): boolean {
-  if (!isRecord(response)) return false
-  const transformations = response.input_transformations
-  if (!Array.isArray(transformations) || transformations.length === 0)
-    return false
+  const transformations = inputTransformationsOf(response)
+  if (!transformations) return false
 
   const items: Record<string, number> = Object.create(null)
   const reasons: Record<string, number> = Object.create(null)
@@ -33,12 +41,17 @@ export function logInputTransformations(
     reasons[reason] = (reasons[reason] ?? 0) + 1
   }
   log.info('Codex transformed input items', {
-    model: typeof response.model === 'string' ? response.model : 'unknown',
+    model:
+      isRecord(response) && typeof response.model === 'string'
+        ? response.model
+        : 'unknown',
     count: transformations.length,
     items,
     reasons,
     transport,
     host,
+    warm: context?.warm,
+    chained: context?.chained,
   })
   return true
 }

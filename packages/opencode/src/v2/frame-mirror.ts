@@ -1,10 +1,17 @@
 import { Buffer } from 'node:buffer'
 import { resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
+import { DEFAULT_MAX_RECORDS } from '@cortexkit/common-auth/opencode2'
 import {
   type AccountPaths,
   CACHE_KEEP_CAPS,
+  createLogger,
+  inputTransformationsOf,
+  isRecord,
   shouldCaptureSessionCache,
 } from '@cortexkit/openai-auth-core/internal'
+
+const log = createLogger('cachekeep')
 
 /** A completed conversation, ready for the HTTP replay adapter to capture. */
 export interface FrameMirrorCapture {
@@ -14,6 +21,12 @@ export interface FrameMirrorCapture {
 }
 
 type Fields = Record<string, unknown>
+type InvalidationReason =
+  | 'output-incomplete'
+  | 'provider-transformed'
+  | 'fields-changed'
+type Diagnostic = InvalidationReason | 'reasoning-reencrypted'
+type DoneItem = { index?: number; item?: Fields }
 type Head = {
   responseID: string
   responseIDBytes: number
@@ -23,7 +36,7 @@ type Head = {
 type Pending = {
   input: unknown[]
   inputBytes: number
-  output: unknown[]
+  output: DoneItem[]
   outputBytes: number
   responseID?: string
   responseIDBytes: number
@@ -86,6 +99,67 @@ function object(text: string): Fields | undefined {
   return undefined
 }
 
+function prefixFields(fields: Fields): Fields {
+  // The HTTP warm forces streaming and store mode, drops generation caps, and
+  // strips these two WS turn/timing stamps. Keep unknown metadata and all
+  // other fields: reconstructing the input cannot account for their changes.
+  const {
+    stream: _stream,
+    store: _store,
+    max_output_tokens: _maxOutputTokens,
+    max_tokens: _maxTokens,
+    max_completion_tokens: _maxCompletionTokens,
+    ...prefix
+  } = fields
+  if (isRecord(prefix.client_metadata)) {
+    const {
+      'x-codex-turn-metadata': _turn,
+      'x-codex-ws-stream-request-start-ms': _start,
+      ...metadata
+    } = prefix.client_metadata
+    prefix.client_metadata = metadata
+  }
+  return prefix
+}
+
+function indexedOutput(done: DoneItem[]): Fields[] | undefined {
+  const output: Fields[] = []
+  for (const { index, item } of done) {
+    if (index === undefined || index >= done.length || output[index] || !item)
+      return undefined
+    output[index] = item
+  }
+  return output
+}
+
+function completedOutput(
+  output: unknown,
+  done: DoneItem[],
+  onReencrypted: () => void,
+): Fields[] | undefined {
+  if (!Array.isArray(output) || !output.every(isRecord)) return undefined
+  // OpenCode's continuation checkpoint prefers the emitted reasoning item
+  // because completion can re-encrypt it (open-responses-continuation.ts,
+  // v2.3.2 lines 201–208 and v2.4.1 lines 203–210). Take order, membership,
+  // and all other items from the completion.
+  const reasoning = new Map<string, Fields>()
+  for (const { item } of done) {
+    if (
+      item?.type === 'reasoning' &&
+      typeof item.id === 'string' &&
+      !reasoning.has(item.id)
+    )
+      reasoning.set(item.id, item)
+  }
+  return output.map((item) => {
+    if (item.type !== 'reasoning' || typeof item.id !== 'string') return item
+    const emitted = reasoning.get(item.id)
+    if (!emitted) return item
+    if (!isDeepStrictEqual(emitted, item)) onReencrypted()
+    return emitted
+  })
+}
+
 /**
  * A bounded view of what the server holds on owned WebSocket sessions.
  * Map order is LRU order. A head includes its completed output; a pending
@@ -95,6 +169,7 @@ function object(text: string): Fields | undefined {
 export class FrameMirror {
   readonly caps = CACHE_KEEP_CAPS
   private readonly entries = new Map<string, Entry>()
+  private readonly diagnostics = new Map<string, Set<Diagnostic>>()
   private bytes = 0
 
   constructor(private enabled = false) {}
@@ -109,7 +184,7 @@ export class FrameMirror {
     if (!enabled) {
       for (const sessionID of this.entries.keys()) {
         if (!shouldCaptureSessionCache(sessionID, enabled))
-          this.forget(sessionID)
+          this.dropSnapshot(sessionID)
       }
     }
   }
@@ -117,21 +192,22 @@ export class FrameMirror {
   /** Records the final response.create bytes, without changing the host frame. */
   send(sessionID: string, frame: string): void {
     if (!shouldCaptureSessionCache(sessionID, this.enabled)) {
-      this.forget(sessionID)
+      this.dropSnapshot(sessionID)
       return
     }
     const body = object(frame)
     if (body?.type !== 'response.create') return
     if (!Array.isArray(body.input)) {
-      this.forget(sessionID)
+      this.dropSnapshot(sessionID)
       return
     }
+    const chained = 'previous_response_id' in body
     const previous = body.previous_response_id
     const prior = this.entries.get(sessionID)
     const head = prior?.head
-    if (previous && previous !== head?.responseID) {
+    if (chained && (!head || previous !== head.responseID)) {
       // Retaining this delta would turn a partial prompt into a full replay.
-      this.forget(sessionID)
+      this.dropSnapshot(sessionID)
       return
     }
     const {
@@ -140,10 +216,18 @@ export class FrameMirror {
       input,
       ...fields
     } = body
+    if (
+      chained &&
+      prior &&
+      !isDeepStrictEqual(prefixFields(fields), prefixFields(prior.fields))
+    ) {
+      this.invalidate(sessionID, 'fields-changed')
+      return
+    }
     this.keep(sessionID, {
-      fields: previous && prior ? prior.fields : fields,
-      fieldsBytes: previous && prior ? prior.fieldsBytes : jsonBytes(fields),
-      ...(previous && head ? { head } : {}),
+      fields: chained && prior ? prior.fields : fields,
+      fieldsBytes: chained && prior ? prior.fieldsBytes : jsonBytes(fields),
+      ...(chained && head ? { head } : {}),
       pending: {
         input: input as unknown[],
         inputBytes: inputBytes(input as unknown[]),
@@ -155,12 +239,7 @@ export class FrameMirror {
     })
   }
 
-  /**
-   * Output items are kept as received, including opaque encrypted reasoning.
-   * Completion consumes the pending send before calling track, so duplicate
-   * completed events cannot capture it twice. Without a subscriber this only
-   * updates the mirror; it does not schedule or send a warm.
-   */
+  /** Completion consumes the pending send before notifying the warm tracker. */
   receive(
     sessionID: string,
     frame: string,
@@ -178,20 +257,28 @@ export class FrameMirror {
     const event = object(frame)
     if (!event) return
     const pending = entry.pending
-    const response = event.response as Fields | undefined
+    const response = isRecord(event.response) ? event.response : undefined
     if (event.type === 'response.created' && typeof response?.id === 'string') {
       pending.responseID = response.id
       pending.responseIDBytes = jsonBytes(response.id)
       this.keep(sessionID, entry)
-    } else if (event.type === 'response.output_item.done' && event.item) {
+    } else if (event.type === 'response.output_item.done') {
       if (
         typeof event.response_id === 'string' &&
         pending.responseID !== undefined &&
         event.response_id !== pending.responseID
       )
         return
-      pending.output.push(event.item)
-      pending.outputBytes += jsonBytes(event.item)
+      const index = event.output_index
+      const done: DoneItem = {
+        index:
+          typeof index === 'number' && Number.isSafeInteger(index) && index >= 0
+            ? index
+            : undefined,
+        item: isRecord(event.item) ? event.item : undefined,
+      }
+      pending.output.push(done)
+      pending.outputBytes += jsonBytes(done)
       this.keep(sessionID, entry)
     } else if (
       event.type === 'response.completed' &&
@@ -202,21 +289,31 @@ export class FrameMirror {
         (pending.responseID !== undefined && response.id !== pending.responseID)
       )
         return
+      if (inputTransformationsOf(response)) {
+        this.invalidate(sessionID, 'provider-transformed')
+        return
+      }
+      const output =
+        'output' in response
+          ? completedOutput(response.output, pending.output, () => {
+              this.logOnce(sessionID, 'reasoning-reencrypted')
+            })
+          : indexedOutput(pending.output)
+      if (!output) {
+        this.invalidate(sessionID, 'output-incomplete')
+        return
+      }
       const head: Head = {
         responseID: response.id,
         responseIDBytes:
           pending.responseID === response.id
             ? pending.responseIDBytes
             : jsonBytes(response.id),
-        input: [
-          ...(entry.head?.input ?? []),
-          ...pending.input,
-          ...pending.output,
-        ],
+        input: [...(entry.head?.input ?? []), ...pending.input, ...output],
         inputBytes:
           (entry.head?.inputBytes ?? 0) +
           pending.inputBytes +
-          pending.outputBytes,
+          inputBytes(output),
       }
       const completed = { ...entry, head, pending: undefined }
       if (!this.keep(sessionID, completed)) return
@@ -238,6 +335,11 @@ export class FrameMirror {
   }
 
   forget(sessionID: string): void {
+    this.dropSnapshot(sessionID)
+    this.diagnostics.delete(sessionID)
+  }
+
+  private dropSnapshot(sessionID: string): void {
     const entry = this.entries.get(sessionID)
     if (entry) this.bytes -= entry.bytes
     this.entries.delete(sessionID)
@@ -260,11 +362,34 @@ export class FrameMirror {
     return JSON.stringify({ ...fields, input: head.input, stream: true })
   }
 
+  private invalidate(sessionID: string, reason: InvalidationReason): void {
+    this.dropSnapshot(sessionID)
+    this.logOnce(sessionID, reason)
+  }
+
+  private logOnce(sessionID: string, reason: Diagnostic): void {
+    const seen = this.diagnostics.get(sessionID) ?? new Set<Diagnostic>()
+    this.diagnostics.delete(sessionID)
+    this.diagnostics.set(sessionID, seen)
+    // Retain only recent diagnostic keys, even if sessions are never deleted.
+    if (this.diagnostics.size > DEFAULT_MAX_RECORDS) {
+      const oldest = this.diagnostics.keys().next().value
+      if (oldest !== undefined) this.diagnostics.delete(oldest)
+    }
+    if (seen.has(reason)) return
+    seen.add(reason)
+    if (reason === 'reasoning-reencrypted')
+      log.debug('Codex reasoning differs between done and completed', {
+        reason,
+      })
+    else log.info('OpenCode 2 keep-warm snapshot invalidated', { reason })
+  }
+
   private keep(sessionID: string, entry: Entry): boolean {
     // Count both head and pending, including unfinished output. A single
     // session cannot retain more bytes than the entire store's byte budget.
     const bytes = entryBytes(entry)
-    this.forget(sessionID)
+    this.dropSnapshot(sessionID)
     if (bytes > this.caps.maxBytes) return false
     entry.bytes = bytes
     this.entries.set(sessionID, entry)
@@ -275,7 +400,7 @@ export class FrameMirror {
     ) {
       const oldest = this.entries.keys().next().value
       if (oldest === undefined) break
-      this.forget(oldest)
+      this.dropSnapshot(oldest)
     }
     return this.entries.has(sessionID)
   }

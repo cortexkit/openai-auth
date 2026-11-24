@@ -26,7 +26,10 @@ import type {
 } from '@cortexkit/common-auth/limits'
 import type { AccountStorage } from './accounts'
 import { sanitizeHttpFallbackInit } from './codex-http'
-import { logInputTransformations } from './input-transformations'
+import {
+  inputTransformationsOf,
+  logInputTransformations,
+} from './input-transformations'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
 import { normalizeQuotaHeaders } from './quota-normalize'
 import {
@@ -44,6 +47,7 @@ import {
   redactCredentialError,
   redactCredentialResponse,
 } from './util/credential-redaction'
+import { isRecord } from './util/record'
 import type { OpenAiVault } from './vault'
 
 export {
@@ -208,6 +212,7 @@ function extractKeepwarmUsage(
 function extractKeepwarmSseUsage(
   bodyText: string,
   host: 'opencode1' | 'opencode2' | 'pi',
+  requestBodyText: string,
 ): ReturnType<typeof emptyKeepwarmUsage> {
   let eventName: string | undefined
   let dataLines: string[] = []
@@ -228,7 +233,19 @@ function extractKeepwarmSseUsage(
       const response = event.response as Record<string, unknown> | undefined
       if (type === 'response.completed' && !completed) {
         completed = true
-        logInputTransformations(response, 'http', host)
+        if (inputTransformationsOf(response)) {
+          let chained: boolean | undefined
+          try {
+            const request: unknown = JSON.parse(requestBodyText)
+            if (isRecord(request)) chained = 'previous_response_id' in request
+          } catch {
+            // A non-JSON capture cannot establish whether the request chained.
+          }
+          logInputTransformations(response, 'http', host, {
+            warm: true,
+            chained,
+          })
+        }
       }
       usage = extractUsageObject(response?.usage ?? event.usage)
     } catch {
@@ -552,7 +569,7 @@ export function createOpenAICacheKeepAdapter(
       return response
     },
 
-    readUsage({ response, text }) {
+    readUsage({ response, text, target }) {
       const contentType = response.headers.get('content-type') ?? ''
       const isSse =
         contentType.includes('text/event-stream') ||
@@ -564,7 +581,11 @@ export function createOpenAICacheKeepAdapter(
         isSse,
       })
       const usage = isSse
-        ? extractKeepwarmSseUsage(text, options.host ?? 'opencode1')
+        ? extractKeepwarmSseUsage(
+            text,
+            options.host ?? 'opencode1',
+            target.bodyText,
+          )
         : extractKeepwarmUsage(text)
       const quota = normalizeQuotaHeaders(response.headers)
       return {

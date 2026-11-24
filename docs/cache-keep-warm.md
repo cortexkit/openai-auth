@@ -27,6 +27,8 @@ The plugin's warming is invisible: it adds no message, visible answer or tool ca
 
 ## Which sessions are warmed
 
+For OpenCode 2 WebSocket sessions, the plugin skips warming when it cannot reconstruct the conversation: the output is incomplete, Codex reports transforming the input, or a request chained via `previous_response_id` changes fields that may affect the cached prefix. Warming resumes after a new full request completes with a usable snapshot; a continuation alone cannot rebuild it.
+
 Keep-warm only runs for main-agent sessions unless subagent warming is on, and it uses the account serving that session. A main session stops warming after one hour without a real request, unless sustain is on. Subagents have a 30-minute idle cap; on GPT-5.6 and later they instead have a 75-minute idle cap and a limit of two successful warms per captured request. Reaching a cap discards the saved request and stops warming, not the session itself; a later real request can start tracking again.
 
 `sustain` still obeys the warm window and limits on the number and total bytes of saved requests. When storage is full, the least recently used requests are discarded. Subagent idle and successful-warm-count limits remain unchanged.
