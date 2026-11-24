@@ -62,9 +62,23 @@ A host with no config file of its own, such as a vault-only Pi, reads the shared
 
 If the settings file cannot be read or parsed **at start**, **the killswitch is on with the default floors (5% primary, 10% secondary) until the file is fixed**. Diagnostics names the file and its problems. An unreadable or unparseable file during a running process keeps its last-good snapshot. After a successful move, an omitted setting uses its declared default, never the old store's saved value.
 
+### Per-host cache, diagnostics and Codex settings
+
+`cache_keep_enabled`, `cache_keep_subagents`, `cache_keep_sustain`, `cache_keep_window`, `log_level`, `request_dumps`, `dump_dir`, `dump_max_bytes`, `codex_api_endpoint` and `responses_lite` are per-host preferences. A plain value still applies to OpenCode 1 and 2 only. To set a value for Pi, give it a `pi` entry. For these keys, Pi uses that entry or the built-in default, never the OpenCode value. In particular, a saved `"request_dumps": true` does not enable dumps on Pi.
+
+```jsonc
+{
+  "schema_version": 1,
+  "cache_keep_enabled": { "default": true, "pi": false },
+  "log_level": { "default": "info", "pi": "debug" }
+}
+```
+
+Here `default` preserves the former plain value for OpenCode; an explicit `opencode` entry takes precedence over it. Pi's `/openai` Cache and Diagnostics controls save only the `pi` entry, preserving any existing OpenCode value. These controls require shared settings. A separate Pi install, or one that has not yet switched to shared settings, uses the built-in defaults for these keys and leaves the shared file alone. Its Diagnostics still shows the settings status.
+
 ### OpenCode transport and diagnostics settings
 
-The settings below apply to OpenCode. Transport and dump environment variables take precedence over the resolved file values; unset values use the defaults. The shared file uses the names below; the legacy config fields apply only to separate installs or processes still using an old store. That legacy config file is `~/.config/opencode/openai-auth.json`; its directory follows `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME`, and `OPENCODE_OPENAI_AUTH_FILE` overrides the full path.
+This table shows OpenCode's transport and dump settings. The first two keys (`web_sockets` and `raw_web_socket`) are OpenCode 1 only; the remaining keys use the per-host rules above. On OpenCode, transport and dump environment variables take precedence over the resolved file values; unset values use the defaults. The shared file uses the names below; the legacy config fields apply only to separate installs or processes still using an old store. That legacy config file is `~/.config/opencode/openai-auth.json`; its directory follows `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME`, and `OPENCODE_OPENAI_AUTH_FILE` overrides the full path.
 
 ```jsonc
 {
@@ -196,7 +210,7 @@ Close every OpenCode process before switching versions or moving credentials. Do
 
 ## Pi
 
-Pi reads its supported preferences from the same shared settings file as OpenCode, unless it is a separate install or its process is still waiting for the settings move. The OpenCode transport and diagnostics settings do not enable those features on Pi. Pi's account store is `openai-auth.json` in its agent directory (`~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise, with `~` expanded by Pi); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path. `PI_AGENT_DIR` is not used. If only `~/.pi/agent` has an existing store (settings, account state, or a vault enrollment token/state file), the extension keeps using it there and logs a warning to stderr once per process. A cached vault roster alone does not count as an enrollment. If the configured directory already has a store, it wins; if neither has one, the configured directory is used. Credentials are never copied or moved between directories.
+Pi reads its supported preferences from the same shared settings file as OpenCode, unless it is a separate install or its process has not yet switched to shared settings. See [the per-host settings](#per-host-cache-diagnostics-and-codex-settings) for the keys that never inherit OpenCode's values. Pi's account store is `openai-auth.json` in its agent directory (`~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise, with `~` expanded by Pi); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path. `PI_AGENT_DIR` is not used. If only `~/.pi/agent` has an existing store (settings, account state, or a vault enrollment token/state file), the extension keeps using it there and logs a warning to stderr once per process. A cached vault roster alone does not count as an enrollment. If the configured directory already has a store, it wins; if neither has one, the configured directory is used. Credentials are never copied or moved between directories.
 
 The Pi provider catalog includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark`.
 

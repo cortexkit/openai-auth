@@ -363,47 +363,256 @@
       }
     },
     "cache_keep_enabled": {
-      "type": "boolean"
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "cache_keep_subagents": {
-      "type": "boolean"
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "cache_keep_sustain": {
-      "type": "boolean"
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "cache_keep_window": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "start_hour": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 23
-          },
-          "end_hour": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 23
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "start_hour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23
+              },
+              "end_hour": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 23
+              }
+            },
+            "additionalProperties": false,
+            "required": ["start_hour", "end_hour"]
           }
         },
-        "additionalProperties": false,
-        "required": ["start_hour", "end_hour"]
-      }
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "start_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  },
+                  "end_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  }
+                },
+                "additionalProperties": false,
+                "required": ["start_hour", "end_hour"]
+              }
+            },
+            "opencode": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "start_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  },
+                  "end_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  }
+                },
+                "additionalProperties": false,
+                "required": ["start_hour", "end_hour"]
+              }
+            },
+            "pi": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "start_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  },
+                  "end_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  }
+                },
+                "additionalProperties": false,
+                "required": ["start_hour", "end_hour"]
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "log_level": {
-      "enum": ["error", "warn", "info", "debug", "trace", "default"]
+      "anyOf": [
+        {
+          "enum": ["error", "warn", "info", "debug", "trace", "default"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "enum": ["error", "warn", "info", "debug", "trace", "default"]
+            },
+            "opencode": {
+              "enum": ["error", "warn", "info", "debug", "trace", "default"]
+            },
+            "pi": {
+              "enum": ["error", "warn", "info", "debug", "trace", "default"]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "request_dumps": {
-      "type": "boolean"
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "dump_dir": {
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "string"
+            },
+            "opencode": {
+              "type": "string"
+            },
+            "pi": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "dump_max_bytes": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 9007199254740991
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "opencode": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "pi": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "web_sockets": {
       "type": "boolean"
@@ -412,10 +621,48 @@
       "type": "boolean"
     },
     "responses_lite": {
-      "type": "boolean"
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "codex_api_endpoint": {
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "string"
+            },
+            "opencode": {
+              "type": "string"
+            },
+            "pi": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     }
   },
   "additionalProperties": false

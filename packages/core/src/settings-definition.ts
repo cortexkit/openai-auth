@@ -14,9 +14,11 @@ const shared = {
   project: 'user-only',
 } as const
 const both = { ...shared, overrides: { host: true } } as const
-const opencode = {
-  hosts: 'OpenCode 1 and OpenCode 2',
-  project: 'user-only',
+// Cache warming, logging, request dumps, and the Codex endpoint and Lite mode
+// were OpenCode preferences. An old value must not turn them on or change them on Pi.
+const perHost = {
+  ...shared,
+  overrides: { host: true, isolatedHosts: ['pi'] },
 } as const
 const opencode1 = { hosts: 'OpenCode 1 only', project: 'user-only' } as const
 
@@ -155,7 +157,7 @@ export const openaiSettings = defineSettings({
       legacy: legacy(['killswitch', 'accounts']),
     },
     cache_keep_enabled: {
-      ...opencode,
+      ...perHost,
       value: boolean(),
       default: false,
       legacy: opencodeLegacy(
@@ -164,7 +166,7 @@ export const openaiSettings = defineSettings({
       ),
     },
     cache_keep_subagents: {
-      ...opencode,
+      ...perHost,
       value: boolean(),
       default: false,
       legacy: opencodeLegacy(
@@ -173,7 +175,7 @@ export const openaiSettings = defineSettings({
       ),
     },
     cache_keep_sustain: {
-      ...opencode,
+      ...perHost,
       value: boolean(),
       default: false,
       legacy: opencodeLegacy(
@@ -182,7 +184,7 @@ export const openaiSettings = defineSettings({
       ),
     },
     cache_keep_window: {
-      ...opencode,
+      ...perHost,
       value: list(
         object({
           start_hour: integer({ min: 0, max: 23 }),
@@ -198,26 +200,26 @@ export const openaiSettings = defineSettings({
       ),
     },
     log_level: {
-      ...opencode,
+      ...perHost,
       value: oneOf(['error', 'warn', 'info', 'debug', 'trace', 'default']),
       default: 'default',
       legacy: opencodeLegacy(['logging', 'level']),
     },
     request_dumps: {
-      ...opencode,
+      ...perHost,
       value: boolean(),
       default: false,
       legacy: opencodeLegacy(['dump'], ['dump', 'enabled']),
     },
     dump_dir: {
-      ...opencode,
+      ...perHost,
       value: string(),
       // The transport resolves an empty folder to its OS-specific temporary path.
       default: '',
       legacy: opencodeLegacy(['dumpDir']),
     },
     dump_max_bytes: {
-      ...opencode,
+      ...perHost,
       value: integer({ min: 0, max: Number.MAX_SAFE_INTEGER }),
       default: 536870912,
       legacy: opencodeLegacy(['dumpMaxBytes']),
@@ -235,13 +237,13 @@ export const openaiSettings = defineSettings({
       legacy: opencodeLegacy(['rawWebSocket']),
     },
     responses_lite: {
-      ...opencode,
+      ...perHost,
       value: boolean(),
       default: false,
       legacy: opencodeLegacy(['responsesLite']),
     },
     codex_api_endpoint: {
-      ...opencode,
+      ...perHost,
       value: string(),
       default: 'https://chatgpt.com/backend-api/codex/responses',
       legacy: opencodeLegacy(['codexApiEndpoint']),

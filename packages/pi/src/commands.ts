@@ -40,6 +40,7 @@ import type {
 import packageJson from '../package.json' with { type: 'json' }
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
 import type { PiPoolCommands } from './runtime.ts'
+import { piSettingsSections } from './settings-menu.ts'
 import type { PiSettingsStartup } from './settings-startup.ts'
 
 export type PiCommandDependencies = {
@@ -122,7 +123,7 @@ export function createPiMenu(
     ...(startup
       ? {
           configPath: startup.paths.configPath,
-          diagnostics: startup.diagnostics,
+          ...piSettingsSections(startup),
         }
       : {}),
     ...(startup?.authority?.decision === 'shared' && startup.snapshot

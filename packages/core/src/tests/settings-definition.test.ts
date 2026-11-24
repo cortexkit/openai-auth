@@ -76,9 +76,26 @@ describe('settings declaration', () => {
       'killswitch_default_primary',
       'killswitch_default_secondary',
     ]
+    const perHost = [
+      'cache_keep_enabled',
+      'cache_keep_subagents',
+      'cache_keep_sustain',
+      'cache_keep_window',
+      'log_level',
+      'request_dumps',
+      'dump_dir',
+      'dump_max_bytes',
+      'responses_lite',
+      'codex_api_endpoint',
+    ]
     for (const [name, setting] of Object.entries(settings)) {
       if (both.includes(name))
         expect(setting).toHaveProperty('overrides', { host: true })
+      else if (perHost.includes(name))
+        expect(setting).toHaveProperty('overrides', {
+          host: true,
+          isolatedHosts: ['pi'],
+        })
       else expect(setting).not.toHaveProperty('overrides')
     }
   })
@@ -101,18 +118,18 @@ describe('settings declaration', () => {
       killswitch_default_primary: 'OpenCode 1, OpenCode 2 and Pi',
       killswitch_default_secondary: 'OpenCode 1, OpenCode 2 and Pi',
       killswitch_account_floors: 'OpenCode 1, OpenCode 2 and Pi',
-      cache_keep_enabled: 'OpenCode 1 and OpenCode 2',
-      cache_keep_subagents: 'OpenCode 1 and OpenCode 2',
-      cache_keep_sustain: 'OpenCode 1 and OpenCode 2',
-      cache_keep_window: 'OpenCode 1 and OpenCode 2',
-      log_level: 'OpenCode 1 and OpenCode 2',
-      request_dumps: 'OpenCode 1 and OpenCode 2',
-      dump_dir: 'OpenCode 1 and OpenCode 2',
-      dump_max_bytes: 'OpenCode 1 and OpenCode 2',
+      cache_keep_enabled: 'OpenCode 1, OpenCode 2 and Pi',
+      cache_keep_subagents: 'OpenCode 1, OpenCode 2 and Pi',
+      cache_keep_sustain: 'OpenCode 1, OpenCode 2 and Pi',
+      cache_keep_window: 'OpenCode 1, OpenCode 2 and Pi',
+      log_level: 'OpenCode 1, OpenCode 2 and Pi',
+      request_dumps: 'OpenCode 1, OpenCode 2 and Pi',
+      dump_dir: 'OpenCode 1, OpenCode 2 and Pi',
+      dump_max_bytes: 'OpenCode 1, OpenCode 2 and Pi',
       web_sockets: 'OpenCode 1 only',
       raw_web_socket: 'OpenCode 1 only',
-      responses_lite: 'OpenCode 1 and OpenCode 2',
-      codex_api_endpoint: 'OpenCode 1 and OpenCode 2',
+      responses_lite: 'OpenCode 1, OpenCode 2 and Pi',
+      codex_api_endpoint: 'OpenCode 1, OpenCode 2 and Pi',
     } as const
     expect(
       Object.fromEntries(

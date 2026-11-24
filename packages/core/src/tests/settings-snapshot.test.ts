@@ -105,6 +105,102 @@ function invalidSettings(snapshot: SettingsSnapshot) {
 }
 
 describe('shared settings snapshot', () => {
+  it('keeps the OpenCode cache, diagnostics and transport values out of Pi settings', async () => {
+    const opencodeValues = {
+      cache_keep_enabled: true,
+      cache_keep_subagents: true,
+      cache_keep_sustain: true,
+      cache_keep_window: [{ start_hour: 22, end_hour: 6 }],
+      log_level: 'trace',
+      request_dumps: true,
+      dump_dir: '/opencode/dumps',
+      dump_max_bytes: 2048,
+      responses_lite: true,
+      codex_api_endpoint: 'https://opencode.example.test/responses',
+    }
+    const keys = Object.keys(opencodeValues) as (keyof typeof opencodeValues)[]
+    const read = (snapshot: SettingsSnapshot) =>
+      Object.fromEntries(keys.map((name) => [name, snapshot.get(name)]))
+    const { file, snapshot: opencode } = await fixture({
+      ...opencodeValues,
+      routing_mode: 'sticky-balanced',
+    })
+    const { snapshot: pi } = await open(file, 'pi')
+    expect(read(opencode)).toEqual(opencodeValues)
+    expect(read(pi)).toEqual({
+      cache_keep_enabled: false,
+      cache_keep_subagents: false,
+      cache_keep_sustain: false,
+      cache_keep_window: [],
+      log_level: 'default',
+      request_dumps: false,
+      dump_dir: '',
+      dump_max_bytes: 536870912,
+      responses_lite: false,
+      codex_api_endpoint: 'https://chatgpt.com/backend-api/codex/responses',
+    })
+    expect(pi.get('routing_mode')).toBe('sticky-balanced')
+    expect(pi.report()).toEqual([])
+
+    const piValues = {
+      cache_keep_enabled: true,
+      cache_keep_subagents: true,
+      cache_keep_sustain: true,
+      cache_keep_window: [{ start_hour: 8, end_hour: 17 }],
+      log_level: 'warn',
+      request_dumps: true,
+      dump_dir: '/pi/dumps',
+      dump_max_bytes: 4096,
+      responses_lite: true,
+      codex_api_endpoint: 'https://pi.example.test/responses',
+    }
+    await writeFile(
+      file,
+      JSON.stringify(
+        Object.fromEntries(
+          keys.map((name) => [
+            name,
+            {
+              default: opencodeValues[name],
+              pi: piValues[name],
+            },
+          ]),
+        ),
+      ),
+    )
+    await Promise.all([opencode.refresh(), pi.refresh()])
+    expect(read(pi)).toEqual(piValues)
+    expect(read(opencode)).toEqual(opencodeValues)
+    expect(pi.report()).toEqual([])
+  })
+
+  it('does not let an invalid warm window keep the other host from applying a valid one', async () => {
+    const piWindow = [{ start_hour: 8, end_hour: 17 }]
+    const opencodeWindow = [{ start_hour: 22, end_hour: 6 }]
+    const { file, snapshot: pi } = await fixture(
+      { cache_keep_window: { default: 'bad window', pi: piWindow } },
+      'pi',
+    )
+    expect(pi.get('cache_keep_window')).toEqual(piWindow)
+    expect(pi.report()).toMatchObject([
+      { keyPath: ['cache_keep_window', 'default'], reason: 'invalid-value' },
+    ])
+
+    await writeFile(
+      file,
+      JSON.stringify({
+        cache_keep_window: { default: opencodeWindow, pi: 'bad window' },
+      }),
+    )
+    const { snapshot: opencode } = await open(file, 'opencode')
+    await pi.refresh()
+    expect(opencode.get('cache_keep_window')).toEqual(opencodeWindow)
+    expect(pi.get('cache_keep_window')).toEqual(piWindow)
+    expect(opencode.report()).toMatchObject([
+      { keyPath: ['cache_keep_window', 'pi'], reason: 'invalid-value' },
+    ])
+  })
+
   it('reads at startup, but request getters and views never call the handle', async () => {
     const diskRead = spyOn(SettingsFs, 'readFile')
     try {

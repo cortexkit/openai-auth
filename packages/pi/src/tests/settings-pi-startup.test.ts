@@ -578,6 +578,15 @@ for (const decision of ['separate', 'legacy'] as const) {
           startedAt: Date.now(),
         })
       }
+      const sharedFile = join(
+        folder,
+        'config',
+        'cortexkit',
+        'openai-auth.jsonc',
+      )
+      const sentinel =
+        '{ "request_dumps": { "pi": true }, "cache_keep_enabled": { "pi": true } }\n'
+      if (decision === 'separate') write(sharedFile, sentinel)
       const result = await startup()
       expect(result.authority!.decision).toBe(decision)
       expect(result.snapshot).toBeUndefined()
@@ -593,13 +602,37 @@ for (const decision of ['separate', 'legacy'] as const) {
         expect(local.saved().routing).toMatchObject({ mode: 'sticky-balanced' })
         const section = await diagnostics(menu)
         expect(section.actions).toEqual([])
+        const cache = (await menu.open(invocation)).menu.sections.find(
+          (item) => item.id === 'cache',
+        )
+        expect(cache?.actions).toEqual([])
+        expect(cache?.lines).toContain('Saved keep-warm preference: off.')
+        const notice = 'Controls require a shared settings file.'
+        expect(cache?.lines).toContain(notice)
         if (decision === 'separate')
-          expect(section.lines).toEqual([SETTINGS_DIAGNOSTICS_TEXT.separate])
+          expect(section.lines).toEqual([
+            SETTINGS_DIAGNOSTICS_TEXT.separate,
+            notice,
+          ])
         else
           expect(section.lines).toEqual([
             SETTINGS_DIAGNOSTICS_TEXT.file(result.authority!.install.target),
             SETTINGS_DIAGNOSTICS_TEXT.legacyProcess,
+            notice,
           ])
+        expect(
+          (await edit(menu, 'cache', 'enabled', { enabled: true })).ok,
+        ).toBe(false)
+        expect(
+          (await edit(menu, 'diagnostics', 'dump', { enabled: true })).ok,
+        ).toBe(false)
+        expect(
+          (await edit(menu, 'diagnostics', 'logging', { level: 'debug' })).ok,
+        ).toBe(false)
+        expect(local.saved()).toEqual({ routing: { mode: 'sticky-balanced' } })
+        if (decision === 'separate')
+          expect(readFileSync(sharedFile, 'utf8')).toBe(sentinel)
+        else expect(existsSync(sharedFile)).toBe(false)
       } finally {
         create.mockRestore()
       }
@@ -608,7 +641,7 @@ for (const decision of ['separate', 'legacy'] as const) {
 }
 
 isolatedTest(
-  'Pi Diagnostics uses the core table, refreshes report and semantic errors, and adds no Cache, dump or log actions',
+  'shared Pi keeps the existing Diagnostics reports and exposes Cache, dump and log actions',
   async () => {
     const result = await startup()
     const menu = menuFor(result)
@@ -635,22 +668,82 @@ isolatedTest(
       SETTINGS_DIAGNOSTICS_TEXT.sharedFound,
       ...result.snapshot!.report().map(settingsReportLine),
     ])
-    expect(section.actions).toEqual([])
+    expect(section.actions.map((action) => action.id)).toEqual([
+      'dump',
+      'logging',
+    ])
     const model = (await menu.open(invocation)).menu
-    expect(model.sections.slice(0, 5).map((item) => item.id)).toEqual([
+    expect(model.sections.slice(0, 6).map((item) => item.id)).toEqual([
       'accounts',
       'quota',
       'routing',
       'limits',
+      'cache',
       'diagnostics',
     ])
-    expect(model.sections.some((item) => item.id === 'cache')).toBe(false)
+  },
+)
+
+isolatedTest(
+  'shared Pi menu writes only Pi preferences and retains OpenCode values',
+  async () => {
+    const file = join(folder, 'config', 'cortexkit', 'openai-auth.jsonc')
+    write(file, {
+      schema_version: 1,
+      cache_keep_enabled: true,
+      request_dumps: true,
+      log_level: { default: 'info', opencode: 'trace' },
+    })
+    const result = await startup()
+    const menu = menuFor(result)
+    const handle = openSettings(openaiSettings, {
+      file,
+      log,
+      separateInstall: false,
+    })
+    expect(result.snapshot!.get('request_dumps')).toBe(false)
+    expect(result.snapshot!.get('cache_keep_enabled')).toBe(false)
+    expect(result.snapshot!.get('log_level')).toBe('default')
+    const model = (await menu.open(invocation)).menu
     expect(
-      model.sections.flatMap((item) => item.actions).map((action) => action.id),
-    ).not.toContain('dump')
+      model.sections.find((item) => item.id === 'cache')?.actions[0],
+    ).toMatchObject({
+      id: 'enabled',
+      knobs: [{ id: 'enabled', value: true }],
+    })
     expect(
-      model.sections.flatMap((item) => item.actions).map((action) => action.id),
-    ).not.toContain('logging')
+      model.sections.find((item) => item.id === 'diagnostics')?.actions,
+    ).toMatchObject([
+      { id: 'dump', knobs: [{ id: 'enabled', value: true }] },
+      { id: 'logging', knobs: [{ id: 'level', value: 'default' }] },
+    ])
+
+    expect((await edit(menu, 'cache', 'enabled', { enabled: true })).ok).toBe(
+      true,
+    )
+    expect(
+      (await edit(menu, 'diagnostics', 'dump', { enabled: true })).ok,
+    ).toBe(true)
+    expect(
+      (await edit(menu, 'diagnostics', 'logging', { level: 'debug' })).ok,
+    ).toBe(true)
+    expect((await edit(menu, 'cache', 'enabled', { enabled: false })).ok).toBe(
+      true,
+    )
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+      schema_version: 1,
+      cache_keep_enabled: { default: true, pi: false },
+      request_dumps: { default: true, pi: true },
+      log_level: { default: 'info', opencode: 'trace', pi: 'debug' },
+    })
+    expect(result.snapshot!.get('request_dumps')).toBe(true)
+    expect(result.snapshot!.get('cache_keep_enabled')).toBe(false)
+    expect(result.snapshot!.get('log_level')).toBe('debug')
+    expect(await handle.get('request_dumps', { host: 'opencode' })).toBe(true)
+    expect(await handle.get('cache_keep_enabled', { host: 'opencode' })).toBe(
+      true,
+    )
+    expect(await handle.get('log_level', { host: 'opencode' })).toBe('trace')
   },
 )
 

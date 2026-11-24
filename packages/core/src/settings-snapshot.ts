@@ -244,17 +244,24 @@ export async function createSettingsSnapshot(options: {
     // intact for readers that still hold this snapshot.
     if (disposed) return
     const readReport = handle.report()
-    report = [...readReport, ...semanticChecks(next, file)]
+    const semanticReport = semanticChecks(next, file)
+    report = [...readReport, ...semanticReport]
     const fileFailed = readReport.some(
       (entry) =>
         entry.file.path === file &&
         (entry.reason === 'unreadable' || entry.reason === 'unparseable'),
     )
     const invalid = (setting: SnapshotSetting) =>
-      report.some(
-        (entry) =>
-          entry.reason === 'invalid-value' && entry.keyPath[0] === setting,
-      )
+      semanticReport.some((entry) => entry.keyPath[0] === setting) ||
+      readReport.some((entry) => {
+        if (entry.reason !== 'invalid-value' || entry.keyPath[0] !== setting)
+          return false
+        // Report invalid keep-warm hours for both hosts, but don't let one
+        // host's malformed hours block an update on the other host.
+        if (setting === 'cache_keep_window')
+          return (host === 'pi') === (entry.keyPath[1] === 'pi')
+        return true
+      })
     const retain = <K extends SnapshotSetting>(setting: K) => {
       next[setting] = values
         ? structuredClone(values[setting])
