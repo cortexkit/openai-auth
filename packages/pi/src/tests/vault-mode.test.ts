@@ -55,7 +55,7 @@ import {
 import { createPiMenu } from '../commands.ts'
 import { registerPiProvider } from '../index.ts'
 import { PiPoolSource } from '../pool-source.ts'
-import { clearPiStickyRouting } from '../routing.ts'
+import { clearPiStickyRouting, setPiStickyRouting } from '../routing.ts'
 import {
   errorEvent,
   FIRST_READING_WAIT_MS,
@@ -95,7 +95,7 @@ const CONTEXT: Context = {
   messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
 }
 
-function sseOk(): Response {
+function sseOk(headers: Record<string, string> = {}): Response {
   const body = [
     'data: {"type":"response.output_item.added","item":{"type":"message","id":"m1","role":"assistant","status":"in_progress","content":[]}}',
     'data: {"type":"response.output_text.delta","item_id":"m1","delta":"hi"}',
@@ -105,7 +105,7 @@ function sseOk(): Response {
   ].join('\n\n')
   return new Response(body, {
     status: 200,
-    headers: { 'content-type': 'text/event-stream' },
+    headers: { 'content-type': 'text/event-stream', ...headers },
   })
 }
 
@@ -137,6 +137,7 @@ let codexTokens: string[]
 let whamTokens: string[]
 /** Every token refresh sent to OpenAI's token endpoint. */
 let refreshes: number
+let codexHeaders: Record<string, string>
 
 const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input)
@@ -145,7 +146,7 @@ const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     ''
   if (url === CODEX_URL) {
     codexTokens.push(token)
-    return sseOk()
+    return sseOk(codexHeaders)
   }
   if (url === WHAM_URL) {
     whamTokens.push(token)
@@ -168,6 +169,7 @@ beforeEach(() => {
   codexTokens = []
   whamTokens = []
   refreshes = 0
+  codexHeaders = {}
 })
 
 afterEach(async () => {
@@ -490,6 +492,76 @@ describe('Pi in vault mode', () => {
       expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-work')])
     } finally {
       await target.dispose()
+    }
+  })
+
+  test('vault quota status updates and masks email labels at their full menu positions', async () => {
+    const identities = ['chatgpt-first', 'chatgpt-second']
+    const emails = ['first@example.test', 'second@example.test']
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'chatgpt:openai': vaultLogin('chatgpt-default'),
+        'chatgpt:openai:first': vaultLogin(identities[0]!, {
+          wire: { email: emails[0] },
+        }),
+        'chatgpt:openai:second': vaultLogin(identities[1]!, {
+          wire: { email: emails[1] },
+        }),
+      },
+    })
+    enroll()
+    await setMode('sticky-balanced')
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const sessionId = 'session-1'
+    const seen: Array<string | undefined> = []
+    runtime.bindQuotaStatus(sessionId, (text) => seen.push(text))
+    const record = spyOn(target, 'recordSnapshot')
+    try {
+      await target.refresh()
+      const main = target
+        .routes()
+        .find((row) => row.credentialId === 'chatgpt:openai')!
+      await target.decline(main.id)
+      await target.pollStale(0)
+      const { menu } = await createPiMenu(runtime.commandSupport()).open({
+        notify() {},
+      })
+      const rows = menu.sections.find(
+        (section) => section.id === 'vault',
+      )!.items
+      expect(rows.map((row) => row.label)).toEqual(['main', ...emails])
+      expect(seen).toEqual([])
+
+      setPiStickyRouting(sessionId, rows[1]!.id)
+      expect(errorOf(await send(runtime, sessionId))).toBeUndefined()
+      expect(seen.at(-1)).toMatch(
+        /^account 2 · 5h 90% left, resets .*7d 90% left, resets /,
+      )
+
+      codexHeaders = {
+        'x-codex-primary-used-percent': '37',
+        'x-codex-primary-window-minutes': '300',
+        'x-codex-primary-reset-at': String(
+          Math.floor((Date.now() + 3_600_000) / 1000),
+        ),
+      }
+      expect(errorOf(await send(runtime, sessionId))).toBeUndefined()
+      await Promise.all(record.mock.results.map((result) => result.value))
+      expect(seen.at(-1)).toMatch(/^account 2 · 5h 63% left, resets /)
+
+      setPiStickyRouting(sessionId, rows[2]!.id)
+      expect(errorOf(await send(runtime, sessionId))).toBeUndefined()
+      expect(seen.at(-1)).toMatch(/^account 3 · 5h /)
+      expect(codexTokens).toEqual([
+        chatgptAccessToken(identities[0]!),
+        chatgptAccessToken(identities[0]!),
+        chatgptAccessToken(identities[1]!),
+      ])
+      expect(seen.join('\n')).not.toMatch(/@|chatgpt-first|chatgpt-second|eyJ/)
+    } finally {
+      await runtime.dispose()
     }
   })
 

@@ -1,6 +1,7 @@
 import { openSettings } from '@cortexkit/common-auth/settings'
 import {
   type AccountPaths,
+  applySettingsLogLevel,
   createLogger,
 } from '@cortexkit/openai-auth-core/internal'
 import {
@@ -19,6 +20,7 @@ import {
   type SettingsSnapshot,
 } from '@cortexkit/openai-auth-core/settings-snapshot'
 import packageJson from '../package.json' with { type: 'json' }
+import { setupPiLogger } from './diagnostics.ts'
 import { getPiAccountPaths } from './store-paths.ts'
 
 export interface PiSettingsStartup {
@@ -39,6 +41,8 @@ export async function preparePiSettingsStartup(
   } = {},
 ): Promise<PiSettingsStartup> {
   const paths = options.paths ?? getPiAccountPaths()
+  setupPiLogger(paths)
+  applySettingsLogLevel('default', 'refresh')
   // The settings handle keeps this logger for watch-time warnings, which arrive
   // while Pi's screen is drawn, so they go to the plugin log, not the terminal.
   const log = options.log ?? createLogger('settings')
@@ -84,6 +88,12 @@ export async function preparePiSettingsStartup(
           host: 'pi',
         })
       : undefined
+  if (snapshot) {
+    applySettingsLogLevel(snapshot.get('log_level'), 'startup')
+    snapshot.onChange(() =>
+      applySettingsLogLevel(snapshot.get('log_level'), 'refresh'),
+    )
+  }
   const diagnosticsOptions = {
     configPath: paths.configPath,
     ...(snapshot ? { snapshot } : {}),

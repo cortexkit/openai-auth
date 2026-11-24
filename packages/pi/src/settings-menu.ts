@@ -9,8 +9,6 @@ import type { PiSettingsStartup } from './settings-startup.ts'
 
 const controlsUnavailable = 'Controls require a shared settings file.'
 const warmLine = (enabled: boolean) => `Keep-warm: ${enabled ? 'on' : 'off'}.`
-const appliesWhenAvailable = (feature: string) =>
-  `This preference applies when ${feature} is available on this install.`
 
 export function piSettingsSections(startup: PiSettingsStartup): {
   cache: PluginSection
@@ -102,7 +100,7 @@ export function piSettingsSections(startup: PiSettingsStartup): {
             {
               id: 'dump',
               label: `Set request dump preference ${dumping ? 'off' : 'on'}`,
-              description: `${appliesWhenAvailable('request dumping')} Body dumps may contain prompt and session content.`,
+              description: 'Body dumps may contain prompt and session content.',
               knobs: [
                 {
                   kind: 'toggle',
@@ -120,7 +118,6 @@ export function piSettingsSections(startup: PiSettingsStartup): {
             {
               id: 'logging',
               label: 'Set the log level preference',
-              description: appliesWhenAvailable('log-level control'),
               knobs: [
                 {
                   kind: 'choice',

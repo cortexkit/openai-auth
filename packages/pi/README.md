@@ -20,6 +20,21 @@ the vault. If Pi does not expose its in-memory credential override, a saved
 expired login may prevent Pi from reaching the plugin. Pi 1.5.2 was verified
 with the override.
 
+Pi's default compaction starts only above the same Codex OAuth input limit as
+OpenCode. The model's output limit is separate. Custom compaction settings
+still belong to Pi.
+
+After a request is served, Pi's status line shows the serving
+account's last 5-hour and 7-day quota readings and reset times. Email labels
+appear as account numbers in `/openai` menu order.
+
+Pi writes `pi-openai-auth.log` next to its account state file. On a shared
+settings install, `/openai` → Diagnostics changes the log level or enables
+redacted HTTP and WebSocket request dumps without restarting Pi. Dumps are off
+by default and may still contain prompt content. The default dump directory is
+`pi-openai-auth-dumps` next to the account state file; Pi's `dump_dir` and
+`dump_max_bytes` settings control the destination and retention cap.
+
 ## License
 
 MIT

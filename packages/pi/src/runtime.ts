@@ -89,6 +89,7 @@ import {
   VaultBillingAttempt,
   type VaultModeRefusal,
   type VaultRoutingFeedback,
+  vaultAccountName,
   vaultLimitsNamespace,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
@@ -132,6 +133,7 @@ import {
   shapePiCacheCapture,
   shapePiCodexHttpRequest,
 } from './codex-wire.ts'
+import { createPiDumps } from './diagnostics.ts'
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import {
@@ -146,6 +148,7 @@ import {
   routePiRequest,
 } from './pool-request.ts'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
+import { piQuotaStatusText } from './quota-status.ts'
 import { placePiStickyPin } from './routing.ts'
 import {
   openVaultSlot,
@@ -174,6 +177,8 @@ type PiRequestSettings = AccountStorage & {
   waitForReset?: boolean
   codexApiEndpoint?: string
   responsesLite?: boolean
+  dumpDir?: string
+  dumpMaxBytes?: number
 }
 
 export interface PiOpenAIRuntimeDeps {
@@ -211,6 +216,7 @@ const TERMINAL_AFTER_OUTPUT_MESSAGE =
 
 /** An attempt as the router sees it, with the events it produced so far. */
 interface StreamAttempt extends RouteAttempt {
+  servedByVault?: boolean
   /** Only a real HTTP status can trigger vault credential recovery. */
   httpStatus?: number
   /** The events through the first output or terminal event, held until selection. */
@@ -324,8 +330,17 @@ export class PiOpenAIRuntime {
   private readonly frameTurns = new FrameTurnState()
   private readonly installationID: string
   private readonly codexEndpoint: string
+  private readonly dumpRequest: ReturnType<typeof createPiDumps>
   /** Captured from a live Pi context; absent in headless hosts. */
   setWorkingMessage: ((message?: string) => void) | undefined
+  private quotaStatus?:
+    | {
+        sessionId: string
+        write: (text?: string) => void
+        served?: { id: string; vault: boolean }
+        text?: string | undefined
+      }
+    | undefined
   /** Pi owns refresh of its native login, so use its resolver when a live context exists. */
   resolveMainToken: (() => Promise<string | undefined>) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
@@ -356,6 +371,9 @@ export class PiOpenAIRuntime {
       deps.settings?.view().codexApiEndpoint,
     )
     this.paths = deps.paths ?? getPiAccountPaths
+    this.dumpRequest = createPiDumps(this.paths, () =>
+      this.deps.settings?.view(),
+    )
     const fetchImpl = () => deps.fetchImpl ?? globalThis.fetch
     this.main = new PiMainAccount({
       now: this.now,
@@ -577,10 +595,75 @@ export class PiOpenAIRuntime {
   }
 
   async dispose(): Promise<void> {
+    this.bindQuotaStatus()
     this.resolveMainToken = undefined
     this.primaryRequests.clear()
     this.cacheKeep.stop()
     await Promise.all([this.pool.dispose(), this.vault.dispose()])
+  }
+
+  bindQuotaStatus(sessionId?: string, write?: (text?: string) => void): void {
+    const previous = this.quotaStatus
+    if (previous && previous.sessionId === sessionId && write) {
+      previous.write = write
+      return
+    }
+    this.quotaStatus = sessionId && write ? { sessionId, write } : undefined
+    if (previous?.text !== undefined) {
+      try {
+        previous.write()
+      } catch {}
+    }
+  }
+
+  refreshQuotaStatus(): void {
+    const status = this.quotaStatus
+    if (!status?.served) return
+    const { id, vault } = status.served
+    let text: string | undefined
+    const now = this.now()
+    if (vault) {
+      // The Vault section lists the full roster in this order, even when a
+      // disabled or cold row cannot be selected by the router.
+      const rows = this.vault.snapshot()?.rows ?? []
+      const index = rows.findIndex((row) => row.routeId === id)
+      const row = rows[index]
+      if (row)
+        text = piQuotaStatusText(
+          vaultAccountName(row),
+          index + 1,
+          row.accountIdentity,
+          row.quota,
+          now,
+        )
+    } else if (!this.vaultMode()) {
+      if (id === FORMER_MAIN_ID) {
+        text = piQuotaStatusText(
+          'Pi login',
+          1,
+          undefined,
+          this.main.quotaMap(),
+          now,
+        )
+      } else {
+        const rows = this.pool.peek().rows
+        const index = rows.findIndex((row) => row.id === id)
+        const row = rows[index]
+        if (row)
+          text = piQuotaStatusText(
+            row.label ?? row.id,
+            index + 1,
+            row.identity,
+            row.quota,
+            now,
+          )
+      }
+    }
+    if (status.text === text) return
+    status.text = text
+    try {
+      status.write(text)
+    } catch {}
   }
 
   // -------------------------------------------------------------------------
@@ -764,12 +847,15 @@ export class PiOpenAIRuntime {
   ): void {
     if (receipt) {
       this.vault.reportUsage(accountId, reply, receipt)
-      void this.vault.recordSnapshot(accountId, snapshot, complete, receipt)
+      void this.vault
+        .recordSnapshot(accountId, snapshot, complete, receipt)
+        .then(() => this.refreshQuotaStatus())
     } else if (accountId === FORMER_MAIN_ID) {
       this.main.record(snapshot, token, complete)
     } else {
       this.pool.recordSnapshot(accountId, snapshot, token, complete)
     }
+    if (!receipt) this.refreshQuotaStatus()
   }
 
   /** Credit quota to the account and vault credential that sent this request, not the socket's opener. */
@@ -921,11 +1007,23 @@ export class PiOpenAIRuntime {
           endWait?.('resumed')
           endWait = undefined
           const { buffered, rest } = attempt.attempt
-          if (
-            primary &&
-            isCurrent() &&
-            buffered.some((event) => isPiOutput(event) || event.type === 'done')
+          const served = buffered.some(
+            (event) => isPiOutput(event) || event.type === 'done',
           )
+          const quotaStatus = this.quotaStatus
+          if (
+            served &&
+            quotaStatus &&
+            quotaStatus.sessionId === options?.sessionId &&
+            (!primary || isCurrent())
+          ) {
+            quotaStatus.served = {
+              id: attempt.accountId,
+              vault: attempt.attempt.servedByVault === true,
+            }
+            this.refreshQuotaStatus()
+          }
+          if (primary && isCurrent() && served)
             this.cacheKeep.served(primary, attempt.accountId)
           let done: Extract<AssistantMessageEvent, { type: 'done' }> | undefined
           const publish = (event: AssistantMessageEvent) => {
@@ -1418,6 +1516,19 @@ export class PiOpenAIRuntime {
                 : init
               if (isCodexRequest && shaped !== init) {
                 const sentHeaders = new Headers(shaped?.headers)
+                if (typeof shaped?.body === 'string')
+                  this.dumpRequest(
+                    {
+                      sessionID: sessionId,
+                      transport: 'http',
+                      phase: 'http',
+                      bodyText: shaped.body,
+                      url: endpoint,
+                      method: shaped.method,
+                      headers: sentHeaders,
+                    },
+                    token,
+                  )
                 rememberSend(
                   sentHeaders,
                   endpoint,
@@ -1516,8 +1627,19 @@ export class PiOpenAIRuntime {
               token,
               owner: this,
               session: wireSession,
-              onSend: (headers) => {
+              onSend: (headers, frame, url) => {
                 beginSend()
+                this.dumpRequest(
+                  {
+                    sessionID: sessionId,
+                    transport: 'websocket',
+                    phase: 'main',
+                    bodyText: frame,
+                    url,
+                    headers,
+                  },
+                  token,
+                )
                 rememberSend(headers, endpoint, false)
               },
               onMessage: (data) =>
@@ -1659,6 +1781,7 @@ export class PiOpenAIRuntime {
       ...(limit && !outputStarted ? { signal: limit.signal } : {}),
       ...(vaultFeedback && !outputStarted ? { vaultFeedback } : {}),
       ...(reading ? { reading } : {}),
+      ...(receipt ? { servedByVault: true } : {}),
       buffered,
       rest,
     }

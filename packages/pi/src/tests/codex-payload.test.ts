@@ -1,10 +1,19 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import {
   buildKeepwarmBody,
+  createLogger,
   flushForTest,
   initLogger,
   resetLoggerForTest,
@@ -24,10 +33,12 @@ import {
 import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
 import { chatgptAccessToken } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { createPiMenu } from '../commands.ts'
 import { installRawCodexWebSocket } from '../index.ts'
 import { RawWebSocket } from '../raw-ws-node.ts'
 import { clearPiStickyRouting, setPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
+import { preparePiSettingsStartup } from '../settings-startup.ts'
 
 const model: Model<'openai-codex-responses'> = {
   id: 'gpt-5.4',
@@ -852,6 +863,140 @@ function applicationUpgradeHeaders(upgrade: Headers) {
     application.delete(name)
   return normalizeUserAgent(application)
 }
+
+test('Pi Diagnostics applies log level and redacted HTTP and WebSocket dumps live', async () => {
+  const settingsEnv = 'PI_OPENAI_AUTH_SETTINGS_FILE'
+  const previous = process.env[settingsEnv]
+  const dumpDir = join(dir, 'dumps')
+  const file = writeSettings({
+    request_dumps: true,
+    dump_dir: { pi: dumpDir },
+    dump_max_bytes: { pi: 65_536 },
+    log_level: { pi: 'error' },
+  })
+  const paths = {
+    configPath: join(dir, 'openai-auth.json'),
+    statePath: join(dir, 'openai-auth-state.json'),
+  }
+  const bearer = 'not-a-real-opaque-bearer-1234'
+  const jwt = chatgptAccessToken('another-identity')
+  const accountId = 'payload-test-account'
+  const secretText = `public marker Bearer ${bearer} JWT ${jwt} account ${accountId} token ${apiKey}`
+  const request: Context = {
+    messages: [{ role: 'user', content: secretText, timestamp: 1 }],
+  }
+  const artifacts = () => (existsSync(dumpDir) ? readdirSync(dumpDir) : [])
+  const until = async (ready: () => boolean) => {
+    for (let i = 0; i < 100 && !ready(); i++) await Bun.sleep(10)
+  }
+  process.env[settingsEnv] = file
+  try {
+    const startup = await preparePiSettingsStartup({ paths })
+    const snapshot = startup.snapshot!
+    expect(snapshot.get('request_dumps')).toBe(false)
+    snapshots.push(snapshot)
+    await restartRuntime(snapshot)
+    const log = createLogger('test-diagnostics')
+    const logPath = join(dir, 'pi-openai-auth.log')
+    log.warn('below configured level')
+    log.error('at configured level', {
+      authorization: `Bearer ${bearer}`,
+      jwt,
+      chatgptAccountId: accountId,
+    })
+    await flushForTest()
+    expect(existsSync(logPath)).toBe(true)
+    const beforeEdit = readFileSync(logPath, 'utf8')
+    expect(beforeEdit).toContain('at configured level')
+    expect(beforeEdit).not.toContain('below configured level')
+
+    await httpRequest({ sessionId }, model, request)
+    expect(artifacts()).toEqual([])
+    const menu = createPiMenu(runtime.commandSupport(), {
+      settingsStartup: startup,
+    })
+    const edit = (actionId: string, values: Record<string, string | boolean>) =>
+      menu.apply(
+        { command: 'openai', sectionId: 'diagnostics', actionId, values },
+        { notify() {} },
+      )
+    expect(await edit('logging', { level: 'debug' })).toMatchObject({
+      ok: true,
+    })
+    expect(snapshot.get('log_level')).toBe('debug')
+    expect(await edit('dump', { enabled: true })).toMatchObject({ ok: true })
+    log.debug('after Diagnostics change')
+    const http = await httpRequest({ sessionId }, model, request)
+    expect(http.json).toContain(secretText)
+    const wsSession = `${sessionId}-diagnostics`
+    try {
+      const { frames } = await captureWebSocketFrames(async (baseUrl) => {
+        const result = await runtime
+          .stream({ ...model, baseUrl }, request, {
+            ...cachedWebSocketOptions(),
+            sessionId: wsSession,
+          })
+          .result()
+        expect(result.responseId).toBe('resp_1')
+      })
+      expect(JSON.stringify(frames[0])).toContain(secretText)
+    } finally {
+      closeOpenAICodexWebSocketSessions(wsSession)
+    }
+
+    await until(() => artifacts().length === 6)
+    const files = artifacts()
+    expect(files.filter((name) => name.endsWith('.body.json'))).toHaveLength(2)
+    for (const transport of ['http', 'websocket']) {
+      const name = files.find(
+        (name) =>
+          name.includes(`-${transport}-`) && name.endsWith('.body.json'),
+      )!
+      expect(
+        JSON.stringify(JSON.parse(readFileSync(join(dumpDir, name), 'utf8'))),
+      ).toContain('public marker')
+    }
+    await flushForTest()
+    const logs = readFileSync(logPath, 'utf8')
+    expect(logs).toContain('after Diagnostics change')
+    const dumped = files
+      .map((name) => readFileSync(join(dumpDir, name), 'utf8'))
+      .join('\n')
+    for (const secret of [bearer, jwt, accountId, apiKey]) {
+      expect(logs).not.toContain(secret)
+      expect(dumped).not.toContain(secret)
+    }
+
+    // Retention protects the current dump but discards old groups over the cap.
+    const old = new Date(Date.now() - 86_400_000)
+    for (const name of files) utimesSync(join(dumpDir, name), old, old)
+    const handle = openSettings(openaiSettings, {
+      file,
+      log,
+      separateInstall: false,
+    })
+    await handle.update(
+      [{ setting: 'dump_max_bytes', value: 4096, level: 'pi' }],
+      { host: 'pi' },
+    )
+    await snapshot.refresh()
+    await httpRequest({ sessionId })
+    await until(
+      () =>
+        artifacts().length === 3 &&
+        files.every((name) => !artifacts().includes(name)),
+    )
+    expect(artifacts()).toHaveLength(3)
+    expect(artifacts().some((name) => files.includes(name))).toBe(false)
+    expect(await edit('dump', { enabled: false })).toMatchObject({ ok: true })
+    await httpRequest({ sessionId })
+    expect(artifacts()).toHaveLength(3)
+  } finally {
+    if (previous === undefined) delete process.env[settingsEnv]
+    else process.env[settingsEnv] = previous
+    resetLoggerForTest()
+  }
+})
 
 function frameMetadata(frame: Record<string, unknown> | undefined) {
   return frame?.client_metadata as Record<string, string> | undefined

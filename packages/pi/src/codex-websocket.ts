@@ -19,7 +19,7 @@ type WebSocketAttempt = {
   token: string
   owner: object
   session: PiCodexWireSession | undefined
-  onSend(headers: Headers): void
+  onSend(headers: Headers, frame: string, url: string): void
   onMessage(data: string): void
 }
 
@@ -137,7 +137,11 @@ class PiRawCodexWebSocket extends RawWebSocket {
     this.activeAttempt = attempt
     const frame = shapePiCodexWebSocketFrame(data, attempt.session)
     super.send(frame)
-    attempt.onSend(new Headers(this.upgradeHeaders))
+    attempt.onSend(
+      new Headers(this.upgradeHeaders),
+      frame,
+      this.binding.endpoint,
+    )
   }
 }
 

@@ -1,5 +1,7 @@
 import {
   type AccountPaths,
+  codexOAuthModelLimit,
+  codexOAuthModelListed,
   isVaultHosted,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Api, Model } from '@earendil-works/pi-ai'
@@ -21,7 +23,10 @@ import {
   getModels as getBuiltinModels,
   streamSimple as streamSimpleOpenAICodexResponses,
 } from '@earendil-works/pi-ai/compat'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from '@earendil-works/pi-coding-agent'
 
 import { installRawCodexWebSocket } from './codex-websocket.ts'
 import { PI_CODEX_BASE_URL } from './codex-wire.ts'
@@ -34,26 +39,27 @@ export { installRawCodexWebSocket } from './codex-websocket.ts'
 
 type CodexModel = Model<'openai-codex-responses'>
 
+// Pi compacts above contextWindow minus its default 16,384-token reserve,
+// independently of maxTokens. Advertise a window that preserves Codex's input limit.
+const PI_DEFAULT_COMPACTION_RESERVE = 16_384
+
 /**
  * Codex models a ChatGPT login can use that a Pi release may not list yet, each
  * built from the Pi entry of its nearest predecessor (`from`). The Codex
  * backend serves both 6.2 models from client 0.166.0 (measured 2026-11-18);
  * pi-ai's Codex stream sends no client version header, which the backend
- * accepts for them. Context windows are the Codex catalog's defaults, as Pi
- * uses for its own entries. Costs are OpenAI's list prices (models.dev).
+ * accepts for them. Costs are OpenAI's list prices (models.dev).
  */
 const ADDED_CODEX_MODELS: ReadonlyArray<{
   id: string
   name: string
   from: string
-  contextWindow: number
   cost: CodexModel['cost']
 }> = [
   {
     id: 'gpt-6.2-sol',
     name: 'GPT-6.2 Sol',
     from: 'gpt-6.1-sol',
-    contextWindow: 500_000,
     cost: {
       input: 2,
       output: 10,
@@ -74,7 +80,6 @@ const ADDED_CODEX_MODELS: ReadonlyArray<{
     id: 'gpt-6.2-astra',
     name: 'GPT-6.2 Astra',
     from: 'gpt-6-astra',
-    contextWindow: 272_000,
     cost: {
       input: 8,
       output: 40,
@@ -96,7 +101,7 @@ const ADDED_CODEX_MODELS: ReadonlyArray<{
 /**
  * The model list this extension registers for `openai-codex`. Pi replaces its
  * built-in list with an extension's `models`, so this starts from Pi's own
- * Codex models and only adds what that Pi release does not list yet.
+ * Codex models before applying shared Codex availability and limit rules.
  */
 export function openAICodexModels(
   builtin: readonly CodexModel[] = getBuiltinModels(
@@ -112,11 +117,21 @@ export function openAICodexModels(
       ...template,
       id: added.id,
       name: added.name,
-      contextWindow: added.contextWindow,
       cost: structuredClone(added.cost),
     })
   }
   return models
+    .filter(({ id }) => codexOAuthModelListed(id))
+    .map((model) => {
+      const limit = codexOAuthModelLimit(model.id)
+      return limit
+        ? {
+            ...model,
+            contextWindow: limit.input + PI_DEFAULT_COMPACTION_RESERVE,
+            maxTokens: limit.output,
+          }
+        : model
+    })
 }
 
 /** How often enrollment approved outside the menu is noticed. */
@@ -183,6 +198,8 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
       explicit,
     )
   const syncInBackground = () => {
+    // A quota poll or menu edit can update the cached readings while Pi is idle.
+    runtime.refreshQuotaStatus()
     void syncSlot(false).catch(() => {
       notify?.(
         'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
@@ -190,20 +207,29 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
       )
     })
   }
+  const useContext = (ctx: ExtensionContext) => {
+    refresh = () => ctx.modelRegistry.refresh()
+    runtime.resolveMainToken = () =>
+      ctx.modelRegistry.getApiKeyForProvider('openai-codex')
+    notify = (message, level) => ctx.ui.notify(message, level)
+    runtime.setWorkingMessage =
+      ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
+        ? (message) => ctx.ui.setWorkingMessage(message)
+        : undefined
+    if (ctx.hasUI && typeof ctx.ui.setStatus === 'function') {
+      runtime.bindQuotaStatus(ctx.sessionManager.getSessionId(), (text) =>
+        ctx.ui.setStatus('openai-auth', text),
+      )
+    } else runtime.bindQuotaStatus()
+  }
   registerCommands(pi, {
     settingsStartup,
     pool: runtime.commandSupport(),
-    afterApply: syncSlot,
-    onContext: (ctx) => {
-      refresh = () => ctx.modelRegistry.refresh()
-      runtime.resolveMainToken = () =>
-        ctx.modelRegistry.getApiKeyForProvider('openai-codex')
-      notify = (message, level) => ctx.ui.notify(message, level)
-      runtime.setWorkingMessage =
-        ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
-          ? (message) => ctx.ui.setWorkingMessage(message)
-          : undefined
+    afterApply: async () => {
+      await syncSlot()
+      runtime.refreshQuotaStatus()
     },
+    onContext: useContext,
   })
   // Startup can move the login before a session context is available. The
   // first session reloads Pi's auth snapshot before looking up any login.
@@ -218,14 +244,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
       await runtime.dispose()
     })
     pi.on('session_start', async (_event, ctx) => {
-      refresh = () => ctx.modelRegistry.refresh()
-      runtime.resolveMainToken = () =>
-        ctx.modelRegistry.getApiKeyForProvider('openai-codex')
-      notify = (message, level) => ctx.ui.notify(message, level)
-      runtime.setWorkingMessage =
-        ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
-          ? (message) => ctx.ui.setWorkingMessage(message)
-          : undefined
+      useContext(ctx)
       void runtime.start()
       try {
         if (isVaultHosted()) {
@@ -234,7 +253,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
         }
         await syncSlot()
       } catch {
-        notify(
+        notify?.(
           'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
           'error',
         )

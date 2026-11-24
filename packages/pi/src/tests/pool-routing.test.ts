@@ -898,6 +898,58 @@ describe('Pi requests on the account pool', () => {
     expect(getPiStickyRouting('session-1')).toBeDefined()
   })
 
+  test('local quota status updates its serving label and follows a sticky detour', async () => {
+    await mutateAccounts((current) => {
+      current.accounts = current.accounts.map((row) => ({
+        ...row,
+        label: row.id === 'alpha' ? 'Morning login' : 'Afternoon login',
+      }))
+      return current
+    }, paths)
+    const runtime = makeRuntime()
+    const seen: Array<string | undefined> = []
+    const sessionId = 'session-1'
+    runtime.bindQuotaStatus(sessionId, (text) => seen.push(text))
+    try {
+      await runtime.start()
+      await runtime.pool.settled()
+      await setMode('sticky-balanced')
+      setPiStickyRouting(sessionId, 'alpha')
+      expect(seen).toEqual([])
+      await send(runtime, { sessionId, apiKey: undefined })
+      expect(seen.at(-1)).toMatch(
+        /^Morning login · 5h 90% left, resets .*7d 90% left, resets /,
+      )
+
+      const resetAt = String(Math.floor((Date.now() + HOUR_MS) / 1000))
+      const reading = (used: string) => ({
+        'x-codex-primary-used-percent': used,
+        'x-codex-primary-window-minutes': '300',
+        'x-codex-primary-reset-at': resetAt,
+      })
+      whamHandler = (call) => whamOk(call.token === ALPHA_TOKEN ? 27 : 10)
+      await runtime.commandSupport().refreshAllQuota()
+      runtime.refreshQuotaStatus()
+      expect(codexTokens()).toEqual([ALPHA_TOKEN])
+      expect(seen.at(-1)).toMatch(/^Morning login · 5h 73% left, resets /)
+
+      codexHandler = (call) =>
+        call.token === ALPHA_TOKEN
+          ? Response.json(
+              { error: { code: 'usage_limit_reached', message: 'limit' } },
+              { status: 429, headers: reading('100') },
+            )
+          : sseOk(reading('39'))
+      await send(runtime, { sessionId, apiKey: undefined })
+      expect(codexTokens().slice(-2)).toEqual([ALPHA_TOKEN, BETA_TOKEN])
+      expect(seen.at(-1)).toMatch(/^Afternoon login · 5h 61% left, resets /)
+      expect(seen.join('\n')).not.toMatch(/acct-alpha|acct-beta|eyJ/)
+    } finally {
+      await runtime.dispose()
+    }
+    expect(seen.at(-1)).toBeUndefined()
+  })
+
   test.each(['expired', 'missing', 'still-valid'] as const)(
     'a %s fallback token uses the correct refresh timing before routing',
     async (state) => {

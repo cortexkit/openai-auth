@@ -2,7 +2,11 @@ import { describe, expect, it, spyOn } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type PiSlot, PiSlotError } from '@cortexkit/common-auth/pi-slot'
-import type { ExtensionCommandContext } from '@earendil-works/pi-coding-agent'
+import {
+  DEFAULT_COMPACTION_SETTINGS,
+  type ExtensionCommandContext,
+  shouldCompact,
+} from '@earendil-works/pi-coding-agent'
 import * as commands from '../commands.ts'
 
 import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
@@ -18,7 +22,7 @@ type RegisteredProvider = {
 
 describe('Pi OpenAI auth extension', () => {
   for (const captureFrom of ['onContext', 'session_start'] as const) {
-    it(`captures the working-message UI from ${captureFrom} and drops it in headless contexts`, async () => {
+    it(`binds the working-message and quota status UI from ${captureFrom} only when interactive`, async () => {
       let runtime: PiOpenAIRuntime | undefined
       let onContext: commands.PiCommandDependencies['onContext']
       let sessionStart:
@@ -46,17 +50,24 @@ describe('Pi OpenAI auth extension', () => {
         PiOpenAIRuntime.prototype,
         'start',
       ).mockResolvedValue()
+      const bind = spyOn(PiOpenAIRuntime.prototype, 'bindQuotaStatus')
       const messages: Array<string | undefined> = []
+      const statuses: unknown[][] = []
       const ui = {
         setWorkingMessage(message?: string) {
           expect(this).toBe(ui)
           messages.push(message)
+        },
+        setStatus(key: string, text?: string) {
+          expect(this).toBe(ui)
+          statuses.push([key, text])
         },
         notify() {},
       }
       const context = {
         hasUI: true,
         ui,
+        sessionManager: { getSessionId: () => 'session-1' },
         modelRegistry: {
           refresh() {},
           getApiKeyForProvider: async () => undefined,
@@ -81,14 +92,21 @@ describe('Pi OpenAI auth extension', () => {
         runtime?.setWorkingMessage?.('waiting')
         runtime?.setWorkingMessage?.()
         expect(messages).toEqual(['waiting', undefined])
+        const [session, setStatus] = bind.mock.lastCall ?? []
+        expect(session).toBe('session-1')
+        expect(statuses).toEqual([])
+        setStatus?.('Pi login · 5h 90% left')
+        expect(statuses).toEqual([['openai-auth', 'Pi login · 5h 90% left']])
         await captureUi({ ...context, hasUI: false })
         expect(runtime?.setWorkingMessage).toBeUndefined()
+        expect(bind.mock.lastCall).toEqual([])
       } finally {
         await shutdown?.()
         capture.mockRestore()
         register.mockRestore()
         sync.mockRestore()
         start.mockRestore()
+        bind.mockRestore()
       }
     })
   }
@@ -233,7 +251,7 @@ describe('Pi OpenAI auth extension', () => {
     expect(ids).toContain('gpt-6.2-astra')
   })
 
-  it('adds GPT-6.2 from its predecessors without duplicating a listed model', async () => {
+  it('registers Codex OAuth model limits without duplicating a listed model', async () => {
     const { openAICodexModels } = await import('../index.ts')
     const base = (id: string, contextWindow: number) =>
       ({
@@ -246,35 +264,74 @@ describe('Pi OpenAI auth extension', () => {
         input: ['text', 'image'],
         cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
-        maxTokens: 128_000,
+        maxTokens: 32_768,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
       }) as never
     const models = openAICodexModels([
       base('gpt-6.1-sol', 500_000),
       base('gpt-6-astra', 272_000),
+      base('gpt-5.5', 280_000),
+      base('gpt-5.6-luna', 372_000),
+      base('gpt-5.6-sol', 372_000),
+      base('gpt-5.6-terra', 372_000),
+      base('gpt-6-sol', 372_000),
+      base('gpt-6-luna', 372_000),
+      base('gpt-6.1-terra', 500_000),
+      base('gpt-5.6', 272_000),
+      base('gpt-6', 272_000),
+      base('gpt-6.1', 272_000),
+      base('gpt-6.2', 272_000),
+      base('gpt-5.4-mini', 272_000),
     ])
-    expect(models.map((model) => model.id)).toEqual([
-      'gpt-6.1-sol',
-      'gpt-6-astra',
-      'gpt-6.2-sol',
-      'gpt-6.2-astra',
-    ])
+    expect(
+      Object.fromEntries(
+        models.map(({ id, contextWindow, maxTokens }) => [
+          id,
+          [contextWindow, maxTokens],
+        ]),
+      ),
+    ).toEqual({
+      'gpt-5.5': [288_384, 128_000],
+      'gpt-5.6-luna': [760_384, 128_000],
+      'gpt-5.6-sol': [760_384, 128_000],
+      'gpt-5.6-terra': [760_384, 128_000],
+      'gpt-6-astra': [760_384, 128_000],
+      'gpt-6-sol': [760_384, 128_000],
+      'gpt-6-luna': [760_384, 128_000],
+      'gpt-6.1-sol': [388_384, 128_000],
+      'gpt-6.1-terra': [388_384, 128_000],
+      'gpt-6.2-sol': [388_384, 128_000],
+      'gpt-6.2-astra': [760_384, 128_000],
+      'gpt-5.4-mini': [272_000, 32_768],
+    })
     const sol = models.find((model) => model.id === 'gpt-6.2-sol')
-    expect(sol?.contextWindow).toBe(500_000)
     expect(sol?.thinkingLevelMap).toEqual({ xhigh: 'xhigh', max: 'max' })
     expect(sol?.cost.input).toBe(2)
-    expect(
-      models.find((model) => model.id === 'gpt-6.2-astra')?.contextWindow,
-    ).toBe(272_000)
-    // A Pi release that already lists 6.2 keeps its own entry.
+    // An SDK entry retains its metadata but still receives the OAuth limits.
     const listed = openAICodexModels([
       base('gpt-6.1-sol', 500_000),
       base('gpt-6.2-sol', 600_000),
     ])
     expect(listed.filter((model) => model.id === 'gpt-6.2-sol')).toHaveLength(1)
+    expect(listed.find((model) => model.id === 'gpt-6.2-sol')?.cost.input).toBe(
+      1,
+    )
+  })
+
+  it('compacts at the OpenCode input limit under default Pi settings', async () => {
+    const { openAICodexModels } = await import('../index.ts')
+    const astra = openAICodexModels().find(
+      (model) => model.id === 'gpt-6.2-astra',
+    )!
     expect(
-      listed.find((model) => model.id === 'gpt-6.2-sol')?.contextWindow,
-    ).toBe(600_000)
+      shouldCompact(700_000, astra.contextWindow, DEFAULT_COMPACTION_SETTINGS),
+    ).toBe(false)
+    expect(
+      shouldCompact(744_000, astra.contextWindow, DEFAULT_COMPACTION_SETTINGS),
+    ).toBe(false)
+    expect(
+      shouldCompact(744_001, astra.contextWindow, DEFAULT_COMPACTION_SETTINGS),
+    ).toBe(true)
   })
 
   it('registers exactly the one /openai command', async () => {
