@@ -940,35 +940,39 @@ test('Pi uses the startup Codex endpoint for HTTP and WebSocket until restart, w
   ])
 })
 
+function transformedResponseEvents(turn: number, modelId = model.id) {
+  return responseEvents(turn).map((event) =>
+    event.type === 'response.completed'
+      ? {
+          ...event,
+          response: {
+            ...event.response,
+            model: modelId,
+            input_transformations: [
+              {
+                action: 'removed',
+                type: 'reasoning',
+                reason: 'prefix_mismatch',
+                id: 'private-reasoning-id',
+              },
+            ],
+          },
+        }
+      : event,
+  )
+}
+
 test('Pi logs Codex transformed input items on HTTP and WebSocket completion', async () => {
   const file = join(dir, 'pi.log')
   initLogger({ file, level: 'info' })
-  const events = (turn: number) =>
-    responseEvents(turn).map((event) =>
-      event.type === 'response.completed'
-        ? {
-            ...event,
-            response: {
-              ...event.response,
-              model: model.id,
-              input_transformations: [
-                {
-                  action: 'removed',
-                  type: 'reasoning',
-                  reason: 'prefix_mismatch',
-                  id: 'private-reasoning-id',
-                },
-              ],
-            },
-          }
-        : event,
-    )
   try {
     const http = await runtime
       .stream(model, context, {
         apiKey,
         transport: 'sse',
-        fetch: mockFetch(async () => sseResponse(1, events(1))),
+        fetch: mockFetch(async () =>
+          sseResponse(1, transformedResponseEvents(1)),
+        ),
       })
       .result()
     expect(http.responseId).toBe('resp_1')
@@ -977,7 +981,7 @@ test('Pi logs Codex transformed input items on HTTP and WebSocket completion', a
         .stream({ ...model, baseUrl }, context, cachedWebSocketOptions())
         .result()
       expect(ws.responseId).toBe('resp_1')
-    }, events)
+    }, transformedResponseEvents)
 
     await flushForTest()
     const logFile = Bun.file(file)
@@ -1004,6 +1008,74 @@ test('Pi logs Codex transformed input items on HTTP and WebSocket completion', a
     resetLoggerForTest()
   }
 })
+
+test.each(['sse', 'websocket-cached'] as const)(
+  'Pi drops its warm target on a transformed %s foreground response and re-arms on a clean reply',
+  async (transport) => {
+    await restartRuntime(
+      await openPiSettings({ cache_keep_enabled: { pi: true } }),
+    )
+    const id = `${sessionId}-transformed-${transport}`
+    const manager = runtime['cacheKeep'].manager
+    const events = (turn: number) =>
+      turn === 2
+        ? transformedResponseEvents(turn, effortModel.id)
+        : responseEvents(turn)
+    const run = async (baseUrl?: string) => {
+      let turn = 0
+      const model = baseUrl ? { ...effortModel, baseUrl } : effortModel
+      const options: SimpleStreamOptions = {
+        ...cachedWebSocketOptions(),
+        transport,
+        sessionId: id,
+        ...(transport === 'sse' && {
+          fetch: mockFetch(async () => sseResponse(++turn, events(turn))),
+        }),
+      }
+      const first = await runtime.stream(model, context, options).result()
+      expect(first.responseId).toBe('resp_1')
+      expect(manager.status().tracked).toBe(1)
+      const secondContext = {
+        systemPrompt,
+        messages: [firstUser, first, secondUser],
+      }
+      const second = await runtime
+        .stream(model, secondContext, options)
+        .result()
+      expect(second.responseId).toBe('resp_2')
+      expect(manager.status().tracked).toBe(0)
+      now += 29 * 60_000
+      await manager.tick()
+      expect(warmRequests).toHaveLength(0)
+      const third = await runtime
+        .stream(
+          model,
+          {
+            systemPrompt,
+            messages: [...secondContext.messages, second, thirdUser],
+          },
+          options,
+        )
+        .result()
+      expect(third.responseId).toBe('resp_3')
+      await tickAtWarmLead(id)
+      expect(warmRequests).toHaveLength(1)
+    }
+    if (transport === 'sse') await run()
+    else {
+      try {
+        const { frames } = await captureWebSocketFrames(run, events)
+        expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+          undefined,
+          'resp_1',
+          'resp_2',
+        ])
+      } finally {
+        closeOpenAICodexWebSocketSessions(id)
+      }
+    }
+  },
+)
 
 test('Pi sends helper WebSocket frames without cache or turn metadata', async () => {
   const { frames, upgrades } = await captureWebSocketFrames(async (baseUrl) => {

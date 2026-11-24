@@ -1262,6 +1262,7 @@ export class PiOpenAIRuntime {
     let headers: Headers | undefined
     let limit: { signal: LimitSignal; body: unknown } | undefined
     let wsCompleted = false
+    let inputTransformed = false
     let logicalBody: string | undefined
     let cacheCapture:
       | (ReturnType<typeof shapePiCacheCapture> & { endpoint: string })
@@ -1274,6 +1275,7 @@ export class PiOpenAIRuntime {
       headers = undefined
       limit = undefined
       wsCompleted = false
+      inputTransformed = false
       cacheCapture = undefined
       reading = initialReading
     }
@@ -1474,11 +1476,12 @@ export class PiOpenAIRuntime {
         onProviderStreamEvent: async (event, eventModel) => {
           if (isRecord(event) && event.type === 'response.completed') {
             if (httpStatus === undefined) wsCompleted = true
-            logInputTransformations(
+            const transformed = logInputTransformations(
               event.response,
               httpStatus === undefined ? 'websocket' : 'http',
               'pi',
             )
+            inputTransformed ||= transformed
           }
           // The bound WebSocket records quota before pi-ai dispatches this callback.
           if (httpStatus !== undefined || !useWebSocketShim)
@@ -1588,7 +1591,7 @@ export class PiOpenAIRuntime {
               runtime.frameTurns.completed(cacheSessionId, sentTurn)
             if (cacheSessionId && execution.isCurrent()) {
               const effectiveAccountId = piCodexAccountId(token)
-              if (cacheCapture && effectiveAccountId) {
+              if (!inputTransformed && cacheCapture && effectiveAccountId) {
                 const { bodyText, replayHeaders, identity, endpoint } =
                   cacheCapture
                 runtime.cacheKeep.capture({

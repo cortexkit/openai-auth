@@ -253,26 +253,18 @@ function extractUsageObject(
   return { input_tokens, output_tokens, cached_tokens, hit_rate }
 }
 
-function extractKeepwarmUsage(
-  bodyText: string,
-): ReturnType<typeof emptyKeepwarmUsage> {
-  try {
-    const parsed = JSON.parse(bodyText) as Record<string, unknown>
-    return extractUsageObject(parsed.usage)
-  } catch {
-    return emptyKeepwarmUsage()
-  }
+interface KeepwarmReply {
+  usage: ReturnType<typeof emptyKeepwarmUsage>
+  transformedResponse?: Record<string, unknown>
+  isSse: boolean
 }
 
-function extractKeepwarmSseUsage(
-  bodyText: string,
-  host: 'opencode1' | 'opencode2' | 'pi',
-  requestBodyText: string,
-): ReturnType<typeof emptyKeepwarmUsage> {
+function createKeepwarmSseReader() {
+  let partialLine = ''
   let eventName: string | undefined
   let dataLines: string[] = []
   let usage: ReturnType<typeof emptyKeepwarmUsage> | undefined
-  let completed = false
+  let transformedResponse: Record<string, unknown> | undefined
 
   const flushEvent = () => {
     if (!dataLines.length) return
@@ -286,42 +278,73 @@ function extractKeepwarmSseUsage(
       const type = event.type ?? currentEvent
       if (type !== 'response.completed' && type !== 'response.done') return
       const response = event.response as Record<string, unknown> | undefined
-      if (type === 'response.completed' && !completed) {
-        completed = true
-        if (inputTransformationsOf(response)) {
-          let chained: boolean | undefined
-          try {
-            const request: unknown = JSON.parse(requestBodyText)
-            if (isRecord(request)) chained = 'previous_response_id' in request
-          } catch {
-            // A non-JSON capture cannot establish whether the request chained.
-          }
-          logInputTransformations(response, 'http', host, {
-            warm: true,
-            chained,
-          })
-        }
-      }
+      if (type === 'response.completed' && inputTransformationsOf(response))
+        transformedResponse ??= response
       usage = extractUsageObject(response?.usage ?? event.usage)
     } catch {
       // Ignore malformed diagnostic events and keep scanning.
     }
   }
 
-  for (const line of bodyText.split(/\r?\n/)) {
-    if (line === '') {
-      flushEvent()
-      continue
-    }
-    if (line.startsWith('event:')) {
+  const readLine = (line: string) => {
+    if (line === '') flushEvent()
+    else if (line.startsWith('event:'))
       eventName = line.slice('event:'.length).trim()
-      continue
-    }
-    if (line.startsWith('data:'))
+    else if (line.startsWith('data:'))
       dataLines.push(line.slice('data:'.length).trim())
   }
-  flushEvent()
-  return usage ?? emptyKeepwarmUsage()
+
+  return {
+    push(chunk: string) {
+      const lines = (partialLine + chunk).split(/\r?\n/)
+      partialLine = lines.pop() ?? ''
+      for (const line of lines) readLine(line)
+    },
+    finish(): KeepwarmReply {
+      readLine(partialLine)
+      flushEvent()
+      return {
+        isSse: true,
+        usage: usage ?? emptyKeepwarmUsage(),
+        ...(transformedResponse && { transformedResponse }),
+      }
+    },
+  }
+}
+
+function createKeepwarmReplyReader(contentType: string) {
+  let sse = contentType.includes('text/event-stream')
+    ? createKeepwarmSseReader()
+    : undefined
+  let text = ''
+  return {
+    push(chunk: string) {
+      if (sse) sse.push(chunk)
+      else {
+        text += chunk
+        if (/(^|\n)(data:|event:)/.test(text.slice(0, 200))) {
+          sse = createKeepwarmSseReader()
+          sse.push(text)
+          text = ''
+        }
+      }
+    },
+    finish(): KeepwarmReply {
+      if (sse) return sse.finish()
+      try {
+        const parsed = JSON.parse(text) as Record<string, unknown>
+        return {
+          isSse: false,
+          usage: extractUsageObject(parsed.usage),
+          ...(inputTransformationsOf(parsed) && {
+            transformedResponse: parsed,
+          }),
+        }
+      } catch {
+        return { isSse: false, usage: emptyKeepwarmUsage() }
+      }
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,13 +455,18 @@ export function resolveCacheKeepAccountIdentity(
 
 export function createOpenAICacheKeepAdapter(
   options: OpenAICacheKeepAdapterOptions,
-  dropChangedIdentity?: (sessionKey: string) => void,
+  dropTarget?: (sessionKey: string, diagnostic: string) => void,
 ): CacheKeepAdapter<OpenAICacheKeepMeta> {
   const log = options.logger
   const activeAccount = options.activeAccount
+  const observedReplies = new WeakMap<Response, KeepwarmReply>()
+  let skipWarmTouch: string | undefined
   return {
     plan: sessionCacheKeepPlan,
-    onWarmed: reportSessionCacheWarmed,
+    onWarmed(sessionKey, input) {
+      if (skipWarmTouch !== sessionKey)
+        reportSessionCacheWarmed(sessionKey, input)
+    },
     onWarmStopped: reportSessionCacheWarmStopped,
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
@@ -468,7 +496,10 @@ export function createOpenAICacheKeepAdapter(
         const capturedIdentity =
           target.meta.chatgptAccountId ?? target.meta.effectiveAccountId
         if (check.identity !== capturedIdentity) {
-          dropChangedIdentity?.(target.sessionKey)
+          dropTarget?.(
+            target.sessionKey,
+            'the account signs in as another login now',
+          )
           throw new Error('the account signs in as another login now')
         }
         const accountKey = await options.activity?.accountKey(check)
@@ -560,15 +591,25 @@ export function createOpenAICacheKeepAdapter(
           // Completion, not response headers, accepts the warm. A cancelled or
           // failed body must not extend the session's cache lifetime.
           const reader = redacted.body.getReader()
-          return new Response(
+          const decoder = new TextDecoder()
+          const reply = createKeepwarmReplyReader(
+            redacted.headers.get('content-type') ?? '',
+          )
+          const observed = new Response(
             new ReadableStream({
               async pull(controller) {
                 try {
                   const chunk = await reader.read()
                   if (chunk.done) {
-                    await accept()
+                    reply.push(decoder.decode())
+                    const result = reply.finish()
+                    observedReplies.set(observed, result)
+                    if (!result.transformedResponse) await accept()
                     controller.close()
-                  } else controller.enqueue(chunk.value)
+                  } else {
+                    reply.push(decoder.decode(chunk.value, { stream: true }))
+                    controller.enqueue(chunk.value)
+                  }
                 } catch (error) {
                   controller.error(error)
                 }
@@ -583,6 +624,7 @@ export function createOpenAICacheKeepAdapter(
               headers: redacted.headers,
             },
           )
+          return observed
         } catch (error) {
           billing?.failed()
           throw redactCredentialError(error, accessToken)
@@ -637,25 +679,48 @@ export function createOpenAICacheKeepAdapter(
 
     readUsage({ response, text, target }) {
       const contentType = response.headers.get('content-type') ?? ''
-      const isSse =
-        contentType.includes('text/event-stream') ||
-        /(^|\n)(data:|event:)/.test(text.slice(0, 200))
+      let reply = observedReplies.get(response)
+      if (!reply) {
+        const reader = createKeepwarmReplyReader(contentType)
+        reader.push(text)
+        reply = reader.finish()
+      }
+      if (reply.transformedResponse) {
+        if (dropTarget) {
+          // The manager is still on this target, but it calls onWarmed after
+          // readUsage even if the target was removed. Do not report that touch.
+          skipWarmTouch = target.sessionKey
+          queueMicrotask(() => {
+            skipWarmTouch = undefined
+          })
+          dropTarget(target.sessionKey, 'provider transformed input')
+        }
+        let chained: boolean | undefined
+        try {
+          const request: unknown = JSON.parse(target.bodyText)
+          if (isRecord(request)) chained = 'previous_response_id' in request
+        } catch {
+          // A non-JSON capture cannot establish whether the request chained.
+        }
+        logInputTransformations(
+          reply.transformedResponse,
+          'http',
+          options.host ?? 'opencode1',
+          {
+            warm: true,
+            chained,
+          },
+        )
+      }
       log?.debug('cachekeep warm response', {
         status: response.status,
         contentType,
         bodyLen: text.length,
-        isSse,
+        isSse: reply.isSse,
       })
-      const usage = isSse
-        ? extractKeepwarmSseUsage(
-            text,
-            options.host ?? 'opencode1',
-            target.bodyText,
-          )
-        : extractKeepwarmUsage(text)
       const quota = normalizeQuotaHeaders(response.headers)
       return {
-        ...usage,
+        ...reply.usage,
         quota_primary_pct: quota.primary?.usedPercent ?? null,
         quota_secondary_pct: quota.secondary?.usedPercent ?? null,
       }
@@ -722,12 +787,11 @@ export function createCacheKeepManager(
         now: options.now,
         logger,
       },
-      (sessionKey) => {
+      (sessionKey, diagnostic) => {
         manager.remove(sessionKey)
-        logger?.debug(
-          'cachekeep dropped target (the account signs in as another login now)',
-          { sessionKey },
-        )
+        logger?.debug(`cachekeep dropped target (${diagnostic})`, {
+          sessionKey,
+        })
       },
     ),
   })
