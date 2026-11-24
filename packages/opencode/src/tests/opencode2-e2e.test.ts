@@ -34,7 +34,6 @@ import {
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import { POOL_BROWSER_METHOD } from '../v2/login'
-import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import {
   POLICY_NOW,
@@ -57,7 +56,7 @@ import {
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE2_E2E === '1'
-export const OPENCODE_CLI_VERSION = '2.3.0'
+export const OPENCODE_CLI_VERSION = '2.4.1'
 const PLACEHOLDER = placeholderSecret('openai')
 const PASSWORD = 'openai-auth-e2e-loopback-only'
 const HOUR = 3600_000
@@ -745,7 +744,12 @@ const samplesOn = (result: ScenarioResult, transport: 'http' | 'ws') =>
 type SentBody = {
   previous_response_id?: string
   reasoning?: { effort?: string }
-  input: Array<{ type?: string; role?: string; reasoning?: unknown }>
+  input: Array<{
+    type?: string
+    role?: string
+    content?: unknown
+    reasoning?: unknown
+  }>
 }
 const bodyOf = (sample: WireSample | undefined) =>
   (sample?.body ?? { input: [] }) as SentBody
@@ -1781,9 +1785,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         expect(messages).toHaveLength(1)
         const start = body.input[0]?.type === 'additional_tools' ? 1 : 0
         expect(body.input[start]).toBe(messages[0])
-        expect(messages[0]).toEqual(
-          expectedBaseInstructions(expect.any(String)),
-        )
+        // The host already put the system prompt in input, so the plugin
+        // leaves its developer item intact instead of moving instructions.
+        expect(messages[0]).toEqual({
+          type: 'message',
+          role: 'developer',
+          content: expect.stringMatching(/\S/),
+        })
       }
     })
   }, 180_000)
