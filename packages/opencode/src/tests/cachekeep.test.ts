@@ -62,6 +62,13 @@ const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const TTL_MS = 5 * 60 * 1000 // 5 min
 const LEAD_MS = 5 * 1000 // 5 s lead
 
+function accessTokenFor(accountId: string) {
+  const claims = {
+    'https://api.openai.com/auth': { chatgpt_account_id: accountId },
+  }
+  return `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.test-signature`
+}
+
 describe('keep-warm session activity', () => {
   function warmFixture() {
     const clock = fakeNow()
@@ -74,7 +81,11 @@ describe('keep-warm session activity', () => {
       isSubagent: false,
       warmCount: 0,
       ttlMs: 1_800_000,
-      meta: { replayHeaders: {}, routingSessionId: 'scheduled-session' },
+      meta: {
+        replayHeaders: {},
+        chatgptAccountId: 'chatgpt-a',
+        routingSessionId: 'scheduled-session',
+      },
     }
     let current: typeof key | undefined = key
     let active: string | undefined = 'a'
@@ -632,6 +643,7 @@ describe('buildKeepwarmCapture', () => {
       enabled: true,
       includeSubagents: false,
       headers: new Headers({
+        originator: 'codex-test',
         'session-id': 'main-session',
         'user-agent': 'codex-test',
         version: '0.144.0',
@@ -647,6 +659,7 @@ describe('buildKeepwarmCapture', () => {
       sessionKey: 'main-session',
       bodyText: body,
       replayHeaders: {
+        originator: 'codex-test',
         'session-id': 'main-session',
         'user-agent': 'codex-test',
         version: '0.144.0',
@@ -693,6 +706,9 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('fallback warm resolves token by storage id but sends real ChatGPT account id header', async () => {
+    refreshFallback.mockResolvedValue(
+      accessTokenFor('8c97f046-7e21-409b-9829-0488897e475b'),
+    )
     const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
@@ -725,7 +741,39 @@ describe('CacheKeepManager tick/prewarm', () => {
     )
   })
 
+  test('OpenCode 1 does not warm a captured account with another login’s token', async () => {
+    const resolve = mock(async () => accessTokenFor('chatgpt-b'))
+    const manager = createCacheKeepManager({
+      host: 'opencode1',
+      fetchImpl,
+      getMainToken: resolve,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+    })
+    try {
+      manager.track({
+        sessionKey: 'sess-1',
+        bodyText: '{"model":"gpt-5.5","input":[]}',
+        accountId: 'main',
+        meta: { replayHeaders: {}, chatgptAccountId: 'chatgpt-a' },
+      })
+      clock.advance(TTL_MS - LEAD_MS + 1000)
+      await manager.tick()
+
+      expect(resolve).toHaveBeenCalledTimes(1)
+      expect(fetchImpl).not.toHaveBeenCalled()
+      expect(manager.status().tracked).toBe(0)
+    } finally {
+      manager.stop()
+    }
+  })
+
   test('subagent warm sends the real ChatGPT account id header', async () => {
+    refreshFallback.mockResolvedValue(accessTokenFor('real-chatgpt-account-id'))
     const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
@@ -762,7 +810,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   test('main warm uses real ChatGPT account id when present and omits stale replay header when absent', async () => {
     const withAccount = createCacheKeepManager({
       fetchImpl,
-      getMainToken,
+      getMainToken: async () => accessTokenFor('main-chatgpt-id'),
       refreshFallback,
       codexResponsesUrl: CODEX_URL,
       logger: log,
@@ -1175,50 +1223,92 @@ describe('CacheKeepManager tick/prewarm', () => {
     )
   })
 
-  test('sends cache-relevant captured headers on warm requests', async () => {
-    const mgr = createCacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track({
-      sessionKey: 'sess-1',
-      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      accountId: 'main',
-      meta: {
-        replayHeaders: {
+  test.each(['opencode1', 'opencode2'] as const)(
+    '%s warms the same capture with canonical bytes and only allowed headers',
+    async (host) => {
+      const freshToken = accessTokenFor('chatgpt-a')
+      const manager = createCacheKeepManager({
+        host,
+        fetchImpl,
+        getMainToken: async () => freshToken,
+        refreshFallback,
+        codexResponsesUrl: CODEX_URL,
+        logger: log,
+        now: clock.now,
+        ttlMs: TTL_MS,
+        leadMs: LEAD_MS,
+      })
+      try {
+        manager.track({
+          sessionKey: 'sess-1',
+          bodyText:
+            '{"prompt_cache_key":"sess-1", "input":[{"role":"user","content":"café"}],"stream":true,"model":"gpt-5.5","max_output_tokens":42,"store":true}',
+          accountId: 'main',
+          meta: {
+            replayHeaders: {
+              accept: 'application/json',
+              Authorization: 'Bearer stale-bearer',
+              'chatgpt-account-id': 'stale-account',
+              Connection: 'Upgrade',
+              'content-length': '999',
+              'content-type': 'text/plain',
+              cookie: 'stale-session',
+              'openai-beta': 'responses_websockets=2026-02-06',
+              Originator: 'codex-test',
+              'sec-websocket-key': 'stale-key',
+              'session-id': 'sess-1',
+              'thread-id': 'sess-1',
+              Upgrade: 'websocket',
+              'user-agent': 'codex-test',
+              version: '0.144.0',
+              'x-client-request-id': 'sess-1',
+              'x-codex-beta-features': 'terminal_resize_reflow',
+              'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
+              'x-codex-window-id': 'window-1',
+              'x-opencode-parent-session-id': 'oc2-parent',
+              'x-parent-session-id': 'parent',
+              'x-session-affinity': 'affinity',
+              'x-unrecognized-header': 'not replayed',
+            },
+            chatgptAccountId: 'chatgpt-a',
+          },
+        })
+
+        clock.advance(TTL_MS - LEAD_MS + 1000)
+        await manager.tick()
+
+        const fetchMock = fetchImpl as unknown as ReturnType<typeof mock>
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+        expect(url).toBe(CODEX_URL)
+        expect(init.method).toBe('POST')
+        expect(init.signal).toBeInstanceOf(AbortSignal)
+        expect(init.body).toBe(
+          '{"model":"gpt-5.5","input":[{"role":"user","content":"café"}],"store":false,"stream":true,"prompt_cache_key":"sess-1"}',
+        )
+        expect(Object.fromEntries(new Headers(init.headers))).toEqual({
+          accept: 'text/event-stream',
+          authorization: `Bearer ${freshToken}`,
+          'chatgpt-account-id': 'chatgpt-a',
+          'content-type': 'application/json',
+          originator: 'codex-test',
           'session-id': 'sess-1',
+          'thread-id': 'sess-1',
           'user-agent': 'codex-test',
           version: '0.144.0',
+          'x-client-request-id': 'sess-1',
           'x-codex-beta-features': 'terminal_resize_reflow',
           'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
-        },
-        chatgptAccountId: undefined,
-      },
-    })
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-
-    const fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
-      .calls[0] as unknown[]
-    const init = fetchCall[1] as RequestInit
-    expect(init.signal).toBeInstanceOf(AbortSignal)
-    expect(Object.fromEntries(new Headers(init.headers))).toMatchObject({
-      authorization: 'Bearer main-token',
-      'content-type': 'application/json',
-      'session-id': 'sess-1',
-      'user-agent': 'codex-test',
-      version: '0.144.0',
-      'x-codex-beta-features': 'terminal_resize_reflow',
-      'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
-    })
-  })
+          'x-codex-window-id': 'window-1',
+          'x-opencode-parent-session-id': 'oc2-parent',
+          'x-parent-session-id': 'parent',
+          'x-session-affinity': 'affinity',
+        })
+      } finally {
+        manager.stop()
+      }
+    },
+  )
 
   test('parses SSE response.completed usage and logs cache hit metrics', async () => {
     const sseBody = [

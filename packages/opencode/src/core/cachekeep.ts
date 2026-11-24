@@ -52,6 +52,7 @@ export function buildKeepwarmCapture(input: {
 
   const replayHeaders: Record<string, string> = {}
   for (const name of [
+    'originator',
     'session-id',
     'x-session-affinity',
     'x-parent-session-id',

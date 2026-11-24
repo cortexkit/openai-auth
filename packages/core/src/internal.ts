@@ -19,6 +19,7 @@ export * from './background-quota-refresh'
 export * from './backoff'
 export {
   buildKeepwarmBody,
+  buildKeepwarmRequest,
   CACHE_KEEP_CAPS,
   type CacheKeepCredentialCheck,
   type CacheKeepWindow,

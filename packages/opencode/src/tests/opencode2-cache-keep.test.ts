@@ -79,7 +79,7 @@ function fakeTimers() {
 
 /** A stand-in location: pool rows, a vault, the account registry, settings. */
 function fakeLocation() {
-  const sent: Sent[] = []
+  const sent: Array<Sent & { bodyText: string }> = []
   const warnings: string[] = []
   const warningData: unknown[] = []
   const state = {
@@ -145,11 +145,13 @@ function fakeLocation() {
     fetch: (async (url: string, init?: RequestInit) => {
       state.sending++
       if (state.gate) await state.gate
+      const bodyText = String(init?.body)
       sent.push({
         url: String(url),
         method: init?.method,
         headers: new Headers(init?.headers),
-        body: JSON.parse(String(init?.body)),
+        bodyText,
+        body: JSON.parse(bodyText),
       })
       return new Response('{}', {
         status: state.status,
@@ -503,7 +505,9 @@ describe('OpenCode 2 keep-warm capture and replay', () => {
   test('a 5-minute model warms just before 5 minutes with store:false, no caps and a fresh token', async () => {
     const fake = served()
     const { lease, clock } = acquire(fake.location)
-    await lease.capture(captured('ses'))
+    await lease.capture(
+      captured('ses', { headers: { originator: 'codex-test' } }),
+    )
     expect(lease.manager.status().targets[0]!.ttlMs).toBe(5 * MINUTE)
     await advance(lease, clock, 3 * MINUTE)
     expect(fake.sent).toHaveLength(0)
@@ -513,14 +517,13 @@ describe('OpenCode 2 keep-warm capture and replay', () => {
     expect(warm!.url).toBe('https://chatgpt.com/backend-api/codex/responses')
     expect(warm!.headers.get('authorization')).toBe('Bearer A-token-1')
     expect(warm!.headers.get('chatgpt-account-id')).toBe('chatgpt-A')
+    expect(warm!.headers.get('originator')).toBe('codex-test')
     expect(warm!.headers.get('session-id')).toBe('thread-ses')
     expect(warm!.headers.get('x-codex-turn-metadata')).toBe('{"turn_id":"t1"}')
     expect(warm!.headers.has('cookie')).toBe(false)
-    expect(warm!.body).toMatchObject({
-      store: false,
-      prompt_cache_key: 'thread-ses',
-    })
-    expect(warm!.body).not.toHaveProperty('max_output_tokens')
+    expect(warm!.bodyText).toBe(
+      '{"model":"gpt-5.5","input":[{"role":"user","content":"hello"}],"store":false,"stream":true,"prompt_cache_key":"thread-ses"}',
+    )
   })
 
   test('a 30-minute model warms just before 30 minutes', async () => {

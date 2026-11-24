@@ -8066,6 +8066,7 @@ describe('integration: active fallback routing', () => {
       expect(warmRequests).toHaveLength(1)
       const warm = warmRequests[0]!
       const warmHeaders = new Headers(warm.headers)
+      expect(warmHeaders.get('originator')).toBe('codex_exec')
       expect(warmHeaders.get('x-openai-internal-codex-responses-lite')).toBe(
         lite ? 'true' : null,
       )

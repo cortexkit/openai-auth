@@ -1802,7 +1802,7 @@ export async function CodexAuthPlugin(
             if (await poolSource.active()) {
               const access = await poolRowAccess('main')
               if (!access) throw new Error('main pool row has no usable token')
-              return access.token
+              return { token: access.token, identity: access.row.identity }
             }
             const auth = await getAuth()
             if ((await vault.authority()) !== 'local')
@@ -1834,7 +1834,7 @@ export async function CodexAuthPlugin(
               // The warmed request recorded the pool row that served it.
               const access = await poolRowAccess(accountId)
               if (!access) throw new Error(`no access token for ${accountId}`)
-              return { token: access.token }
+              return { token: access.token, identity: access.row.identity }
             }
             const fbStorage = await loadRequestAccounts()
             const account = fbStorage

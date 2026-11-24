@@ -25,7 +25,9 @@ import type {
   SessionActivityStore,
 } from '@cortexkit/common-auth/limits'
 import type { AccountStorage } from './accounts'
+import { orderCodexBody } from './codex-body'
 import { sanitizeHttpFallbackInit } from './codex-http'
+import { RESPONSES_LITE_HEADER } from './codex-lite'
 import {
   inputTransformationsOf,
   logInputTransformations,
@@ -63,9 +65,9 @@ export {
 
 /** Plugin data stored with each target and handed back on every warm. */
 export interface OpenAICacheKeepMeta {
-  /** Cache-relevant request headers, replayed verbatim on the warm request. */
+  /** Captured request headers; only cache identity and Lite can be replayed. */
   replayHeaders: Record<string, string>
-  /** The ChatGPT account id sent as `ChatGPT-Account-Id`; absent for none. */
+  /** ChatGPT identity of the captured request, used to check the fresh credential. */
   chatgptAccountId?: string
   /**
    * The session id the router keyed this request's routing by. It can differ
@@ -146,7 +148,7 @@ export function openaiCacheKeepProfile(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Replay body
+// HTTP replay
 // ---------------------------------------------------------------------------
 
 export function buildKeepwarmBody(bodyText: string): string {
@@ -156,7 +158,49 @@ export function buildKeepwarmBody(bodyText: string): string {
   delete clone.max_output_tokens
   delete clone.max_tokens
   delete clone.max_completion_tokens
-  return JSON.stringify(clone)
+  return JSON.stringify(orderCodexBody(clone))
+}
+
+const KEEPWARM_REPLAY_HEADERS = new Set([
+  'originator',
+  'session-id',
+  'thread-id',
+  'user-agent',
+  'version',
+  'x-client-request-id',
+  'x-codex-beta-features',
+  'x-codex-turn-metadata',
+  'x-codex-window-id',
+  'x-opencode-parent-session-id',
+  'x-parent-session-id',
+  'x-session-affinity',
+  RESPONSES_LITE_HEADER,
+])
+
+/** Build the HTTP request from the prepared warm body and a verified credential. */
+export function buildKeepwarmRequest(input: {
+  body: string
+  replayHeaders: Readonly<Record<string, string>>
+  credential: { token: string; identity: string | undefined }
+  signal: AbortSignal
+}): RequestInit {
+  const headers = new Headers()
+  for (const [name, value] of Object.entries(input.replayHeaders)) {
+    if (KEEPWARM_REPLAY_HEADERS.has(name.toLowerCase()))
+      headers.set(name, value)
+  }
+  headers.set('authorization', `Bearer ${input.credential.token}`)
+  if (input.credential.identity)
+    headers.set('chatgpt-account-id', input.credential.identity)
+  // The HTTP transport sets its own Accept and Content-Type and translates
+  // any WebSocket Lite flag into the corresponding HTTP header.
+  const request = {
+    method: 'POST',
+    headers,
+    body: input.body,
+    signal: input.signal,
+  }
+  return sanitizeHttpFallbackInit(request) ?? request
 }
 
 // ---------------------------------------------------------------------------
@@ -273,13 +317,13 @@ function extractKeepwarmSseUsage(
 // Adapter and manager
 // ---------------------------------------------------------------------------
 
-type CacheKeepFallbackAccess =
+type CacheKeepLocalAccess =
   | string
   | {
       token: string
       /**
        * The ChatGPT account the token signs in as, when the caller knows it;
-       * otherwise it is read from the token. Only `verifyCredential` uses it.
+       * otherwise it is read from the token.
        */
       identity?: string
       onAuthFailure?: (status: number) => Promise<void>
@@ -344,12 +388,12 @@ export interface OpenAICacheKeepAdapterBaseOptions {
 export type CacheKeepLocalCredentialOptions =
   | {
       /** The main account's bearer; a throw (no token) backs the target off. */
-      getMainToken: () => Promise<string>
+      getMainToken: () => Promise<CacheKeepLocalAccess>
       /**
        * Resolve the local fallback row identified by `accountId` to a bearer for
        * this replay. `onAuthFailure` handles a 401 on that resolved credential.
        */
-      refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
+      refreshFallback: (accountId: string) => Promise<CacheKeepLocalAccess>
       resolveLocal?: never
     }
   | {
@@ -358,7 +402,7 @@ export type CacheKeepLocalCredentialOptions =
       /** The bearer for the target's own account; a throw backs it off. */
       resolveLocal: (
         target: CacheKeepTargetView<OpenAICacheKeepMeta>,
-      ) => Promise<CacheKeepFallbackAccess>
+      ) => Promise<CacheKeepLocalAccess>
     }
 
 export type OpenAICacheKeepAdapterOptions = OpenAICacheKeepAdapterBaseOptions &
@@ -371,6 +415,7 @@ function identityOfToken(token: string): string | undefined {
 
 export function createOpenAICacheKeepAdapter(
   options: OpenAICacheKeepAdapterOptions,
+  dropChangedIdentity?: (sessionKey: string) => void,
 ): CacheKeepAdapter<OpenAICacheKeepMeta> {
   const log = options.logger
   const activeAccount = options.activeAccount
@@ -400,6 +445,10 @@ export function createOpenAICacheKeepAdapter(
             identityOfToken(accessToken),
         }
         await options.verifyCredential?.(check)
+        if (check.identity !== target.meta.chatgptAccountId) {
+          dropChangedIdentity?.(target.sessionKey)
+          throw new Error('the account signs in as another login now')
+        }
         const accountKey = await options.activity?.accountKey(check)
         signal.throwIfAborted()
         const dispatched: SessionDispatch | undefined = accountKey
@@ -410,17 +459,6 @@ export function createOpenAICacheKeepAdapter(
               ttlMs: ttlForModel(target.bodyText, target.ttlMs),
             }
           : undefined
-
-        const headers: Record<string, string> = {
-          ...target.meta.replayHeaders,
-          authorization: `Bearer ${accessToken}`,
-          'content-type': 'application/json',
-        }
-        if (target.meta.chatgptAccountId) {
-          headers['ChatGPT-Account-Id'] = target.meta.chatgptAccountId
-        } else {
-          delete headers['ChatGPT-Account-Id']
-        }
 
         let warmBodyShape: Record<string, unknown> | undefined
         const billing =
@@ -446,21 +484,21 @@ export function createOpenAICacheKeepAdapter(
         } catch {
           // Diagnostic logging must never block the warm.
         }
-        log?.debug('cachekeep warm request', {
-          ...warmBodyShape,
-          headerKeys: Object.keys(headers),
-          hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
-        })
-
         try {
+          const request = buildKeepwarmRequest({
+            body,
+            replayHeaders: target.meta.replayHeaders,
+            credential: { token: accessToken, identity: check.identity },
+            signal,
+          })
+          log?.debug('cachekeep warm request', {
+            ...warmBodyShape,
+            headerKeys: [...new Headers(request.headers).keys()],
+            hasChatGptAccountId: check.identity !== undefined,
+          })
           const received = await options.fetchImpl(
             target.meta.url ?? options.codexResponsesUrl,
-            sanitizeHttpFallbackInit({
-              method: 'POST',
-              headers,
-              body,
-              signal,
-            }),
+            request,
           )
           const response = billing ? billing.response(received) : received
           if (vaultAttempt && target.accountId)
@@ -637,21 +675,31 @@ export function createCacheKeepManager(
           getMainToken: options.getMainToken,
           refreshFallback: options.refreshFallback,
         }
-  return new CacheKeepManager<OpenAICacheKeepMeta>({
+  const manager: OpenAICacheKeepManager = new CacheKeepManager({
     ...managerOptions,
     logger,
-    adapter: createOpenAICacheKeepAdapter({
-      fetchImpl,
-      host,
-      observeBillingSend,
-      ...local,
-      vault,
-      codexResponsesUrl,
-      activeAccount,
-      verifyCredential,
-      activity,
-      now: options.now,
-      logger,
-    }),
+    adapter: createOpenAICacheKeepAdapter(
+      {
+        fetchImpl,
+        host,
+        observeBillingSend,
+        ...local,
+        vault,
+        codexResponsesUrl,
+        activeAccount,
+        verifyCredential,
+        activity,
+        now: options.now,
+        logger,
+      },
+      (sessionKey) => {
+        manager.remove(sessionKey)
+        logger?.debug(
+          'cachekeep dropped target (the account signs in as another login now)',
+          { sessionKey },
+        )
+      },
+    ),
   })
+  return manager
 }

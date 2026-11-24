@@ -68,10 +68,9 @@ import type { ActiveAccounts } from './session-accounts'
 export const CACHE_KEEP_JOIN_MS = 5_000
 
 /**
- * The request headers a warm replays. Everything here describes the client,
- * the conversation or the turn. Credentials (`authorization`, `cookie`) and
- * the account header are left out: the account header is sent from the
- * capture's own field, and the bearer is resolved fresh for every warm.
+ * Headers retained for the warm builder. Do not retain secrets such as
+ * authorization or cookies. The warm's bearer and account header come from
+ * the fresh credential.
  */
 const REPLAY_HEADERS = [
   'accept',
@@ -389,15 +388,11 @@ function createEntry(
       }
       return active
     },
-    verifyCredential: ({ target, mode, identity }) => {
+    verifyCredential: ({ target, mode }) => {
       if (target.meta.credentialMode !== mode)
         throw new Error(
           `a target captured in ${target.meta.credentialMode ?? 'an unknown'} mode is not warmed with a ${mode} credential`,
         )
-      if (identity !== target.meta.chatgptAccountId) {
-        drop(target.sessionKey, 'the account signs in as another login now')
-        throw new Error('the account signs in as another login now')
-      }
     },
   })
   return {
