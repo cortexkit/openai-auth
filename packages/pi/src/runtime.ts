@@ -178,7 +178,7 @@ export interface PiOpenAIRuntimeDeps {
   /** Used for quota polls and token refreshes; read at call time by default. */
   fetchImpl?: typeof fetch
   now?: () => number
-  /** Wire identifiers may be seeded in request captures. */
+  /** Makes the turn ids on the wire predictable; tests pass a fixed generator. */
   turnUuid?: () => string
   installationID?: string
   firstReadingWaitMs?: number
