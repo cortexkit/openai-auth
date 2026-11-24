@@ -121,7 +121,10 @@ export function piResetCredits(options: {
         account === FORMER_MAIN_ID
           ? await main.pollNow()
           : (
-              await pool.pollRows(await options.storage(), { ids: [account] })
+              await pool.pollRows(await options.storage(), {
+                ids: [account],
+                persistQuota: true,
+              })
             )[0]
       return {
         account,

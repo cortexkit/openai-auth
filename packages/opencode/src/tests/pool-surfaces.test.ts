@@ -250,6 +250,11 @@ describe('a migrated install refreshes and polls its rows only through the pool'
   })
 
   it('polls under the bg-quota-refresh lease, refreshing due tokens through the pool', async () => {
+    const leaseOptions = {
+      name: 'bg-quota-refresh',
+      ttlMs: 120_000,
+      path: files.configFile,
+    }
     const acquire = authFs.acquireRefreshFileLock
     const leaseSpy = spyOn(authFs, 'acquireRefreshFileLock').mockImplementation(
       (options) => {
@@ -315,6 +320,9 @@ describe('a migrated install refreshes and polls its rows only through the pool'
     } finally {
       storeSpy.mockRestore()
     }
+    const publishedMain = Promise.withResolvers<void>()
+    let heldAtFallbackPublish: boolean | undefined
+    // Pause the batched quota writes so only the idle poll can save its reading.
     const quotaCommits = poolQuotaTimer(timeline)
     const currentStoreSpy = spyOn(
       poolStores,
@@ -324,9 +332,21 @@ describe('a migrated install refreshes and polls its rows only through the pool'
         ...options,
         quotaCommitTimer: quotaCommits.timer,
         onStep: (step, info) =>
-          timeline.phase(`pool write: ${step}`, () =>
-            options.onStep?.(step, info),
-          ),
+          timeline.phase(`pool write: ${step}`, async () => {
+            await options.onStep?.(step, info)
+            if (step !== 'after-config-write' || info.operation !== 'pull')
+              return
+            if (info.rowId === 'main' && poolPrimaryUsed('main') === 33)
+              publishedMain.resolve()
+            if (
+              info.rowId === 'fallback-1' &&
+              poolPrimaryUsed('fallback-1') === 33
+            ) {
+              const contender = await acquireRefreshFileLock(leaseOptions)
+              heldAtFallbackPublish = contender === null
+              await contender?.release()
+            }
+          }),
         hold: (step, row) =>
           timeline.phase(`pool ${row}: ${step}`, () =>
             options.hold?.(step, row),
@@ -388,11 +408,7 @@ describe('a migrated install refreshes and polls its rows only through the pool'
 
     // Another process holds the bg-quota-refresh lease: this process's
     // background pass polls no row.
-    const lease = await acquireRefreshFileLock({
-      name: 'bg-quota-refresh',
-      ttlMs: 120_000,
-      path: files.configFile,
-    })
+    const lease = await acquireRefreshFileLock(leaseOptions)
     if (!lease) throw new Error('lease not taken')
     try {
       tick()
@@ -416,17 +432,20 @@ describe('a migrated install refreshes and polls its rows only through the pool'
     }
     tick()
     try {
-      // Publish main before the fallback answers, so its reading must use a
-      // second commit slot even on a machine fast enough to batch both polls.
-      await timeline.phase('main quota queued', quotaCommits.next)
-      await timeline.phase('publish main quota', quotaCommits.drain)
+      await timeline.phase('main quota published', () => publishedMain.promise)
+      expect(poolPrimaryUsed('main')).toBe(33)
+      expect(poolPrimaryUsed('fallback-1')).toBe(10)
     } finally {
       releaseFallback.resolve()
     }
     await timeline.phase('background polls settled', settleSurfaceWork)
-    // Pool reads include queued quota immediately, but this assertion reads
-    // disk. Drive the detached writer rather than wait for its 30-second slot.
-    await timeline.phase('publish remaining quota', quotaCommits.drain)
+    expect(heldAtFallbackPublish).toBe(true)
+    const after = await acquireRefreshFileLock(leaseOptions)
+    try {
+      expect(after).not.toBeNull()
+    } finally {
+      await after?.release()
+    }
     await waitFor(
       () =>
         poolPrimaryUsed('main') === 33 && poolPrimaryUsed('fallback-1') === 33

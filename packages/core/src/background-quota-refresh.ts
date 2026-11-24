@@ -121,7 +121,7 @@ export interface PoolBackgroundSource {
   refreshDueTokens(storage: AccountStorage | null): Promise<void>
   pollRows(
     storage: AccountStorage | null,
-    options: { skipReadWithinMs?: number },
+    options: { skipReadWithinMs: number; persistQuota: true },
   ): Promise<Array<{ id: string; ok: boolean; error?: string }>>
 }
 
@@ -148,6 +148,8 @@ export function refreshPoolInBackground(
       if (canPoll && !(await canPoll())) return []
       return source.pollRows(storage, {
         skipReadWithinMs: BACKGROUND_QUOTA_FRESHNESS_MS,
+        // Another owner may take the lease immediately and read from disk.
+        persistQuota: true,
       })
     },
     acquireLock,

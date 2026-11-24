@@ -997,10 +997,16 @@ export class PoolAccountSource {
    * polls take, and resolves once every poll has ended. A row whose oldest
    * reading is newer than `skipReadWithinMs` is left out. Due tokens are
    * refreshed first so a poll is not sent with a token that ran out.
+   * With `persistQuota`, successful readings reach disk before the poll
+   * resolves instead of waiting for the normal batch write.
    */
   async pollRows(
     storage: AccountStorage | null,
-    options: { ids?: readonly string[]; skipReadWithinMs?: number } = {},
+    options: {
+      ids?: readonly string[]
+      skipReadWithinMs?: number
+      persistQuota?: boolean
+    } = {},
   ): Promise<PoolPollResult[]> {
     const view = await this.load()
     if (!view.active || this.disposed) return []
@@ -1015,12 +1021,7 @@ export class PoolAccountSource {
     })
     if (targets.length === 0) return []
     await this.prepareTokens(targets, storage, { waitForAll: true })
-    // An idle pass must publish before releasing its lease; otherwise the
-    // next owner can see the old reading and poll the same account again.
-    const store = this.storeFor(
-      this.deps.paths(),
-      options.skipReadWithinMs !== undefined,
-    )
+    const store = this.storeFor(this.deps.paths(), options.persistQuota)
     for (const row of targets) {
       this.pollOutcomes.delete(row.id)
       this.requestReading(row.id, true, store)

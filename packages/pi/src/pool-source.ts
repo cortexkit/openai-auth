@@ -726,10 +726,16 @@ export class PiPoolSource {
    * Polls the quota of every candidate OAuth row through the store, the same
    * pull path the first and admission polls take, and resolves once every
    * poll has ended. Due tokens are refreshed first.
+   * With `persistQuota`, successful readings reach disk before the poll
+   * resolves instead of waiting for the normal batch write.
    */
   async pollRows(
     settings: AccountStorage | null,
-    options: { ids?: readonly string[]; skipReadWithinMs?: number } = {},
+    options: {
+      ids?: readonly string[]
+      skipReadWithinMs?: number
+      persistQuota?: boolean
+    } = {},
   ): Promise<PoolPollResult[]> {
     if (this.setAside()) return []
     const view = await this.load()
@@ -744,12 +750,7 @@ export class PiPoolSource {
     })
     if (targets.length === 0) return []
     await this.refreshDueTokens(targets, settings)
-    // The next lease holder must see these readings on disk. Reset checks
-    // also save the returned balance before giving control back to the menu.
-    const store = this.storeFor(
-      this.deps.paths(),
-      options.skipReadWithinMs !== undefined || options.ids !== undefined,
-    )
+    const store = this.storeFor(this.deps.paths(), options.persistQuota)
     for (const row of targets) {
       this.pollOutcomes.delete(row.id)
       this.requestReading(row.id, true, store)
