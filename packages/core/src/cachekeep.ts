@@ -109,7 +109,7 @@ export const CACHE_KEEP_CAPS: Readonly<{
 
 /** The persisted `cachekeep` clock window, or undefined for "always warm". */
 export function getCacheKeepWindow(
-  storage: AccountStorage | null,
+  storage: Pick<AccountStorage, 'cachekeep'> | null,
 ): CacheKeepWindow | undefined {
   return normalizeCacheKeepWindow(storage?.cachekeep)
 }
@@ -178,6 +178,15 @@ const KEEPWARM_REPLAY_HEADERS = new Set([
   'x-session-affinity',
   RESPONSES_LITE_HEADER,
 ])
+
+/** Keep only the headers the warm can replay, without retaining credentials. */
+export function keepwarmReplayHeaders(
+  headers: Headers,
+): Record<string, string> {
+  return Object.fromEntries(
+    [...headers].filter(([name]) => KEEPWARM_REPLAY_HEADERS.has(name)),
+  )
+}
 
 /** Build the HTTP request from the prepared warm body and a verified credential. */
 export function buildKeepwarmRequest(input: {
@@ -359,6 +368,8 @@ export interface OpenAICacheKeepAdapterBaseOptions {
     ) => AccountKey | undefined | Promise<AccountKey | undefined>
   }
   now?: () => number
+  /** Read the identity from the bearer when the host's wire header uses a specific claim. */
+  credentialIdentity?: (token: string) => string | undefined
   /**
    * Called with each warm's fresh credential just before the warm is sent.
    * A throw sends nothing and backs the target off, unless the callback has
@@ -446,10 +457,12 @@ export function createOpenAICacheKeepAdapter(
         const check: CacheKeepCredentialCheck = {
           target,
           mode: vaultAttempt ? 'vault' : 'local',
-          identity: resolveCacheKeepAccountIdentity(
-            accessToken,
-            vaultAttempt ? vaultAttempt.accountIdentity : localIdentity,
-          ),
+          identity: options.credentialIdentity
+            ? options.credentialIdentity(accessToken)
+            : resolveCacheKeepAccountIdentity(
+                accessToken,
+                vaultAttempt ? vaultAttempt.accountIdentity : localIdentity,
+              ),
         }
         await options.verifyCredential?.(check)
         const capturedIdentity =
@@ -672,6 +685,7 @@ export function createCacheKeepManager(
     fetchImpl,
     host = 'opencode1',
     observeBillingSend,
+    credentialIdentity,
     getMainToken: _getMainToken,
     refreshFallback: _refreshFallback,
     resolveLocal: _resolveLocal,
@@ -698,6 +712,7 @@ export function createCacheKeepManager(
         fetchImpl,
         host,
         observeBillingSend,
+        credentialIdentity,
         ...local,
         vault,
         codexResponsesUrl,

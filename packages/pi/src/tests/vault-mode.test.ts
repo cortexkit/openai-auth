@@ -1932,13 +1932,88 @@ describe('Pi vault slot lifecycle', () => {
   })
 })
 
+test('Pi skips local warming after enrollment and bills vault HTTP warms', async () => {
+  const sessionId = 'pi-enrolled-cache'
+  let now = Date.now()
+  let nativeReads = 0
+  const key = Symbol.for('cortexkit.routing')
+  const original = Object.getOwnPropertyDescriptor(globalThis, key)
+  const reports: Record<string, unknown>[] = []
+  Reflect.set(globalThis, key, (id: string) =>
+    id === sessionId
+      ? {
+          cache: () => ({ keep_warm: 'always' }),
+          report: (payload: Record<string, unknown>) => reports.push(payload),
+        }
+      : undefined,
+  )
+  const target = vault()
+  const runtime = new PiOpenAIRuntime({
+    streamSimple,
+    createStream: createAssistantMessageEventStream,
+    paths: () => paths,
+    fetchImpl: fakeFetch,
+    now: () => now,
+    vault: target,
+  })
+  runtime.resolveMainToken = async () => {
+    nativeReads++
+    return NATIVE_ACCESS
+  }
+  const tick = async () => {
+    const { targets } = runtime['cacheKeep'].manager.status()
+    expect(targets).toHaveLength(1)
+    now = targets[0]!.cacheExpiresAt - 10_000
+    await runtime['cacheKeep'].manager.tick()
+  }
+  try {
+    expect((await send(runtime, sessionId)).at(-1)?.type).toBe('done')
+    expect(codexTokens).toEqual([NATIVE_ACCESS])
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    await target.refresh()
+    await target.pollStale(0)
+    await tick()
+    expect(nativeReads).toBe(0)
+    expect(codexTokens).toEqual([NATIVE_ACCESS])
+    expect((await send(runtime, sessionId)).at(-1)?.type).toBe('done')
+    await tick()
+    expect(codexTokens).toEqual([NATIVE_ACCESS, VAULT_ACCESS, VAULT_ACCESS])
+    expect(reports.filter(({ kind }) => kind === 'billing')).toEqual([
+      expect.objectContaining({
+        request_kind: 'primary',
+        cache: { implicit: true, warming: { on: true } },
+      }),
+      expect.objectContaining({
+        request_kind: 'keep_warm',
+        outcome: 'completed',
+        provider_response_id: 'r1',
+        credential_id: 'oauth:openai:vault',
+        account_id: 'chatgpt-vault',
+        charge_basis: 'subscription_included',
+        usage: { input: 1, output: 1, reasoning_included_in_output: true },
+      }),
+    ])
+    expect(reports).toContainEqual(
+      expect.objectContaining({ kind: 'cache_touch', source: 'warm' }),
+    )
+  } finally {
+    await runtime.dispose()
+    if (original) Object.defineProperty(globalThis, key, original)
+    else Reflect.deleteProperty(globalThis, key)
+  }
+})
+
 for (const { outcome, plan, warming } of [
   { outcome: 'completed', plan: undefined, warming: { on: false } },
   { outcome: 'completed', plan: 'off', warming: { on: false } },
   {
     outcome: 'completed',
     plan: 'always',
-    warming: { on: false, stop_reason: 'unsupported' },
+    warming: { on: false },
   },
   { outcome: 'throw', plan: undefined, warming: { on: false } },
   { outcome: 'error', plan: undefined, warming: { on: false } },

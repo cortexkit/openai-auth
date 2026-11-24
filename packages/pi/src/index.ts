@@ -196,6 +196,8 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     afterApply: syncSlot,
     onContext: (ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
+      runtime.resolveMainToken = () =>
+        ctx.modelRegistry.getApiKeyForProvider('openai-codex')
       notify = (message, level) => ctx.ui.notify(message, level)
       runtime.setWorkingMessage =
         ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
@@ -213,10 +215,12 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     pi.on('session_shutdown', async () => {
       clearInterval(syncTimer)
       settingsStartup.snapshot?.dispose()
-      await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
+      await runtime.dispose()
     })
     pi.on('session_start', async (_event, ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
+      runtime.resolveMainToken = () =>
+        ctx.modelRegistry.getApiKeyForProvider('openai-codex')
       notify = (message, level) => ctx.ui.notify(message, level)
       runtime.setWorkingMessage =
         ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'

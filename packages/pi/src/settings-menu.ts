@@ -8,8 +8,7 @@ import { settingsRefusalText } from '@cortexkit/openai-auth-core/settings-diagno
 import type { PiSettingsStartup } from './settings-startup.ts'
 
 const controlsUnavailable = 'Controls require a shared settings file.'
-const warmLine = (enabled: boolean) =>
-  `Saved keep-warm preference: ${enabled ? 'on' : 'off'}.`
+const warmLine = (enabled: boolean) => `Keep-warm: ${enabled ? 'on' : 'off'}.`
 const appliesWhenAvailable = (feature: string) =>
   `This preference applies when ${feature} is available on this install.`
 
@@ -71,8 +70,9 @@ export function piSettingsSections(startup: PiSettingsStartup): {
           actions: [
             {
               id: 'enabled',
-              label: `Set keep-warm preference ${enabled ? 'off' : 'on'}`,
-              description: appliesWhenAvailable('keep-warm'),
+              label: `Turn keep-warm ${enabled ? 'off' : 'on'}`,
+              description:
+                'Replay the last completed request before its prompt cache expires.',
               knobs: [
                 {
                   kind: 'toggle',

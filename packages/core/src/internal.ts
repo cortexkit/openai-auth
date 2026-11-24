@@ -26,6 +26,7 @@ export {
   createCacheKeepManager,
   createOpenAICacheKeepAdapter,
   getCacheKeepWindow,
+  keepwarmReplayHeaders,
   type OpenAICacheKeepAdapterOptions,
   type OpenAICacheKeepManager,
   type OpenAICacheKeepManagerOptions,

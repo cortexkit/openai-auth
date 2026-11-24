@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import {
+  buildKeepwarmBody,
   flushForTest,
   initLogger,
   resetLoggerForTest,
@@ -25,6 +26,7 @@ import { streamSimple } from '@earendil-works/pi-ai/compat'
 import { chatgptAccessToken } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { installRawCodexWebSocket } from '../index.ts'
 import { RawWebSocket } from '../raw-ws-node.ts'
+import { clearPiStickyRouting, setPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 
 const model: Model<'openai-codex-responses'> = {
@@ -162,6 +164,8 @@ let sdkHttpEncodings: (string | null)[]
 let wireHttpEncodings: (string | null)[]
 let savedEnv: [string, string | undefined][]
 let snapshots: SettingsSnapshot[]
+let now: number
+let warmRequests: { url: string; headers: Headers; body: string }[]
 
 beforeEach(() => {
   savedEnv = [endpointEnv, liteEnv].map((name) => [name, process.env[name]])
@@ -170,6 +174,8 @@ beforeEach(() => {
   sdkHttpEncodings = []
   wireHttpEncodings = []
   snapshots = []
+  now = wireNow
+  warmRequests = []
   runtime = makeRuntime(dir)
 })
 
@@ -192,7 +198,7 @@ function makeRuntime(directory: string, settings?: SettingsSnapshot) {
     },
     createStream: createAssistantMessageEventStream,
     installWebSocket: installRawCodexWebSocket,
-    now: () => wireNow,
+    now: () => now,
     installationID,
     turnUuid: () =>
       `00000000-0000-7000-8000-${String(++nextTurn).padStart(12, '0')}`,
@@ -200,8 +206,16 @@ function makeRuntime(directory: string, settings?: SettingsSnapshot) {
       configPath: join(directory, 'openai-auth.json'),
       statePath: join(directory, 'openai-auth-state.json'),
     }),
-    fetchImpl: mockFetch(async () =>
-      Response.json({
+    fetchImpl: mockFetch(async (url, init) => {
+      if (init?.method === 'POST') {
+        warmRequests.push({
+          url: String(url),
+          headers: new Headers(init.headers),
+          body: String(init.body),
+        })
+        return sseResponse(99)
+      }
+      return Response.json({
         rate_limit: {
           primary_window: {
             used_percent: 10,
@@ -209,8 +223,8 @@ function makeRuntime(directory: string, settings?: SettingsSnapshot) {
             reset_at: wireNow / 1000 + 7200,
           },
         },
-      }),
-    ),
+      })
+    }),
   })
 }
 
@@ -233,12 +247,12 @@ async function openPiSettings(values: Record<string, unknown>) {
 }
 
 async function restartRuntime(settings: SettingsSnapshot) {
-  await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
+  await runtime.dispose()
   runtime = makeRuntime(dir, settings)
 }
 
 afterEach(async () => {
-  await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
+  await runtime.dispose()
   for (const snapshot of snapshots) snapshot.dispose()
   for (const [name, value] of savedEnv) {
     if (value === undefined) delete process.env[name]
@@ -284,6 +298,16 @@ async function httpRequest(
   const [request] = requests
   if (!request) throw new Error('No captured HTTP request')
   return request
+}
+
+async function tickAtWarmLead(id = sessionId) {
+  const manager = runtime['cacheKeep'].manager
+  const status = manager.status()
+  const target = status.targets.find(({ sessionKey }) => sessionKey === id)
+  expect(target).toBeDefined()
+  if (!target) throw new Error('Expected a captured primary request')
+  now = target.cacheExpiresAt - status.leadMs + 1
+  await manager.tick()
 }
 
 async function httpBody(...args: Parameters<typeof httpRequest>) {
@@ -1242,6 +1266,216 @@ test('Pi keeps gpt-6.2-sol WebSocket turns chained after injecting an effort upd
   ])
   expect(payloads.map((input) => input.length)).toEqual([1, 3, 5])
 })
+
+test('Pi keeps Lite warm at the configured HTTP endpoint with a fresh same-account bearer', async () => {
+  const endpoint = 'https://pi-custom.invalid/own/responses'
+  await restartRuntime(
+    await openPiSettings({
+      cache_keep_enabled: { pi: true },
+      codex_api_endpoint: { pi: endpoint },
+      responses_lite: { pi: true },
+    }),
+  )
+  const rotated = chatgptAccessToken('payload-test-account', 'fresh')
+  runtime.resolveMainToken = async () => rotated
+  const foreground = await httpRequest(
+    {
+      sessionId,
+      onPayload: (body) => ({
+        ...(body as object),
+        store: true,
+        max_output_tokens: 19,
+        max_completion_tokens: 29,
+        max_tokens: 39,
+      }),
+    },
+    effortModel,
+  )
+  expect(foreground.headers.get(liteHeader)).toBe('true')
+  expect(JSON.parse(foreground.json).max_output_tokens).toBe(19)
+  await runtime['cacheKeep'].manager.tick()
+  expect(warmRequests).toHaveLength(0)
+  await tickAtWarmLead()
+  await runtime['cacheKeep'].manager.tick()
+  expect(warmRequests).toHaveLength(1)
+  const warm = warmRequests[0]!
+  expect(warm.url).toBe(endpoint)
+  expect(warm.body).toBe(buildKeepwarmBody(foreground.json))
+  expect(JSON.parse(warm.body)).toHaveProperty('store', false)
+  for (const cap of [
+    'max_output_tokens',
+    'max_completion_tokens',
+    'max_tokens',
+  ])
+    expect(JSON.parse(warm.body)).not.toHaveProperty(cap)
+  expect(warm.headers.get(liteHeader)).toBe('true')
+  expect(warm.headers.get('authorization')).toBe(`Bearer ${rotated}`)
+  expect(warm.headers.get('chatgpt-account-id')).toBe('payload-test-account')
+  expect(warm.headers.get('originator')).toBe(
+    foreground.headers.get('originator'),
+  )
+})
+
+test('Pi warms the full WebSocket prefix over standard HTTP without breaking chaining', async () => {
+  await restartRuntime(
+    await openPiSettings({
+      cache_keep_enabled: { pi: true },
+      responses_lite: { pi: true },
+    }),
+  )
+  const { frames, connections } = await captureWebSocketFrames(
+    async (baseUrl) => {
+      const socketModel = { ...model, baseUrl }
+      const options = cachedWebSocketOptions()
+      const first = await runtime.stream(socketModel, context, options).result()
+      const secondContext = {
+        systemPrompt,
+        messages: [firstUser, first, secondUser],
+      }
+      const second = await runtime
+        .stream(socketModel, secondContext, options)
+        .result()
+      expect(second.responseId).toBe('resp_2')
+      await tickAtWarmLead()
+      expect(warmRequests).toHaveLength(1)
+      const warm = warmRequests[0]!
+      expect(warm.url).toBe(`${baseUrl}codex/responses`)
+      expect(warm.headers.get(liteHeader)).toBeNull()
+      expect(warm.headers.get('sec-websocket-key')).toBeNull()
+      const body = JSON.parse(warm.body)
+      expect(body).not.toHaveProperty('type')
+      expect(body).not.toHaveProperty('previous_response_id')
+      expect(Object.keys(body.client_metadata)).toEqual([
+        'x-codex-installation-id',
+        'x-codex-window-id',
+      ])
+      expect(body.input).toEqual([
+        developerMessage(systemPrompt, systemId),
+        userItem(firstUser.content),
+        expect.objectContaining({ role: 'assistant' }),
+        userItem(secondUser.content),
+      ])
+      const third = await runtime
+        .stream(
+          socketModel,
+          {
+            systemPrompt,
+            messages: [...secondContext.messages, second, thirdUser],
+          },
+          options,
+        )
+        .result()
+      expect(third.responseId).toBe('resp_3')
+    },
+  )
+  expect(connections).toBe(1)
+  expect(frames.map((frame) => frame.previous_response_id)).toEqual([
+    undefined,
+    'resp_1',
+    'resp_2',
+  ])
+  closeOpenAICodexWebSocketSessions(sessionId)
+})
+
+test('Pi keeps its clean capture when helper, rejected, aborted and superseded sends finish', async () => {
+  await restartRuntime(
+    await openPiSettings({ cache_keep_enabled: { pi: true } }),
+  )
+  const foreground = await httpRequest({ sessionId })
+  const otherContext = { systemPrompt, messages: [secondUser] }
+  await httpRequest({ sessionId, cacheRetention: 'none' }, model, otherContext)
+
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const options: SimpleStreamOptions = {
+    apiKey,
+    sessionId,
+    transport: 'sse',
+    maxRetries: 0,
+  }
+  const old = runtime.stream(model, otherContext, {
+    ...options,
+    fetch: mockFetch(async () => {
+      entered.resolve()
+      await release.promise
+      return sseResponse(3)
+    }),
+  })
+  try {
+    await entered.promise
+    const refused = await runtime
+      .stream(model, otherContext, {
+        ...options,
+        fetch: mockFetch(
+          async () =>
+            new Response('{"error":{"message":"Rejected"}}', { status: 400 }),
+        ),
+      })
+      .result()
+    expect(refused.stopReason).toBe('error')
+  } finally {
+    release.resolve()
+  }
+  expect((await old.result()).responseId).toBe('resp_3')
+
+  const controller = new AbortController()
+  const aborted = runtime.stream(model, otherContext, {
+    ...options,
+    signal: controller.signal,
+    fetch: mockFetch(async () => {
+      controller.abort()
+      return sseResponse(4)
+    }),
+  })
+  for await (const _event of aborted) {
+  }
+  expect(controller.signal.aborted).toBe(true)
+  await tickAtWarmLead()
+  expect(warmRequests.map(({ body }) => body)).toEqual([
+    buildKeepwarmBody(foreground.json),
+  ])
+})
+
+test.each(['account', 'identity', 'identity before first warm'])(
+  'Pi drops a changed %s without sending',
+  async (changed) => {
+    const key = Symbol.for('cortexkit.routing')
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    const cacheReports: Record<string, unknown>[] = []
+    Reflect.set(globalThis, key, (id: string) => ({
+      report(payload: Record<string, unknown>) {
+        if (id === sessionId) cacheReports.push(payload)
+      },
+    }))
+    try {
+      await restartRuntime(
+        await openPiSettings({ cache_keep_enabled: { pi: true } }),
+      )
+      await httpRequest({ sessionId })
+      const warmed = changed !== 'identity before first warm'
+      if (warmed) await tickAtWarmLead()
+      if (changed === 'account') setPiStickyRouting(sessionId, 'another-route')
+      else
+        runtime.resolveMainToken = async () =>
+          chatgptAccessToken('another-login')
+      await tickAtWarmLead()
+      expect(warmRequests).toHaveLength(warmed ? 1 : 0)
+      expect(runtime['cacheKeep'].manager.status().tracked).toBe(0)
+      expect(
+        cacheReports.filter(
+          (report) => report.kind === 'cache_touch' && report.source === 'warm',
+        ),
+      ).toHaveLength(warmed ? 1 : 0)
+      expect(
+        cacheReports.filter((report) => report.kind === 'cache_warm_stopped'),
+      ).toHaveLength(warmed ? 1 : 0)
+    } finally {
+      clearPiStickyRouting(sessionId)
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  },
+)
 
 function cachedWebSocketOptions(): SimpleStreamOptions {
   return {

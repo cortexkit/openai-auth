@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { parseJwtClaims } from '@cortexkit/openai-auth-core/internal'
 import {
   type PiCodexWireSession,
+  piCodexAccountId,
   shapePiCodexUpgrade,
   shapePiCodexWebSocketFrame,
 } from './codex-wire.ts'
@@ -19,7 +19,7 @@ type WebSocketAttempt = {
   token: string
   owner: object
   session: PiCodexWireSession | undefined
-  onSend(): void
+  onSend(headers: Headers): void
   onMessage(data: string): void
 }
 
@@ -35,10 +35,8 @@ function cacheKey({ session, token }: WebSocketAttempt): string | undefined {
   if (!session) return
   // pi-ai keys the cache by the original session ID and the nested JWT claim,
   // not by the prompt_cache_key sent on the wire or the plugin's routing account ID.
-  const accountId =
-    parseJwtClaims(token)?.['https://api.openai.com/auth']?.chatgpt_account_id
-  if (typeof accountId === 'string' && accountId)
-    return JSON.stringify([session.threadID, accountId])
+  const accountId = piCodexAccountId(token)
+  if (accountId) return JSON.stringify([session.threadID, accountId])
 }
 
 export function retireIdlePiCodexWebSocket(): void {
@@ -78,10 +76,13 @@ class PiRawCodexWebSocket extends RawWebSocket {
   >
   private readonly cacheKey?: string
   private activeAttempt?: ScopedAttempt
+  private readonly upgradeHeaders: Record<string, string>
 
   constructor(attempt: ScopedAttempt, headers: Record<string, string>) {
     const { endpoint, token, owner, cacheKey } = attempt
-    super(endpoint, shapePiCodexUpgrade(headers, attempt.session))
+    const upgradeHeaders = shapePiCodexUpgrade(headers, attempt.session)
+    super(endpoint, upgradeHeaders)
+    this.upgradeHeaders = upgradeHeaders
     this.binding = { endpoint, token, owner }
     // An open incumbent means pi-ai opened this as a temporary socket while
     // the cached connection was busy. It must not displace the cached one.
@@ -134,8 +135,9 @@ class PiRawCodexWebSocket extends RawWebSocket {
     if (!this.activeAttempt && this.cacheKey && this.readyState === 1)
       cachedSockets.set(this.cacheKey, this)
     this.activeAttempt = attempt
-    attempt.onSend()
-    super.send(shapePiCodexWebSocketFrame(data, attempt.session))
+    const frame = shapePiCodexWebSocketFrame(data, attempt.session)
+    super.send(frame)
+    attempt.onSend(new Headers(this.upgradeHeaders))
   }
 }
 

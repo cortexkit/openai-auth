@@ -606,7 +606,7 @@ for (const decision of ['separate', 'legacy'] as const) {
           (item) => item.id === 'cache',
         )
         expect(cache?.actions).toEqual([])
-        expect(cache?.lines).toContain('Saved keep-warm preference: off.')
+        expect(cache?.lines).toContain('Keep-warm: off.')
         const notice = 'Controls require a shared settings file.'
         expect(cache?.lines).toContain(notice)
         if (decision === 'separate')
@@ -721,6 +721,17 @@ isolatedTest(
     expect((await edit(menu, 'cache', 'enabled', { enabled: true })).ok).toBe(
       true,
     )
+    expect(result.snapshot!.get('cache_keep_enabled')).toBe(true)
+    expect(
+      (await menu.open(invocation)).menu.sections.find(
+        (item) => item.id === 'cache',
+      ),
+    ).toMatchObject({
+      lines: ['Keep-warm: on.'],
+      actions: [
+        expect.objectContaining({ id: 'enabled', label: 'Turn keep-warm off' }),
+      ],
+    })
     expect(
       (await edit(menu, 'diagnostics', 'dump', { enabled: true })).ok,
     ).toBe(true)

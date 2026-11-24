@@ -69,6 +69,7 @@ import {
   OpenAiVault,
   poolLimitsNamespace,
   quotaSnapshotPassesPolicy,
+  RESPONSES_LITE_HEADER,
   type RefreshAllQuotaResult,
   type RoutingMode,
   recordSessionCompletion,
@@ -80,7 +81,6 @@ import {
   resolveCodexEndpoint,
   resolveResponsesLite,
   type SessionDispatch,
-  sessionCacheKeepPlan,
   startVaultRoutingWait,
   ttlForModel,
   uuidV7,
@@ -118,6 +118,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
+import { PiCacheKeep } from './cache-keep.ts'
 import {
   retireIdlePiCodexWebSocket,
   withPiCodexWebSocketAttempt,
@@ -125,8 +126,10 @@ import {
 import {
   omitPiCodexDefaults,
   type PiCodexWireSession,
+  piCodexAccountId,
   piCodexHttpUrl,
   piCodexWebSocketUrl,
+  shapePiCacheCapture,
   shapePiCodexHttpRequest,
 } from './codex-wire.ts'
 import { PiMainAccount } from './main-account.ts'
@@ -218,6 +221,7 @@ interface StreamAttempt extends RouteAttempt {
 
 interface PiRouteExecution {
   canWait: boolean
+  isCurrent(): boolean
   wake?: PiWake
   vaultRetry?: PiVaultRetry
   attemptedVaultIds: Set<string>
@@ -314,12 +318,16 @@ export class PiOpenAIRuntime {
   readonly pool: PiPoolSource
   readonly vault: OpenAiVault
   readonly activity = createSessionActivityStore()
+  private readonly cacheKeep: PiCacheKeep
+  private readonly primaryRequests = new Map<string, object>()
   private readonly effortBySession = new Map<string, CodexEffortState>()
   private readonly frameTurns = new FrameTurnState()
   private readonly installationID: string
   private readonly codexEndpoint: string
   /** Captured from a live Pi context; absent in headless hosts. */
   setWorkingMessage: ((message?: string) => void) | undefined
+  /** Pi owns refresh of its native login, so use its resolver when a live context exists. */
+  resolveMainToken: (() => Promise<string | undefined>) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
   /**
    * Which accounts this runtime serves on prepaid credits, so the info line
@@ -418,6 +426,47 @@ export class PiOpenAIRuntime {
         fetchImpl,
         now: this.now,
       })
+    this.cacheKeep = new PiCacheKeep({
+      now: this.now,
+      endpoint: this.codexEndpoint,
+      fetchImpl: ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        fetchImpl()(input, init)) as typeof fetch,
+      vault: this.vault,
+      activity: this.activity,
+      settings: () => this.deps.settings?.view(),
+      resolveLocal: (id) => this.resolveWarmLocal(id),
+      accountKey: (id) =>
+        this.accounts(this.settings(this.storageCache?.storage ?? null)).find(
+          (account) => account.id === id,
+        )?.accountKey,
+      busy: (id) => this.primaryRequests.has(id),
+    })
+  }
+
+  private async resolveWarmLocal(id: string): Promise<string> {
+    if ((await this.readAuthority()) !== 'local')
+      throw new Error('Local accounts are not warmed while enrolled')
+    if (id === FORMER_MAIN_ID) {
+      const token = this.resolveMainToken
+        ? await this.resolveMainToken()
+        : this.main.currentToken()
+      if (token) {
+        const identity = piCodexAccountId(token)
+        if (identity && !this.vault.identities().has(identity)) return token
+      }
+    } else {
+      const settings = this.settings(await this.storage())
+      await this.pool.current()
+      const row = this.poolRowById(id)
+      if (row) {
+        await this.pool.refreshDueTokens([row], settings)
+        const account = this.accounts(settings).find(
+          (account) => !account.vault && account.id === id,
+        )
+        if (account?.token) return account.token
+      }
+    }
+    throw new Error('The serving Pi account has no usable token')
   }
 
   /**
@@ -525,6 +574,13 @@ export class PiOpenAIRuntime {
       () => {},
       () => {},
     )
+  }
+
+  async dispose(): Promise<void> {
+    this.resolveMainToken = undefined
+    this.primaryRequests.clear()
+    this.cacheKeep.stop()
+    await Promise.all([this.pool.dispose(), this.vault.dispose()])
   }
 
   // -------------------------------------------------------------------------
@@ -753,6 +809,12 @@ export class PiOpenAIRuntime {
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream {
     const outer = this.deps.createStream()
+    const primary =
+      piRequestKind(options) === 'primary' ? options?.sessionId : undefined
+    const request = {}
+    if (primary) this.primaryRequests.set(primary, request)
+    const isCurrent = () =>
+      !!primary && this.primaryRequests.get(primary) === request
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
     const setWorkingMessage = this.setWorkingMessage
     void (async () => {
@@ -762,6 +824,7 @@ export class PiOpenAIRuntime {
         const execution: PiRouteExecution = {
           canWait: false,
           attemptedVaultIds: new Set(),
+          isCurrent,
         }
         for (;;) {
           if (options?.signal?.aborted) return
@@ -858,14 +921,29 @@ export class PiOpenAIRuntime {
           endWait?.('resumed')
           endWait = undefined
           const { buffered, rest } = attempt.attempt
-          for (const event of buffered) outer.push(event)
+          if (
+            primary &&
+            isCurrent() &&
+            buffered.some((event) => isPiOutput(event) || event.type === 'done')
+          )
+            this.cacheKeep.served(primary, attempt.accountId)
+          let done: Extract<AssistantMessageEvent, { type: 'done' }> | undefined
+          const publish = (event: AssistantMessageEvent) => {
+            // A host can start its next request as soon as it receives `done`.
+            // Commit the selected attempt after draining it, before exposing that boundary.
+            if (event.type === 'done') done = event
+            else outer.push(event)
+          }
+          for (const event of buffered) publish(event)
           if (rest) {
             for (;;) {
               const next = await rest.next()
               if (next.done) break
-              outer.push(next.value)
+              publish(next.value)
             }
           }
+          if (primary && isCurrent()) this.primaryRequests.delete(primary)
+          if (done) outer.push(done)
           return
         }
       } catch (error) {
@@ -876,6 +954,7 @@ export class PiOpenAIRuntime {
           ),
         )
       } finally {
+        if (primary && isCurrent()) this.primaryRequests.delete(primary)
         endWait?.(options?.signal?.aborted ? 'cancelled' : 'abandoned')
         outer.end()
         restoreWebSocket()
@@ -992,7 +1071,14 @@ export class PiOpenAIRuntime {
                 return attempt
               })
             : account.token
-              ? this.attempt(model, context, options, account.id, account.token)
+              ? this.attempt(
+                  model,
+                  context,
+                  options,
+                  account.id,
+                  account.token,
+                  execution,
+                )
               : Promise.resolve(undefined),
       afterVaultLimit: async (account, feedback, routing) => {
         const refused = { kind: 'vault-refused' } as const
@@ -1125,8 +1211,8 @@ export class PiOpenAIRuntime {
     options: SimpleStreamOptions | undefined,
     accountId: string,
     token: string,
+    execution: PiRouteExecution,
     receipt?: QuotaReceipt,
-    execution?: { billingAttempt?: number },
     freeQuota = false,
   ): Promise<StreamAttempt> {
     const kind = piRequestKind(options)
@@ -1153,12 +1239,7 @@ export class PiOpenAIRuntime {
         }
       : undefined
     let billing: VaultBillingAttempt | undefined
-    if (
-      receipt?.credentialId &&
-      sessionId &&
-      execution &&
-      hasVaultRoutingAccessor()
-    ) {
+    if (receipt?.credentialId && sessionId && hasVaultRoutingAccessor()) {
       execution.billingAttempt = (execution.billingAttempt ?? 0) + 1
       billing = new VaultBillingAttempt(
         sessionId,
@@ -1166,12 +1247,7 @@ export class PiOpenAIRuntime {
         kind,
         model.id,
         execution.billingAttempt,
-        (sessionId) => {
-          const plan = sessionCacheKeepPlan(sessionId)
-          return plan && plan.mode !== 'off'
-            ? { on: false, stopReason: 'unsupported' }
-            : { on: false }
-        },
+        (sessionId) => this.cacheKeep.manager.warming(sessionId),
         freeQuota,
       )
     }
@@ -1186,6 +1262,10 @@ export class PiOpenAIRuntime {
     let headers: Headers | undefined
     let limit: { signal: LimitSignal; body: unknown } | undefined
     let wsCompleted = false
+    let logicalBody: string | undefined
+    let cacheCapture:
+      | (ReturnType<typeof shapePiCacheCapture> & { endpoint: string })
+      | undefined
     const status = () => limit?.signal.status ?? httpStatus
     const beginSend = () => {
       // pi-ai can retry a send or switch transports without ending its stream.
@@ -1194,7 +1274,29 @@ export class PiOpenAIRuntime {
       headers = undefined
       limit = undefined
       wsCompleted = false
+      cacheCapture = undefined
       reading = initialReading
+    }
+    const rememberSend = (
+      sentHeaders: Headers,
+      endpoint: string,
+      liteHttp: boolean,
+    ) => {
+      if (!wireSession || !sentTurn || !logicalBody || !execution.isCurrent())
+        return
+      try {
+        cacheCapture = {
+          ...shapePiCacheCapture(
+            logicalBody,
+            sentHeaders,
+            wireSession,
+            liteHttp,
+          ),
+          endpoint,
+        }
+      } catch {
+        // A background replay must not interrupt the foreground send.
+      }
     }
     const mergeReading = (snapshot: OAuthQuotaSnapshot | undefined) => {
       if (!snapshot) return
@@ -1288,6 +1390,16 @@ export class PiOpenAIRuntime {
             const body = { ...source }
             this.applyEffort(body, effortSessionId)
             source = body
+            if (
+              execution.isCurrent() &&
+              this.cacheKeep.enabled(effortSessionId)
+            ) {
+              try {
+                logicalBody = JSON.stringify(body)
+              } catch {
+                // Let pi-ai handle a body it cannot serialize on its own path.
+              }
+            }
           }
           // A cached socket may have gone idle while the caller built its payload.
           if (useWebSocketShim) retireIdlePiCodexWebSocket()
@@ -1299,11 +1411,21 @@ export class PiOpenAIRuntime {
             beginSend()
             try {
               const isCodexRequest = input === httpUrl
+              const shaped = isCodexRequest
+                ? shapePiCodexHttpRequest(init, wireSession, responsesLite)
+                : init
+              if (isCodexRequest && shaped !== init) {
+                const sentHeaders = new Headers(shaped?.headers)
+                rememberSend(
+                  sentHeaders,
+                  endpoint,
+                  responsesLite &&
+                    sentHeaders.get(RESPONSES_LITE_HEADER) === 'true',
+                )
+              }
               const response = await send(
                 isCodexRequest ? endpoint : input,
-                isCodexRequest
-                  ? shapePiCodexHttpRequest(init, wireSession, responsesLite)
-                  : init,
+                shaped,
               )
               const safe = await redactCredentialResponse(
                 response,
@@ -1391,7 +1513,10 @@ export class PiOpenAIRuntime {
               token,
               owner: this,
               session: wireSession,
-              onSend: beginSend,
+              onSend: (headers) => {
+                beginSend()
+                rememberSend(headers, endpoint, false)
+              },
               onMessage: (data) =>
                 mergeReading(this.observeWebSocketMessage(quotaDispatch, data)),
             },
@@ -1461,6 +1586,27 @@ export class PiOpenAIRuntime {
           ) {
             if (cacheSessionId && sentTurn)
               runtime.frameTurns.completed(cacheSessionId, sentTurn)
+            if (cacheSessionId && execution.isCurrent()) {
+              const effectiveAccountId = piCodexAccountId(token)
+              if (cacheCapture && effectiveAccountId) {
+                const { bodyText, replayHeaders, identity, endpoint } =
+                  cacheCapture
+                runtime.cacheKeep.capture({
+                  sessionKey: cacheSessionId,
+                  accountId,
+                  bodyText,
+                  meta: {
+                    replayHeaders,
+                    ...(identity !== undefined
+                      ? { chatgptAccountId: identity }
+                      : { effectiveAccountId }),
+                    routingSessionId: cacheSessionId,
+                    url: endpoint,
+                    credentialMode: receipt ? 'vault' : 'local',
+                  },
+                })
+              } else runtime.cacheKeep.forget(cacheSessionId)
+            }
             reportVaultRouting(sessionId, receipt, {
               status: completedStatus,
               headers: headers ?? new Headers(),
@@ -1526,7 +1672,7 @@ export class PiOpenAIRuntime {
     context: Context,
     options: SimpleStreamOptions | undefined,
     accountId: string,
-    execution: { billingAttempt?: number },
+    execution: PiRouteExecution,
     freeQuota = false,
     revalidate?: (
       receipt: QuotaReceipt,
@@ -1552,8 +1698,8 @@ export class PiOpenAIRuntime {
           options,
           accountId,
           token,
-          attempt,
           execution,
+          attempt,
           freeQuota,
         )
         return new Response(null, { status: last.httpStatus ?? 200 })

@@ -1,10 +1,9 @@
 /**
  * The `/openai` command: one menu for accounts, quota, routing, limits, the
  * cache, diagnostics and the provider extras, built on the shared command
- * menu (`@cortexkit/common-auth/commands`). Both hosts build their menu with
- * `createOpenAiMenu`; each supplies what only it has (OpenCode its cache
- * keep-warm manager and dumps, Pi its own login and pool; both their
- * connection to the Claustrum vault).
+ * menu (`@cortexkit/common-auth/commands`). Hosts supply their cache controls
+ * and Claustrum vault connection to `createOpenAiMenu`. Pi also supplies its
+ * own login and pool.
  *
  * The menu works on the account pool, so it needs a migrated install. Until
  * then `/openai` shows only why (`migrationNoticeMenu`).

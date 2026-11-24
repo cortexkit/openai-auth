@@ -3,6 +3,9 @@ import {
   applyCodexClientHeaders,
   type FrameTurn,
   isRecord,
+  keepwarmReplayHeaders,
+  parseJwtClaims,
+  RESPONSES_LITE_HEADER,
   shapeCodexRequest,
   stampCodexSession,
   stampCodexThreadHeaders,
@@ -13,6 +16,13 @@ import type {
 } from '@earendil-works/pi-ai'
 
 export const PI_CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
+
+/** pi-ai uses this JWT claim for both its account header and its socket cache. */
+export function piCodexAccountId(token: string): string | undefined {
+  const id =
+    parseJwtClaims(token)?.['https://api.openai.com/auth']?.chatgpt_account_id
+  return typeof id === 'string' && id ? id : undefined
+}
 
 // Match pi-ai's URL derivation before applying any plugin wire changes.
 export function piCodexHttpUrl(baseUrl: string): string {
@@ -136,6 +146,32 @@ export function shapePiCodexWebSocketFrame(
   const frame: unknown = JSON.parse(data)
   if (!isRecord(frame) || frame.type !== 'response.create') return data
   return JSON.stringify(shapePiCodexBody(frame, new Headers(), session, true))
+}
+
+/** Rebuild from the full logical body, not pi-ai's possibly chained wire frame. */
+export function shapePiCacheCapture(
+  logicalBody: string,
+  sentHeaders: Headers,
+  session: PiCodexWireSession,
+  liteHttp: boolean,
+) {
+  const body = JSON.parse(logicalBody) as Record<string, unknown>
+  delete body.type
+  delete body.previous_response_id
+  const metadata = body.client_metadata
+  if (isRecord(metadata)) {
+    delete metadata['x-codex-turn-metadata']
+    delete metadata['x-codex-ws-stream-request-start-ms']
+    delete metadata.ws_request_header_x_openai_internal_codex_responses_lite
+  }
+  const headers = new Headers(keepwarmReplayHeaders(sentHeaders))
+  headers.delete(RESPONSES_LITE_HEADER)
+  const shaped = shapePiCodexBody(body, headers, session, false, liteHttp)
+  return {
+    bodyText: JSON.stringify(shaped),
+    replayHeaders: keepwarmReplayHeaders(headers),
+    identity: sentHeaders.get('chatgpt-account-id') ?? undefined,
+  }
 }
 
 export function shapePiCodexHttpRequest(

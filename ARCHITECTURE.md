@@ -57,7 +57,7 @@ On Pi, `openai-auth.json` lives in Pi's agent folder (`PI_CODING_AGENT_DIR`, els
 | Shared core | `packages/core/src/` | Account store wrappers, OAuth, routing rules, limits, quota, the vault, reset credits, the `/openai` menu, redaction. |
 | Pool and migration | `packages/opencode/src/core/pool-*.ts`, `host-slot.ts`, `version-fence.ts`, `process-heartbeat.ts` | Reading the pool for requests, migrating into it, adopting later logins. |
 | Runtime layout | `packages/opencode/src/core/runtime-layout.ts`, `account-paths.ts` | The one-time move of runtime files out of OpenCode's config folder. |
-| Keep-warm | `packages/opencode/src/core/cachekeep.ts`, `v2/cache-keep.ts` | Replays a session's last request to keep its prompt cache alive. |
+| Keep-warm | `packages/core/src/cachekeep.ts`, `packages/opencode/src/v2/cache-keep.ts`, `packages/pi/src/cache-keep.ts` | Replays a session's last request to keep its prompt cache alive. |
 | Sidebar and RPC | `packages/opencode/src/sidebar-state.ts`, `tui.tsx`, `tui/`, `rpc/`, `v2/sidebar-publisher.ts` | The quota sidebar, its state file, and the loopback RPC between server and TUI. |
 | Setup | `packages/opencode/src/bin.ts`, `setup.ts` | `opencode-openai-auth setup`, over `@cortexkit/common-auth/setup`. |
 
@@ -157,11 +157,11 @@ Readings carry their own time and merge per window by the newer reading. A backg
 
 ## Cache keep-warm
 
-The Codex backend evicts an unused prompt cache after a while. Keep-warm (off by default; `/openai` → Cache) replays a session's last real request with `store: false` and its output-token caps removed, shortly before the cache would expire. The schedule, caps and backoff are common-auth's `CacheKeepManager`; `packages/opencode/src/core/cachekeep.ts` holds the Codex parts (which headers to replay, body capping, the GPT-5.6 lifetime and subagent policy). OpenCode 2 runs one manager per account store in the process (`v2/cache-keep.ts`). A warm goes only to the account that serves the session now, with a fresh credential, and only if that credential still signs in as the captured ChatGPT account. A successful warm counts as cache activity for the same-account wait. Pi has no keep-warm.
+The Codex backend evicts an unused prompt cache after a while. Keep-warm (off by default; `/openai` → Cache) replays a session's last real request with `store: false` and its output-token caps removed, shortly before the cache would expire. Common-auth's `CacheKeepManager` owns scheduling, caps and backoff; `packages/core/src/cachekeep.ts` builds the HTTP replay and sets the per-model profiles. OpenCode 2 runs one manager per account store in the process (`v2/cache-keep.ts`). Pi captures only clean primary completions. It replays the full logical prefix over HTTP at the foreground endpoint, even after a WebSocket delta, without changing the socket's continuation. A warm goes only to the account that serves the session now, with a fresh credential that still signs in as the captured ChatGPT account. A successful warm extends the cache lifetime the router considers when deciding whether to wait for the serving account's quota to reset.
 
 ## Commands, sidebar and RPC
 
-`/openai` is the one command on all three hosts (`createOpenAiMenu` in `packages/core/src/commands.ts`): accounts, quota, routing, killswitch floors, cache, diagnostics, vault, reset credits and session pins. It's built on common-auth's shared command menu. Each host adds what only it has: OpenCode its keep-warm, dumps and logging; Pi its own login. Until an install is migrated, `/openai` shows only why.
+`/openai` is the one command on all three hosts (`createOpenAiMenu` in `packages/core/src/commands.ts`): accounts, quota, routing, minimum remaining quota for admission, cache, diagnostics, vault, reset credits and session pins. It's built on common-auth's shared command menu. OpenCode adds its dumps and logging; Pi adds its own login. An install that needs migration shows a migration notice instead.
 
 On OpenCode 1, the server process writes `sidebar-state.json` and the TUI (`packages/opencode/src/tui.tsx`) reads it. The `/openai` dialog travels over a loopback HTTP RPC (`packages/opencode/src/rpc/`) on `127.0.0.1` with a per-process bearer token; port files live under the RPC folder per project. On OpenCode 2, `v2/control-plane.ts` registers the command and `tui/v2.tsx` drains the dialog for the displayed session. The sidebar component is common-auth's shared quota sidebar.
 
