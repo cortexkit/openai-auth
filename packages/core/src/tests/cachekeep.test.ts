@@ -1,5 +1,10 @@
 import { expect, test } from 'bun:test'
-import { createCacheKeepManager } from '../cachekeep'
+import {
+  CacheKeepManager,
+  createCacheKeepManager,
+  createOpenAICacheKeepAdapter,
+  type OpenAICacheKeepMeta,
+} from '../cachekeep'
 import { createSessionActivityStore } from '../session-cache-activity'
 
 const endpoint = 'https://codex.invalid/responses'
@@ -108,3 +113,76 @@ for (const hadWarm of [false, true]) {
     }
   })
 }
+
+test('one tick touches only the clean session when warm reports arrive later', async () => {
+  const routing = Symbol.for('cortexkit.routing')
+  const original = Object.getOwnPropertyDescriptor(globalThis, routing)
+  const touched: string[] = []
+  Reflect.set(globalThis, routing, (sessionId: string) => ({
+    report(value: { kind: string; source?: string }) {
+      if (value.kind === 'cache_touch' && value.source === 'warm')
+        touched.push(sessionId)
+    },
+  }))
+  let now = 1_800_000_000_000
+  const sent: (string | null)[] = []
+  const clean = 'warm-clean'
+  const report = Promise.withResolvers<void>()
+  const reports: Promise<unknown>[] = []
+  const adapter = createOpenAICacheKeepAdapter(
+    {
+      codexResponsesUrl: endpoint,
+      getMainToken: async () => 'token',
+      refreshFallback: async () => 'token',
+      fetchImpl: Object.assign(
+        async (_url: unknown, init?: RequestInit) => {
+          const sessionId = new Headers(init?.headers).get('session-id')
+          sent.push(sessionId)
+          return completed(sessionId === sessionKey)
+        },
+        { preconnect: () => {} },
+      ),
+    },
+    (key) => manager.remove(key),
+  )
+  const manager: CacheKeepManager<OpenAICacheKeepMeta> = new CacheKeepManager({
+    adapter: {
+      ...adapter,
+      onWarmed(key, input) {
+        const pending = report.promise.then(() =>
+          adapter.onWarmed?.(key, input),
+        )
+        reports.push(pending)
+        return pending
+      },
+    },
+    now: () => now,
+    ttlMs,
+    leadMs,
+  })
+  try {
+    for (const key of [sessionKey, clean])
+      manager.track({
+        sessionKey: key,
+        accountId: 'main',
+        bodyText: '{"model":"gpt-5.4"}',
+        meta: { replayHeaders: { 'session-id': key } },
+      })
+    now += ttlMs - leadMs + 1
+    await manager.tick()
+    expect(sent).toEqual([sessionKey, clean])
+    expect(touched).toEqual([])
+    report.resolve()
+    await Promise.all(reports)
+    expect(touched).toEqual([clean])
+    expect(manager.status().targets.map((target) => target.sessionKey)).toEqual(
+      [clean],
+    )
+  } finally {
+    report.resolve()
+    await Promise.all(reports)
+    manager.stop()
+    if (original) Object.defineProperty(globalThis, routing, original)
+    else Reflect.deleteProperty(globalThis, routing)
+  }
+})

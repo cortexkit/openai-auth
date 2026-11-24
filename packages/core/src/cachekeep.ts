@@ -16,6 +16,7 @@ import {
   type CacheKeepManagerOptions,
   type CacheKeepProfile,
   type CacheKeepTargetView,
+  type CacheKeepTrackInput,
   type CacheKeepWindow,
   normalizeCacheKeepWindow,
 } from '@cortexkit/common-auth/cachekeep'
@@ -456,15 +457,15 @@ export function resolveCacheKeepAccountIdentity(
 export function createOpenAICacheKeepAdapter(
   options: OpenAICacheKeepAdapterOptions,
   dropTarget?: (sessionKey: string, diagnostic: string) => void,
+  transformedWarms = new Set<string>(),
 ): CacheKeepAdapter<OpenAICacheKeepMeta> {
   const log = options.logger
   const activeAccount = options.activeAccount
   const observedReplies = new WeakMap<Response, KeepwarmReply>()
-  let skipWarmTouch: string | undefined
   return {
     plan: sessionCacheKeepPlan,
     onWarmed(sessionKey, input) {
-      if (skipWarmTouch !== sessionKey)
+      if (!transformedWarms.delete(sessionKey))
         reportSessionCacheWarmed(sessionKey, input)
     },
     onWarmStopped: reportSessionCacheWarmStopped,
@@ -687,12 +688,9 @@ export function createOpenAICacheKeepAdapter(
       }
       if (reply.transformedResponse) {
         if (dropTarget) {
-          // The manager is still on this target, but it calls onWarmed after
-          // readUsage even if the target was removed. Do not report that touch.
-          skipWarmTouch = target.sessionKey
-          queueMicrotask(() => {
-            skipWarmTouch = undefined
-          })
+          // Common-auth's CacheKeepManager calls onWarmed even after readUsage
+          // removes the target. Remember which warm touch to suppress.
+          transformedWarms.add(target.sessionKey)
           dropTarget(target.sessionKey, 'provider transformed input')
         }
         let chained: boolean | undefined
@@ -769,7 +767,15 @@ export function createCacheKeepManager(
           getMainToken: options.getMainToken,
           refreshFallback: options.refreshFallback,
         }
-  const manager: OpenAICacheKeepManager = new CacheKeepManager({
+  const transformedWarms = new Set<string>()
+  class ReplayManager extends CacheKeepManager<OpenAICacheKeepMeta> {
+    override track(input: CacheKeepTrackInput<OpenAICacheKeepMeta>) {
+      const result = super.track(input)
+      if (result.tracked) transformedWarms.delete(input.sessionKey)
+      return result
+    }
+  }
+  const manager: OpenAICacheKeepManager = new ReplayManager({
     ...managerOptions,
     logger,
     adapter: createOpenAICacheKeepAdapter(
@@ -793,6 +799,7 @@ export function createCacheKeepManager(
           sessionKey,
         })
       },
+      transformedWarms,
     ),
   })
   return manager
