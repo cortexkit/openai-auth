@@ -70,7 +70,7 @@ let snapshots: SettingsSnapshot[]
 let runtimes: PiOpenAIRuntime[]
 let sends: string[]
 let status: (token: string) => number
-let onSend: (() => Promise<void>) | undefined
+let onSend: ((url: string, headers: Headers) => Promise<void>) | undefined
 let quotaUsed: number
 let refreshes: number
 
@@ -151,13 +151,12 @@ const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         },
       },
     })
-  const token =
-    new Headers(init?.headers).get('authorization')?.replace('Bearer ', '') ??
-    ''
+  const headers = new Headers(init?.headers)
+  const token = headers.get('authorization')?.replace('Bearer ', '') ?? ''
   sends.push(token)
   const next = onSend
   onSend = undefined
-  await next?.()
+  await next?.(url, headers)
   const code = status(token)
   if (code !== 200)
     return Response.json(
@@ -223,10 +222,10 @@ async function ready(
   await value.main.pending()
 }
 
-async function send(value: PiOpenAIRuntime) {
+async function send(value: PiOpenAIRuntime, requestModel = model) {
   const events: AssistantMessageEvent[] = []
   for await (const event of value.stream(
-    model,
+    requestModel,
     { messages: [] },
     { apiKey: mainToken, fetch: fakeFetch, transport: 'sse' },
   ))
@@ -654,47 +653,62 @@ test('quota command resolves the refresh window without an intervening request',
   expect(refreshes).toBe(1)
 })
 
-test('Pi does not consume OpenCode-only knobs from the resolved view', async () => {
+test('Pi uses its Codex settings without reading OpenCode-only knobs', async () => {
+  const piEndpoint = 'https://pi.invalid/responses'
   write({
     routing_mode: 'fallback-first',
-    cache_keep_enabled: true,
-    log_level: 'trace',
-    request_dumps: true,
     web_sockets: true,
     raw_web_socket: true,
-    responses_lite: true,
-    codex_api_endpoint: 'https://not-a-provider.invalid',
+    responses_lite: { opencode: false, pi: true },
+    codex_api_endpoint: {
+      opencode: 'https://opencode.invalid/responses',
+      pi: piEndpoint,
+    },
     cost_zeroing: true,
   })
   const state = await snapshot()
-  const ignored = new Set([
-    'cacheKeep',
-    'cachekeep',
-    'logging',
-    'dump',
-    'dumpDir',
-    'dumpMaxBytes',
-    'webSockets',
-    'rawWebSocket',
-    'responsesLite',
-    'codexApiEndpoint',
-    'costZeroing',
-  ])
+  const ignored = new Set(['webSockets', 'rawWebSocket', 'costZeroing'])
+  const forbiddenReads: string[] = []
   const guarded: SettingsSnapshot = {
     ...state.value,
     view: (store) =>
       new Proxy(state.value.view(store), {
         get(target, key, receiver) {
-          if (typeof key === 'string' && ignored.has(key))
+          if (typeof key === 'string' && ignored.has(key)) {
+            forbiddenReads.push(key)
             throw new Error(`Pi read ignored setting ${key}`)
+          }
           return Reflect.get(target, key, receiver)
         },
       }),
   }
-  const value = runtime(guarded)
-  await ready(value)
-  await send(value)
-  expect(sends).toEqual([poolToken])
+  const envKeys = [
+    'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
+    'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
+  ]
+  const savedEnv = envKeys.map((key) => process.env[key])
+  for (const key of envKeys) delete process.env[key]
+  try {
+    const value = runtime(guarded)
+    await ready(value)
+    const requests: { url: string; lite: string | null }[] = []
+    onSend = async (url, headers) => {
+      requests.push({
+        url,
+        lite: headers.get('x-openai-internal-codex-responses-lite'),
+      })
+    }
+    await send(value, { ...model, id: 'gpt-6.2-sol' })
+    expect(forbiddenReads).toEqual([])
+    expect(sends).toEqual([poolToken])
+    expect(requests).toEqual([{ url: piEndpoint, lite: 'true' }])
+  } finally {
+    for (const [index, key] of envKeys.entries()) {
+      const saved = savedEnv[index]
+      if (saved === undefined) delete process.env[key]
+      else process.env[key] = saved
+    }
+  }
 })
 
 test('same-account wait is captured anew by the terminal-policy reader on each route', async () => {
