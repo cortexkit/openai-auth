@@ -211,6 +211,9 @@ export interface RuntimeLayoutLogger {
   warn(message: string, meta?: Record<string, unknown>): unknown
 }
 
+/** Starts a diagnostic phase and returns a callback to mark it finished. */
+type LayoutObserver = (phase: string, path?: string) => () => void
+
 export interface RuntimeLayoutOptions {
   /** This build's version, for the version fence. */
   version: string
@@ -233,6 +236,53 @@ export interface RuntimeLayoutOptions {
   }
   /** Test seam: how long to wait for the layout lock. */
   layoutLockWaitMs?: number
+}
+
+interface PrepareRuntimeLayoutOptions extends RuntimeLayoutOptions {
+  /** Test observer; called synchronously, never awaited. */
+  observePhase?: LayoutObserver
+}
+
+function observed<Args extends unknown[], T>(
+  observe: LayoutObserver,
+  phase: string,
+  path: string | undefined,
+  run: (...args: Args) => Promise<T>,
+  ...args: Args
+): Promise<T> {
+  const end = observe(phase, path)
+  try {
+    return run(...args).finally(end)
+  } catch (error) {
+    end()
+    throw error
+  }
+}
+
+function tracedSteps(
+  steps: NonNullable<RuntimeLayoutOptions['steps']>,
+  observe: LayoutObserver,
+): RuntimeLayoutOptions['steps'] {
+  return {
+    afterCopy:
+      steps.afterCopy &&
+      (() =>
+        observed(observe, 'test-step.after-copy', undefined, async () =>
+          steps.afterCopy?.(),
+        )),
+    afterMarker:
+      steps.afterMarker &&
+      (() =>
+        observed(observe, 'test-step.after-marker', undefined, async () =>
+          steps.afterMarker?.(),
+        )),
+    beforeRemove:
+      steps.beforeRemove &&
+      ((path) =>
+        observed(observe, 'test-step.before-remove', path, async () =>
+          steps.beforeRemove?.(path),
+        )),
+  }
 }
 
 interface LayoutMarker {
@@ -354,7 +404,7 @@ function logCleanupFailure(
  * plugin must not start.
  */
 export function prepareRuntimeLayout(
-  options: RuntimeLayoutOptions,
+  options: PrepareRuntimeLayoutOptions,
 ): Promise<RuntimeLayout> {
   const location = runtimeLayoutLocation()
   const decided = decidedRuntimeLayout(location)
@@ -362,7 +412,19 @@ export function prepareRuntimeLayout(
   const runKey = `${location.stateHomeDir}\0${location.key}`
   let run = processState.runs.get(runKey)
   if (!run) {
-    run = decide(location, options)
+    const observe = options.observePhase
+    run = (
+      observe
+        ? observed(
+            observe,
+            'layout.decide',
+            location.stateHomeDir,
+            decide,
+            location,
+            options,
+          )
+        : decide(location, options)
+    )
       .catch((error: unknown) => {
         // Anything not handled on the way stops the start the same way.
         if (error instanceof RuntimeLayoutRefusal) throw error
@@ -378,8 +440,13 @@ export function prepareRuntimeLayout(
 
 async function decide(
   location: RuntimeLayoutLocation,
-  options: RuntimeLayoutOptions,
+  options: PrepareRuntimeLayoutOptions,
 ): Promise<RuntimeLayout> {
+  const observe = options.observePhase
+  const steps =
+    observe && options.steps
+      ? tracedSteps(options.steps, observe)
+      : options.steps
   const log = options.log ?? createLogger('runtime-layout')
   if (hasLegacyRuntimeGeneration()) {
     // No filesystem inspection or lock is needed: old timers may still own
@@ -391,11 +458,14 @@ async function decide(
       ),
     )
     try {
-      await recordProcessLayout({
-        key: location.key,
-        layout: 'legacy',
-        version: options.version,
-      })
+      await writeHeartbeat(
+        {
+          key: location.key,
+          layout: 'legacy',
+          version: options.version,
+        },
+        observe,
+      )
     } catch (error) {
       // Reload must not refuse startup when auxiliary heartbeat writing fails.
       log.warn('process heartbeat not written', {
@@ -412,22 +482,28 @@ async function decide(
   const overrideInDestination = overrides.some((path) =>
     insideOrSame(path, stateDir),
   )
-  const fence = options.fence ?? defaultFence(options.version)
+  const checkFence = options.fence ?? defaultFence(options.version)
+  const fence = observe
+    ? () => observed(observe, 'version-fence.check', undefined, checkFence)
+    : checkFence
 
   const readOwnMarker = async () => {
-    const found = await readMarker(location, files)
-    await assertOwnFolder(location, found)
+    const found = await readMarker(location, files, observe)
+    await assertOwnFolder(location, found, observe)
     if (found?.oldFilesRemoved && found.keptVaultState)
-      await refuseKeptVaultOverride(location, files)
+      await refuseKeptVaultOverride(location, files, observe)
     return found
   }
 
   const stateHome = async (): Promise<RuntimeLayout> => {
-    await recordProcessLayout({
-      key: location.key,
-      layout: 'state-home',
-      version: options.version,
-    })
+    await writeHeartbeat(
+      {
+        key: location.key,
+        layout: 'state-home',
+        version: options.version,
+      },
+      observe,
+    )
     setRuntimeLayout(location, 'state-home')
     return 'state-home'
   }
@@ -435,28 +511,37 @@ async function decide(
   // Read-only first: whose folder this is, and whether the move is done.
   let marker = await readOwnMarker()
   if (marker?.oldFilesRemoved && !overrideInDestination) {
-    await noticeReappearedFiles(location, files, overrides, marker, log)
+    await noticeReappearedFiles(
+      location,
+      files,
+      overrides,
+      marker,
+      log,
+      observe,
+    )
     // A move that stopped right after its last marker write left its
     // `layout-moving.json`; it is removed below, under the layout lock.
     const manifestLeft = await exists(
       join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
+      observe,
     ).catch(() => true)
     const tempsLeft =
       !overriding &&
-      (await oldAtomicTemps(files).catch(() => [true])).length > 0
+      (await oldAtomicTemps(files, observe).catch(() => [true])).length > 0
     if (!manifestLeft && !tempsLeft) return stateHome()
   }
 
   // A state-home folder that is OpenCode's config folder itself (a link or a
   // mount) gets no chmod or note of its own; the move then stays legacy.
-  const aliased = await samePhysical(location.configDir, stateDir)
+  const aliased = await samePhysical(location.configDir, stateDir, observe)
   let layoutLock: RefreshFileLock
   try {
-    if (!aliased) await ensureOwnerOnlyDir(stateDir)
+    if (!aliased) await ensureOwnerOnlyDir(stateDir, observe)
     layoutLock = await takeLock(
       RUNTIME_LAYOUT_LOCK_NAME,
       markerPath,
       options.layoutLockWaitMs ?? LAYOUT_LOCK_WAIT_MS,
+      observe,
     )
   } catch (error) {
     // Only an existing marker settles the layout without the lock.
@@ -469,11 +554,14 @@ async function decide(
   const legacy = async (): Promise<RuntimeLayout> => {
     try {
       await lock.assertOwned()
-      await recordProcessLayout({
-        key: location.key,
-        layout: 'legacy',
-        version: options.version,
-      })
+      await writeHeartbeat(
+        {
+          key: location.key,
+          layout: 'legacy',
+          version: options.version,
+        },
+        observe,
+      )
     } catch (error) {
       throw new RuntimeLayoutRefusal(stateDir, errorClass(error))
     }
@@ -483,7 +571,7 @@ async function decide(
 
   try {
     marker = await readOwnMarker()
-    if (!aliased) await writeOwnerNote(location)
+    if (!aliased) await writeOwnerNote(location, observe)
 
     if (overrideInDestination) {
       logOnce(`${location.key}\0override`, () =>
@@ -499,10 +587,11 @@ async function decide(
         await finishOldFiles(location, files, markerPath, marker, lock, {
           fence,
           log,
-          steps: options.steps,
+          steps,
+          observe,
         })
       else if (marker.oldFilesRemoved)
-        await removeLeftoverManifest(location, lock, options.steps, log)
+        await removeLeftoverManifest(location, lock, steps, log, observe)
       return await stateHome()
     }
     // Only a process that resolves every runtime file at its default place
@@ -528,7 +617,8 @@ async function decide(
       const outcome = await moveFiles(location, files, markerPath, lock, {
         fence,
         log,
-        steps: options.steps,
+        steps,
+        observe,
         onMarker: () => {
           markerStarted = true
         },
@@ -638,11 +728,13 @@ async function moveFiles(
     fence: () => Promise<VersionFenceResult>
     log: RuntimeLayoutLogger
     steps?: RuntimeLayoutOptions['steps']
+    observe?: LayoutObserver
     onMarker: () => void
   },
 ): Promise<MoveOutcome> {
   const stateDir = location.stateHomeDir
-  const locks = await takeDataLocks(location, files)
+  const { observe } = input
+  const locks = await takeDataLocks(location, files, observe)
   let oldVaultEmptied = false
   try {
     // Heartbeats read again under every lock, right before the copy: a
@@ -651,49 +743,55 @@ async function moveFiles(
     const gate = await input.fence()
     if (!gate.open) return { kind: 'deferred', blockers: gate.blockers }
 
-    const aliases = await physicalAliases(location, files)
+    const aliases = await physicalAliases(location, files, observe)
     if (aliases.length > 0)
       return { kind: 'refused', reason: 'same-physical-file', paths: aliases }
 
     // A runtime file in the state-home folder that no unfinished move of ours
     // listed was put there by someone else (an override, by hand): leave it.
-    const listed = await readManifest(stateDir)
-    const foreign = (await destinationFiles(files)).filter(
+    const listed = await readManifest(stateDir, observe)
+    const foreign = (await destinationFiles(files, observe)).filter(
       (path) => !listed.has(path),
     )
     if (foreign.length > 0)
       return { kind: 'refused', reason: 'destination-in-use', paths: foreign }
 
-    const present = await presentOldFiles(files)
+    const present = await presentOldFiles(files, observe)
     await layoutLock.assertOwned()
-    await writeManifest(stateDir, [
-      ...new Set([...listed, ...present.map((file) => file.next)]),
-    ])
+    await writeManifest(
+      stateDir,
+      [...new Set([...listed, ...present.map((file) => file.next)])],
+      observe,
+    )
     // Copies an earlier, interrupted move left whose source has since gone.
     const wanted = new Set(present.map((file) => file.next))
     for (const path of listed) {
       if (wanted.has(path)) continue
       await layoutLock.assertOwned()
-      await unlink(path).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== 'ENOENT') throw error
-      })
+      await unlinkLayoutFile(path, observe).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT') throw error
+        },
+      )
     }
     for (const file of present) {
       await layoutLock.assertOwned()
-      await copyVerified(file)
+      await (observe
+        ? observed(observe, 'file.copy', file.old, copyVerified, file, observe)
+        : copyVerified(file))
     }
     await input.steps?.afterCopy?.()
 
     await layoutLock.assertOwned()
     for (const lock of locks) await lock.assertOwned()
-    const keptVaultState = await keepableVaultState(files, present)
+    const keptVaultState = await keepableVaultState(files, present, observe)
     const marker: LayoutMarker = {
       version: 1,
       oldDir: location.key,
       ...(keptVaultState ? { keptVaultState } : {}),
     }
     input.onMarker()
-    await writeMarker(markerPath, marker)
+    await writeMarker(markerPath, marker, observe)
     await input.steps?.afterMarker?.()
 
     await layoutLock.assertOwned()
@@ -702,8 +800,9 @@ async function moveFiles(
         log: input.log,
         keptVaultState,
         steps: input.steps,
+        observe,
       })
-      await removeOldAtomicTemps(files, layoutLock, locks, input.steps)
+      await removeOldAtomicTemps(files, layoutLock, locks, input.steps, observe)
     } catch (error) {
       if (!(error instanceof OldCredentialKeptError)) throw error
       // The copies are verified and the marker is written, so this process
@@ -714,15 +813,15 @@ async function moveFiles(
     }
     oldVaultEmptied = true
     await layoutLock.assertOwned()
-    await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
-    await removeManifestOwned(stateDir, layoutLock, input.steps)
+    await writeMarker(markerPath, { ...marker, oldFilesRemoved: true }, observe)
+    await removeManifestOwned(stateDir, layoutLock, input.steps, observe)
     return { kind: 'moved', moved: present.length > 0 }
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
     // The roster lock is released now, so the emptied old vault folder can
     // go; rmdir leaves a folder that still holds anything.
     if (oldVaultEmptied)
-      await removeOldVaultFolder(files, layoutLock, input.steps)
+      await removeOldVaultFolder(files, layoutLock, input.steps, observe)
   }
 }
 
@@ -742,9 +841,11 @@ async function finishOldFiles(
     fence: () => Promise<VersionFenceResult>
     log: RuntimeLayoutLogger
     steps?: RuntimeLayoutOptions['steps']
+    observe?: LayoutObserver
   },
 ): Promise<void> {
   let locks: RefreshFileLock[] = []
+  const { observe } = input
   let done = false
   // Which step failed, for the warning below.
   let step = 'fence'
@@ -754,11 +855,11 @@ async function finishOldFiles(
     // and kept the legacy layout has recorded it by then.
     if (!(await input.fence()).open) return
     step = 'data-locks'
-    locks = await takeDataLocks(location, files)
+    locks = await takeDataLocks(location, files, observe)
     step = 'fence'
     if (!(await input.fence()).open) return
     step = 'same-file-check'
-    const aliases = await physicalAliases(location, files)
+    const aliases = await physicalAliases(location, files, observe)
     if (aliases.length > 0) {
       logOnce(`${location.key}\0cleanup-aliased`, () =>
         input.log.warn(
@@ -773,28 +874,35 @@ async function finishOldFiles(
     if (!marker.oldFilesRemoved)
       await removeOldCopies(
         location,
-        await presentOldFiles(files),
+        await presentOldFiles(files, observe),
         layoutLock,
         {
           log: input.log,
           keptVaultState: marker.keptVaultState,
           steps: input.steps,
+          observe,
         },
       )
     step = 'remove-old-temps'
-    await removeOldAtomicTemps(files, layoutLock, locks, input.steps)
+    await removeOldAtomicTemps(files, layoutLock, locks, input.steps, observe)
     done = true
     step = 'marker'
     await layoutLock.assertOwned()
-    await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
+    await writeMarker(markerPath, { ...marker, oldFilesRemoved: true }, observe)
     step = 'manifest'
-    await removeManifestOwned(location.stateHomeDir, layoutLock, input.steps)
+    await removeManifestOwned(
+      location.stateHomeDir,
+      layoutLock,
+      input.steps,
+      observe,
+    )
   } catch (error) {
     if (error instanceof RuntimeLayoutRefusal) throw error
     logCleanupFailure(location, input.log, step, error)
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
-    if (done) await removeOldVaultFolder(files, layoutLock, input.steps)
+    if (done)
+      await removeOldVaultFolder(files, layoutLock, input.steps, observe)
   }
 }
 
@@ -808,9 +916,10 @@ async function removeLeftoverManifest(
   layoutLock: RefreshFileLock,
   steps: RuntimeLayoutOptions['steps'],
   log: RuntimeLayoutLogger,
+  observe?: LayoutObserver,
 ): Promise<void> {
   try {
-    await removeManifestOwned(location.stateHomeDir, layoutLock, steps)
+    await removeManifestOwned(location.stateHomeDir, layoutLock, steps, observe)
   } catch (error) {
     logOnce(`${location.key}\0manifest`, () =>
       log.warn(
@@ -826,12 +935,13 @@ async function removeManifestOwned(
   stateDir: string,
   layoutLock: RefreshFileLock,
   steps: RuntimeLayoutOptions['steps'],
+  observe?: LayoutObserver,
 ): Promise<void> {
   const path = join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE)
-  if (!(await exists(path))) return
+  if (!(await exists(path, observe))) return
   await steps?.beforeRemove?.(path)
   await layoutLock.assertOwned()
-  await removeManifest(stateDir)
+  await removeManifest(stateDir, observe)
 }
 
 /**
@@ -843,11 +953,12 @@ async function removeOldVaultFolder(
   files: LayoutFiles,
   layoutLock: RefreshFileLock,
   steps: RuntimeLayoutOptions['steps'],
+  observe?: LayoutObserver,
 ): Promise<void> {
   try {
     await steps?.beforeRemove?.(files.vault.old)
     await layoutLock.assertOwned()
-    await rmdir(files.vault.old)
+    await removeLayoutFolder(files.vault.old, observe)
   } catch {}
 }
 
@@ -861,17 +972,21 @@ async function removeOldVaultFolder(
 async function takeDataLocks(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
+  observe?: LayoutObserver,
 ): Promise<RefreshFileLock[]> {
   const locks: RefreshFileLock[] = []
   try {
-    if (await exists(location.configDir)) {
-      locks.push(await takeLock('save', files.state.old, DATA_LOCK_WAIT_MS))
-      if (await exists(files.vault.old))
+    if (await exists(location.configDir, observe)) {
+      locks.push(
+        await takeLock('save', files.state.old, DATA_LOCK_WAIT_MS, observe),
+      )
+      if (await exists(files.vault.old, observe))
         locks.push(
           await takeLock(
             'claustrum-roster-write',
             vaultPaths(files.vault.old, 'opencode').rosterPath,
             DATA_LOCK_WAIT_MS,
+            observe,
           ),
         )
       for (const sessions of files.sessions)
@@ -880,6 +995,7 @@ async function takeDataLocks(
             CODEX_SESSIONS_LOCK_NAME,
             sessions.old,
             DATA_LOCK_WAIT_MS,
+            observe,
           ),
         )
     }
@@ -941,12 +1057,10 @@ const NO_TOKEN_FILE = 'opencode-enrollment-no-token.json'
  */
 async function vaultModeWithoutToken(
   paths: ClaustrumEnrollmentPaths,
+  observe?: LayoutObserver,
 ): Promise<boolean> {
   try {
-    const status = await readClaustrumEnrollmentStatus(
-      paths,
-      OPENCODE_ENROLLMENT_NAME,
-    )
+    const status = await readEnrollment(paths, observe)
     return (
       status.state === 'blocked' &&
       status.code === 'missing_token' &&
@@ -957,10 +1071,27 @@ async function vaultModeWithoutToken(
   }
 }
 
+function readEnrollment(
+  paths: ClaustrumEnrollmentPaths,
+  observe?: LayoutObserver,
+) {
+  return observe
+    ? observed(
+        observe,
+        'private.read-enrollment',
+        paths.statePath,
+        readClaustrumEnrollmentStatus,
+        paths,
+        OPENCODE_ENROLLMENT_NAME,
+      )
+    : readClaustrumEnrollmentStatus(paths, OPENCODE_ENROLLMENT_NAME)
+}
+
 /** Refuse an explicit state path that leads back to the enrollment left for older versions. */
 async function refuseKeptVaultOverride(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
+  observe?: LayoutObserver,
 ): Promise<void> {
   const override = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
   if (
@@ -970,13 +1101,13 @@ async function refuseKeptVaultOverride(
     return
 
   const old = vaultPaths(files.vault.old, 'opencode')
-  const names = await folderFiles(files.vault.old).catch(() => [])
+  const names = await folderFiles(files.vault.old, observe).catch(() => [])
   if (names.length !== 1 || names[0] !== basename(old.statePath)) return
-  if (!(await vaultModeWithoutToken(old))) return
+  if (!(await vaultModeWithoutToken(old, observe))) return
 
-  const moved = await readClaustrumEnrollmentStatus(
+  const moved = await readEnrollment(
     vaultPaths(files.vault.next, 'opencode'),
-    OPENCODE_ENROLLMENT_NAME,
+    observe,
   ).catch(() => undefined)
   if (
     moved?.state !== 'approved' ||
@@ -1004,26 +1135,38 @@ async function refuseKeptVaultOverride(
 async function keepableVaultState(
   files: LayoutFiles,
   present: LayoutFile[],
+  observe?: LayoutObserver,
 ): Promise<string | undefined> {
   const state = vaultStateFile(files)
   if (!present.some((file) => file.old === state.old)) return undefined
   // The copy, verified byte for byte against the old file, read the way an
   // older version will read the old one after the move removes its token.
-  const keepable = await vaultModeWithoutToken({
-    statePath: state.next,
-    tokenPath: join(files.vault.next, NO_TOKEN_FILE),
-  })
-  return keepable ? sha256(await readFile(state.next)) : undefined
+  const keepable = await vaultModeWithoutToken(
+    {
+      statePath: state.next,
+      tokenPath: join(files.vault.next, NO_TOKEN_FILE),
+    },
+    observe,
+  )
+  return keepable
+    ? sha256(
+        await readLayoutBytes(state.next, observe, 'file.verify-kept-state'),
+      )
+    : undefined
 }
 
 /** True when `path` holds exactly the bytes whose SHA-256 is `hash`. */
 async function isKeptVaultState(
   path: string,
   hash: string | undefined,
+  observe?: LayoutObserver,
 ): Promise<boolean> {
   if (!hash) return false
   try {
-    return sha256(await readFile(path)) === hash
+    return (
+      sha256(await readLayoutBytes(path, observe, 'file.verify-kept-state')) ===
+      hash
+    )
   } catch {
     return false
   }
@@ -1039,11 +1182,13 @@ async function isKeptVaultState(
 async function isVaultStateLeftover(
   files: LayoutFiles,
   keptVaultState: string | undefined,
+  observe?: LayoutObserver,
 ): Promise<boolean> {
   if (!keptVaultState) return false
   const old = vaultPaths(files.vault.old, 'opencode')
-  if (await isKeptVaultState(old.statePath, keptVaultState)) return true
-  return vaultModeWithoutToken(old)
+  if (await isKeptVaultState(old.statePath, keptVaultState, observe))
+    return true
+  return vaultModeWithoutToken(old, observe)
 }
 
 /**
@@ -1080,7 +1225,10 @@ function isTransient(name: string): boolean {
 const ATOMIC_STAGE_SUFFIX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/
 
-async function oldAtomicTemps(files: LayoutFiles): Promise<string[]> {
+async function oldAtomicTemps(
+  files: LayoutFiles,
+  observe?: LayoutObserver,
+): Promise<string[]> {
   const vault = vaultPaths(files.vault.old, 'opencode')
   const targets = [
     files.state.old,
@@ -1093,7 +1241,7 @@ async function oldAtomicTemps(files: LayoutFiles): Promise<string[]> {
   for (const dir of new Set(targets.map(dirname))) {
     let entries: Dirent[]
     try {
-      entries = await readdir(dir, { withFileTypes: true })
+      entries = await readLayoutDir(dir, observe, 'directory.scan-atomic-temps')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
       throw error
@@ -1121,22 +1269,28 @@ async function removeOldAtomicTemps(
   layoutLock: RefreshFileLock,
   locks: RefreshFileLock[],
   steps: RuntimeLayoutOptions['steps'],
+  observe?: LayoutObserver,
 ): Promise<void> {
-  for (const path of await oldAtomicTemps(files)) {
+  for (const path of await oldAtomicTemps(files, observe)) {
     await steps?.beforeRemove?.(path)
     await layoutLock.assertOwned()
     for (const lock of locks) await lock.assertOwned()
-    await unlink(path).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') throw error
-    })
+    await unlinkLayoutFile(path, observe).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error
+      },
+    )
   }
 }
 
 /** The regular, non-transient files directly in a folder. */
-async function folderFiles(dir: string): Promise<string[]> {
+async function folderFiles(
+  dir: string,
+  observe?: LayoutObserver,
+): Promise<string[]> {
   let entries: Dirent[]
   try {
-    entries = await readdir(dir, { withFileTypes: true })
+    entries = await readLayoutDir(dir, observe, 'directory.list-runtime-files')
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT' || code === 'ENOTDIR') return []
@@ -1149,27 +1303,33 @@ async function folderFiles(dir: string): Promise<string[]> {
 }
 
 /** Every runtime file that exists in the old layout, paired with its target. */
-async function presentOldFiles(files: LayoutFiles): Promise<LayoutFile[]> {
+async function presentOldFiles(
+  files: LayoutFiles,
+  observe?: LayoutObserver,
+): Promise<LayoutFile[]> {
   const present: LayoutFile[] = []
-  if (await exists(files.state.old)) present.push(files.state)
-  for (const name of await folderFiles(files.vault.old))
+  if (await exists(files.state.old, observe)) present.push(files.state)
+  for (const name of await folderFiles(files.vault.old, observe))
     present.push({
       old: join(files.vault.old, name),
       next: join(files.vault.next, name),
     })
   for (const sessions of files.sessions)
-    if (await exists(sessions.old)) present.push(sessions)
+    if (await exists(sessions.old, observe)) present.push(sessions)
   return present
 }
 
 /** Every runtime file that exists in the state-home layout. */
-async function destinationFiles(files: LayoutFiles): Promise<string[]> {
+async function destinationFiles(
+  files: LayoutFiles,
+  observe?: LayoutObserver,
+): Promise<string[]> {
   const found: string[] = []
-  if (await exists(files.state.next)) found.push(files.state.next)
-  for (const name of await folderFiles(files.vault.next))
+  if (await exists(files.state.next, observe)) found.push(files.state.next)
+  for (const name of await folderFiles(files.vault.next, observe))
     found.push(join(files.vault.next, name))
   for (const sessions of files.sessions)
-    if (await exists(sessions.next)) found.push(sessions.next)
+    if (await exists(sessions.next, observe)) found.push(sessions.next)
   return found
 }
 
@@ -1181,6 +1341,7 @@ async function destinationFiles(files: LayoutFiles): Promise<string[]> {
 async function physicalAliases(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
+  observe?: LayoutObserver,
 ): Promise<string[]> {
   const pairs: [string, string][] = [
     [location.configDir, location.stateHomeDir],
@@ -1188,19 +1349,27 @@ async function physicalAliases(
     [files.state.old, files.state.next],
     ...files.sessions.map((file): [string, string] => [file.old, file.next]),
   ]
-  for (const name of await folderFiles(files.vault.old))
+  for (const name of await folderFiles(files.vault.old, observe))
     pairs.push([join(files.vault.old, name), join(files.vault.next, name)])
   const aliased: string[] = []
   for (const [old, next] of pairs)
-    if (await samePhysical(old, next)) aliased.push(old)
+    if (await samePhysical(old, next, observe)) aliased.push(old)
   return aliased
 }
 
 /** True when both paths exist and are one file or folder (device and inode). */
-async function samePhysical(a: string, b: string): Promise<boolean> {
+async function samePhysical(
+  a: string,
+  b: string,
+  observe?: LayoutObserver,
+): Promise<boolean> {
   const id = async (path: string) => {
     try {
-      const info = await stat(path, { bigint: true })
+      const info = await (observe
+        ? observed(observe, 'file.stat-identity', path, () =>
+            stat(path, { bigint: true }),
+          )
+        : stat(path, { bigint: true }))
       // A file system without inode numbers cannot prove anything here.
       return info.ino === 0n ? undefined : `${info.dev}:${info.ino}`
     } catch (error) {
@@ -1213,15 +1382,26 @@ async function samePhysical(a: string, b: string): Promise<boolean> {
   return left !== undefined && left === (await id(b))
 }
 
-async function copyVerified(file: LayoutFile): Promise<void> {
-  const bytes = await readFile(file.old)
+async function copyVerified(
+  file: LayoutFile,
+  observe?: LayoutObserver,
+): Promise<void> {
+  const bytes = await readLayoutBytes(
+    file.old,
+    observe,
+    'file.read-copy-source',
+  )
   const text = bytes.toString('utf8')
   // The private writer takes text; a file that is not valid UTF-8 would not
   // survive the round trip, so it is not copied at all.
   if (!Buffer.from(text, 'utf8').equals(bytes))
     throw new LayoutMoveError('not-utf8', `${file.old} is not UTF-8 text`)
-  await writePrivateText(file.next, text)
-  if (!(await readFile(file.next)).equals(bytes))
+  await writePrivateText(file.next, text, observe)
+  if (
+    !(await readLayoutBytes(file.next, observe, 'file.verify-copy')).equals(
+      bytes,
+    )
+  )
     throw new LayoutMoveError(
       'copy-mismatch',
       `${file.next} does not match ${file.old}`,
@@ -1250,8 +1430,10 @@ async function removeOldCopies(
     log: RuntimeLayoutLogger
     keptVaultState: string | undefined
     steps?: RuntimeLayoutOptions['steps']
+    observe?: LayoutObserver
   },
 ): Promise<void> {
+  const { observe } = input
   const kept: string[] = []
   const credentialsKept: string[] = []
   const files = layoutFiles(location)
@@ -1265,7 +1447,8 @@ async function removeOldCopies(
   for (const file of ordered) {
     await layoutLock.assertOwned()
     if (file.old === keptState) {
-      if (await isVaultStateLeftover(files, input.keptVaultState)) continue
+      if (await isVaultStateLeftover(files, input.keptVaultState, observe))
+        continue
       // An old credential still in place means another try at the next
       // start; the state file is judged then, beside what is left by then.
       if (credentialsKept.length > 0) continue
@@ -1274,14 +1457,21 @@ async function removeOldCopies(
       // a copy identical to the state-home one must still stay: removing it
       // would make an older version read this host as local. Differing bytes
       // are judged below.
-      if (input.keptVaultState && (await sameBytes(file.old, file.next)))
+      if (
+        input.keptVaultState &&
+        (await sameBytes(file.old, file.next, observe))
+      )
         continue
     }
     const credentials =
       file.old === files.state.old || insideOrSame(file.old, files.vault.old)
     if (
-      !(await unlinkIfIdentical(file, location.stateHomeDir, credentials, () =>
-        beforeRemove(file.old, layoutLock, input.steps),
+      !(await unlinkIfIdentical(
+        file,
+        location.stateHomeDir,
+        credentials,
+        () => beforeRemove(file.old, layoutLock, input.steps),
+        observe,
       ))
     )
       (credentials ? credentialsKept : kept).push(file.old)
@@ -1296,9 +1486,15 @@ async function removeOldCopies(
 }
 
 /** True when both files can be read and hold the same bytes. */
-async function sameBytes(a: string, b: string): Promise<boolean> {
+async function sameBytes(
+  a: string,
+  b: string,
+  observe?: LayoutObserver,
+): Promise<boolean> {
   try {
-    return (await readFile(a)).equals(await readFile(b))
+    return (await readLayoutBytes(a, observe, 'file.verify-old')).equals(
+      await readLayoutBytes(b, observe, 'file.verify-new'),
+    )
   } catch {
     return false
   }
@@ -1342,17 +1538,20 @@ async function unlinkIfIdentical(
   stateDir: string,
   credentials: boolean,
   guard: () => Promise<void>,
+  observe?: LayoutObserver,
 ): Promise<boolean> {
   const started = performance.now()
   for (const delay of SHARING_RETRY_DELAYS_MS) {
     if (delay > 0) await new Promise((done) => setTimeout(done, delay))
     let same: boolean
     try {
-      same = (await readFile(file.old)).equals(await readFile(file.next))
+      same = (
+        await readLayoutBytes(file.old, observe, 'file.verify-old')
+      ).equals(await readLayoutBytes(file.next, observe, 'file.verify-new'))
     } catch (error) {
       if (
         (error as NodeJS.ErrnoException).code === 'ENOENT' &&
-        !(await exists(file.old))
+        !(await exists(file.old, observe))
       )
         return true
       // A file Windows holds open is not evidence that the two copies differ:
@@ -1373,7 +1572,7 @@ async function unlinkIfIdentical(
     }
     await guard()
     try {
-      await unlink(file.old)
+      await unlinkLayoutFile(file.old, observe)
       return true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
@@ -1393,21 +1592,22 @@ async function noticeReappearedFiles(
   overrides: string[],
   marker: LayoutMarker,
   log: RuntimeLayoutLogger,
+  observe?: LayoutObserver,
 ): Promise<void> {
   // A file an override names is this process's own, wherever it is.
   const own = (path: string) =>
     overrides.some((override) => accountPathsCollide(override, path))
-  if (!own(files.state.old) && (await exists(files.state.old)))
+  if (!own(files.state.old) && (await exists(files.state.old, observe)))
     throw credentialConflict(location.stateHomeDir, files.state)
   if (!own(files.vault.old)) {
     const keptState = vaultStateFile(files).old
-    for (const name of await folderFiles(files.vault.old)) {
+    for (const name of await folderFiles(files.vault.old, observe)) {
       const old = join(files.vault.old, name)
       // The enrollment state file the move left on purpose, as it moved or as
       // an older version rewrote it without leaving vault mode.
       if (
         old === keptState &&
-        (await isVaultStateLeftover(files, marker.keptVaultState))
+        (await isVaultStateLeftover(files, marker.keptVaultState, observe))
       )
         continue
       if (!own(old))
@@ -1420,7 +1620,7 @@ async function noticeReappearedFiles(
   const found: string[] = []
   try {
     for (const file of files.sessions)
-      if (await exists(file.old)) found.push(file.old)
+      if (await exists(file.old, observe)) found.push(file.old)
   } catch {
     // Only a warning depends on this; an unreadable folder warns nothing.
   }
@@ -1447,6 +1647,7 @@ async function noticeReappearedFiles(
 async function readMarker(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
+  observe?: LayoutObserver,
 ): Promise<LayoutMarker | undefined> {
   const stateDir = location.stateHomeDir
   const path = join(stateDir, RUNTIME_LAYOUT_MARKER_FILE)
@@ -1456,7 +1657,7 @@ async function readMarker(
     if (attempt > 0)
       await new Promise((done) => setTimeout(done, MARKER_READ_RETRY_MS))
     try {
-      text = await readFile(path, 'utf8')
+      text = await readLayoutText(path, observe, 'marker.read')
       break
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -1492,7 +1693,9 @@ async function readMarker(
   } catch {}
   // Files in the destination may be the only surviving copies. Their presence
   // does not prove the move completed or authorize rebuilding the marker.
-  const destination = await destinationFiles(files).catch(() => undefined)
+  const destination = await destinationFiles(files, observe).catch(
+    () => undefined,
+  )
   throw new RuntimeLayoutRefusal(
     stateDir,
     'malformed-marker',
@@ -1509,13 +1712,18 @@ async function readMarker(
 async function assertOwnFolder(
   location: RuntimeLayoutLocation,
   marker: LayoutMarker | undefined,
+  observe?: LayoutObserver,
 ): Promise<void> {
   const stateDir = location.stateHomeDir
   if (marker && marker.oldDir !== location.key)
     throw foreignFolder(stateDir, location.key)
   let text: string
   try {
-    text = await readFile(join(stateDir, RUNTIME_CONFIG_DIR_NOTE_FILE), 'utf8')
+    text = await readLayoutText(
+      join(stateDir, RUNTIME_CONFIG_DIR_NOTE_FILE),
+      observe,
+      'owner-note.read',
+    )
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT' || code === 'ENOTDIR') return
@@ -1529,20 +1737,31 @@ async function assertOwnFolder(
 }
 
 /** Name this folder's config folder, once; the caller holds the layout lock. */
-async function writeOwnerNote(location: RuntimeLayoutLocation): Promise<void> {
+async function writeOwnerNote(
+  location: RuntimeLayoutLocation,
+  observe?: LayoutObserver,
+): Promise<void> {
   const path = join(location.stateHomeDir, RUNTIME_CONFIG_DIR_NOTE_FILE)
-  if (await exists(path)) return
+  if (await exists(path, observe)) return
   await writePrivateText(
     path,
     `${JSON.stringify({ version: 1, configDir: location.key }, null, 2)}\n`,
+    observe,
   )
 }
 
 /** The copies an unfinished move listed; empty when there is none. */
-async function readManifest(stateDir: string): Promise<Set<string>> {
+async function readManifest(
+  stateDir: string,
+  observe?: LayoutObserver,
+): Promise<Set<string>> {
   let text: string
   try {
-    text = await readFile(join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE), 'utf8')
+    text = await readLayoutText(
+      join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
+      observe,
+      'manifest.read',
+    )
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set()
     throw error
@@ -1559,23 +1778,47 @@ async function readManifest(stateDir: string): Promise<Set<string>> {
   return new Set()
 }
 
-async function writeManifest(stateDir: string, paths: string[]): Promise<void> {
+async function writeManifest(
+  stateDir: string,
+  paths: string[],
+  observe?: LayoutObserver,
+): Promise<void> {
   await writePrivateText(
     join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
     `${JSON.stringify({ version: 1, files: paths }, null, 2)}\n`,
+    observe,
   )
 }
 
-async function removeManifest(stateDir: string): Promise<void> {
-  await unlink(join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE)).catch(
-    (error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') throw error
-    },
-  )
+async function removeManifest(
+  stateDir: string,
+  observe?: LayoutObserver,
+): Promise<void> {
+  await unlinkLayoutFile(
+    join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
+    observe,
+  ).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error
+  })
 }
 
-async function writeMarker(path: string, marker: LayoutMarker): Promise<void> {
-  await writePrivateText(path, `${JSON.stringify(marker, null, 2)}\n`)
+async function writeMarker(
+  path: string,
+  marker: LayoutMarker,
+  observe?: LayoutObserver,
+): Promise<void> {
+  const text = `${JSON.stringify(marker, null, 2)}\n`
+  await (observe
+    ? observed(
+        observe,
+        'marker.write',
+        path,
+        writePrivateText,
+        path,
+        text,
+        observe,
+      )
+    : writePrivateText(path, text))
 }
 
 /**
@@ -1583,13 +1826,22 @@ async function writeMarker(path: string, marker: LayoutMarker): Promise<void> {
  * the file and then its folder synced on POSIX; the private-files ACL and a
  * file flush on Windows, where folder sync is not available.
  */
-async function writePrivateText(path: string, text: string): Promise<void> {
-  await ensureOwnerOnlyDir(dirname(path))
-  await writeJsonAtomic(path, null, {
+async function writePrivateText(
+  path: string,
+  text: string,
+  observe?: LayoutObserver,
+): Promise<void> {
+  await ensureOwnerOnlyDir(dirname(path), observe)
+  const options = {
     serialize: () => text,
     durable: true,
-    durability: 'file-only-on-windows',
-  })
+    durability: 'file-only-on-windows' as const,
+  }
+  await (observe
+    ? observed(observe, 'private.write', path, () =>
+        writeJsonAtomic(path, null, options),
+      )
+    : writeJsonAtomic(path, null, options))
 }
 
 /**
@@ -1597,16 +1849,48 @@ async function writePrivateText(path: string, text: string): Promise<void> {
  * heartbeat folder does). On Windows the private-files writer and the lock
  * create every missing folder with an owner-only ACL themselves.
  */
-async function ensureOwnerOnlyDir(path: string): Promise<void> {
+async function ensureOwnerOnlyDir(
+  path: string,
+  observe?: LayoutObserver,
+): Promise<void> {
   if (process.platform === 'win32') return
-  await mkdir(path, { recursive: true, mode: 0o700 })
-  await chmod(path, 0o700)
+  await (observe
+    ? observed(observe, 'directory.mkdir', path, () =>
+        mkdir(path, { recursive: true, mode: 0o700 }),
+      )
+    : mkdir(path, { recursive: true, mode: 0o700 }))
+  await (observe
+    ? observed(observe, 'directory.chmod', path, chmod, path, 0o700)
+    : chmod(path, 0o700))
 }
 
-async function takeLock(
+function takeLock(
   name: string,
   path: string,
   waitMs: number,
+  observe?: LayoutObserver,
+): Promise<RefreshFileLock> {
+  if (!observe) return waitForLock(name, path, waitMs)
+  const label = `${name}: ${path}`
+  return observed(
+    observe,
+    'lock.acquire',
+    label,
+    waitForLock,
+    name,
+    path,
+    waitMs,
+    observe,
+    label,
+  )
+}
+
+async function waitForLock(
+  name: string,
+  path: string,
+  waitMs: number,
+  observe?: LayoutObserver,
+  label?: string,
 ): Promise<RefreshFileLock> {
   const started = performance.now()
   for (;;) {
@@ -1617,6 +1901,7 @@ async function takeLock(
         path,
         ttlMs: LOCK_TTL_MS,
         renew: true,
+        ...(observe && observeRenewal(observe, label)),
       })
     } catch (error) {
       // On Windows a holder that releases while this attempt reads its lock
@@ -1624,16 +1909,131 @@ async function takeLock(
       // again rather than fail.
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    if (lock) return lock
+    if (lock) {
+      if (!observe) return lock
+      const held = lock
+      return {
+        ...held,
+        assertOwned: () =>
+          observed(observe, 'lock.assert-owned', label, () =>
+            held.assertOwned(),
+          ),
+        release: (signal) =>
+          observed(observe, 'lock.release', label, () => held.release(signal)),
+      }
+    }
     if (performance.now() - started >= waitMs)
       throw new LayoutMoveError('lock-timeout', `${name} lock at ${path}`)
     await new Promise((done) => setTimeout(done, LOCK_RETRY_MS))
   }
 }
 
-async function exists(path: string): Promise<boolean> {
+function observeRenewal(
+  observe: LayoutObserver,
+  label?: string,
+): Pick<
+  Parameters<typeof acquireRefreshFileLock>[0],
+  'onRenewalTimer' | 'onStep'
+> {
+  let end: (() => void) | undefined
+  const point = (event: string) => observe(`lock.renewal.${event}`, label)
+  return {
+    onRenewalTimer(event) {
+      end?.()
+      if (event === 'scheduled') end = point(event)
+      else {
+        end = undefined
+        point(event)()
+      }
+    },
+    onStep(step) {
+      // There is no timer-fired event. Until the first milestone, a pending
+      // timer and a renewal stalled while acquiring its marker look alike.
+      if (
+        !end ||
+        !(
+          step.startsWith('renewal-') ||
+          step === 'eviction-marker-acquired' ||
+          step === 'relinquish-read'
+        )
+      )
+        return
+      end()
+      if (step === 'renewal-finished') {
+        end = undefined
+        point(step)()
+      } else end = point(step)
+    },
+  }
+}
+
+function writeHeartbeat(
+  input: Parameters<typeof recordProcessLayout>[0],
+  observe?: LayoutObserver,
+) {
+  return observe
+    ? observed(
+        observe,
+        'heartbeat.write',
+        input.layout,
+        recordProcessLayout,
+        input,
+      )
+    : recordProcessLayout(input)
+}
+
+function readLayoutBytes(
+  path: string,
+  observe: LayoutObserver | undefined,
+  phase: string,
+) {
+  return observe
+    ? observed(observe, phase, path, () => readFile(path))
+    : readFile(path)
+}
+
+function readLayoutText(
+  path: string,
+  observe: LayoutObserver | undefined,
+  phase: string,
+) {
+  return observe
+    ? observed(observe, phase, path, () => readFile(path, 'utf8'))
+    : readFile(path, 'utf8')
+}
+
+function readLayoutDir(
+  path: string,
+  observe: LayoutObserver | undefined,
+  phase: string,
+) {
+  return observe
+    ? observed(observe, phase, path, () =>
+        readdir(path, { withFileTypes: true }),
+      )
+    : readdir(path, { withFileTypes: true })
+}
+
+function unlinkLayoutFile(path: string, observe?: LayoutObserver) {
+  return observe
+    ? observed(observe, 'file.unlink', path, unlink, path)
+    : unlink(path)
+}
+
+function removeLayoutFolder(path: string, observe?: LayoutObserver) {
+  return observe
+    ? observed(observe, 'directory.rmdir', path, rmdir, path)
+    : rmdir(path)
+}
+
+async function exists(
+  path: string,
+  observe?: LayoutObserver,
+): Promise<boolean> {
   try {
-    await stat(path)
+    await (observe
+      ? observed(observe, 'file.stat', path, stat, path)
+      : stat(path))
     return true
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code

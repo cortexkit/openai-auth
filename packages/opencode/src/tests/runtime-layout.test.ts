@@ -6,7 +6,7 @@
 // than named imports, so each one fails on its own assertion against a build
 // that lacks them instead of the whole file failing to load.
 import { dlopen, FFIType, ptr } from 'bun:ffi'
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, it as bunIt, describe, expect } from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -22,7 +22,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   enrollmentAuthority,
@@ -54,6 +54,7 @@ import {
 } from '../core/runtime-layout'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { processHeartbeatDir } from '../core/version-fence'
+import type { LayoutPhaseMessage } from './fixtures/runtime-layout-process'
 import { restoreEnv, unsetEnv } from './setup-env'
 
 const VERSION = '1.7.0'
@@ -69,11 +70,154 @@ const POSIX = process.platform !== 'win32'
 let root: string
 let saved: Record<string, string | undefined>
 let logged: { level: string; message: string; meta?: unknown }[]
-let currentCase: { ended: boolean }
+let currentCase: CaseTrace
+
+const SLOW_CASE_MS = 2_000
+
+class CaseTrace {
+  readonly started = performance.now()
+  readonly phases: {
+    name: string
+    subject?: string
+    start: number
+    end?: number
+  }[] = []
+  name = 'case setup'
+  root?: string
+  ended = false
+  outcome: 'running' | 'passed' | 'failed' = 'running'
+
+  observe = (name: string, subject?: string) => this.record(name, subject)
+
+  record(name: string, subject?: string, start = performance.now()) {
+    if (this.ended) return () => {}
+    const phase = { name, subject, start, end: undefined as number | undefined }
+    this.phases.push(phase)
+    return (end = performance.now()) => {
+      if (!this.ended) phase.end = end
+    }
+  }
+
+  finish() {
+    const now = performance.now()
+    const elapsed = now - this.started
+    this.ended = true
+    if (this.outcome === 'passed' && elapsed <= SLOW_CASE_MS) return
+    const reason =
+      this.outcome === 'running'
+        ? 'body unfinished'
+        : this.outcome === 'failed'
+          ? 'failed'
+          : 'slow'
+    const lines = this.phases
+      .sort((a, b) => a.start - b.start)
+      .map(({ name, subject, start, end }) => {
+        const unfinished =
+          end !== undefined
+            ? ''
+            : name.endsWith('lock.renewal.scheduled')
+              ? ' (renewal may be in progress; no later milestone)'
+              : name.includes('lock.renewal.')
+                ? ' (renewal in progress; no later milestone)'
+                : ' (unfinished)'
+        const shown = this.root
+          ? subject?.replace(`${this.root}${sep}`, '')
+          : subject
+        return `  +${(start - this.started).toFixed(1)} ms ${(Math.max(start, end ?? now) - start).toFixed(1)} ms ${name}${shown ? ` ${shown}` : ''}${unfinished}`
+      })
+    console.error(
+      [
+        `[runtime-layout trace] ${this.name} (${reason}, ${elapsed.toFixed(1)} ms)`,
+        ...lines,
+      ].join('\n'),
+    )
+  }
+}
+
+function testStep<T>(name: string, run: () => T, subject?: string): T {
+  const end = currentCase.observe(name, subject)
+  try {
+    return run()
+  } finally {
+    end()
+  }
+}
+
+async function testAsyncStep<T>(
+  name: string,
+  run: () => Promise<T>,
+  subject?: string,
+): Promise<T> {
+  const end = currentCase.observe(name, subject)
+  try {
+    return await run()
+  } finally {
+    end()
+  }
+}
+
+type CaseBody<Args extends unknown[]> = (
+  ...args: Args
+) => undefined | Promise<unknown>
+
+function traceBody<Args extends unknown[]>(name: string, body: CaseBody<Args>) {
+  return (...args: Args) => {
+    const testCase = currentCase
+    let index = 0
+    testCase.name = name.replace(/%s/g, () => String(args[index++]))
+    const end = testCase.observe('test.body')
+    const finish = (outcome: 'passed' | 'failed') => {
+      testCase.outcome = outcome
+      end()
+    }
+    try {
+      const result = body(...args)
+      if (result)
+        return result.then(
+          () => finish('passed'),
+          (error: unknown) => {
+            finish('failed')
+            throw error
+          },
+        )
+      finish('passed')
+    } catch (error) {
+      finish('failed')
+      throw error
+    }
+  }
+}
+
+// Bun 1.3's afterEach does not receive the test outcome. Capture throws and
+// rejections here; a body still running at teardown did not finish on time.
+function tracedCases(register: typeof bunIt) {
+  return Object.assign(
+    (name: string, body: CaseBody<[]>, timeout?: number) =>
+      register(name, traceBody(name, body), timeout),
+    {
+      skipIf: (condition: boolean) => tracedCases(register.skipIf(condition)),
+      each: <const Row>(rows: readonly Row[]) => {
+        type Args = Row extends readonly unknown[] ? [...Row] : [Row]
+        return (name: string, body: CaseBody<Args>, timeout?: number) => {
+          const run = traceBody(name, body)
+          register.each(rows as readonly unknown[])(
+            name,
+            (...args: unknown[]) => run(...(args as Args)),
+            timeout,
+          )
+        }
+      },
+    },
+  )
+}
+
+const it = tracedCases(bunIt)
 
 beforeEach(() => {
+  currentCase = new CaseTrace()
+  const end = currentCase.observe('test.setup')
   root = realpathSync.native(mkdtempSync(join(tmpdir(), 'runtime-layout-')))
-  currentCase = { ended: false }
+  currentCase.root = root
   saved = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]))
   process.env.XDG_CONFIG_HOME = join(root, 'config')
   process.env.XDG_STATE_HOME = join(root, 'state')
@@ -82,6 +226,7 @@ beforeEach(() => {
   unsetEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
   resetProcess()
   logged = []
+  end()
 })
 
 /** Every `prepare()` of the current test that has not settled yet. */
@@ -108,7 +253,7 @@ afterEach(async () => {
   // A timeout does not stop an async test body. Reject its prepare continuation
   // before it can read files or reset the next test's process state. The
   // underlying filesystem work must still settle before removing its folder.
-  currentCase.ended = true
+  currentCase.finish()
   await settlePreparing()
   for (const name of ENV_NAMES) restoreEnv(name, saved[name])
   resetProcess()
@@ -140,9 +285,11 @@ async function settlePreparing(): Promise<void> {
 
 /** Stands in for a new process: nothing decided, nothing logged. */
 function resetProcess() {
+  const end = currentCase.observe('test.reset-process')
   __resetRuntimeLayoutsForTest()
   __resetRuntimeLayoutRunsForTest()
   __resetProcessHeartbeatForTest()
+  end()
 }
 
 /** The module's exports, including ones a build might lack. */
@@ -156,6 +303,7 @@ function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
       throw new Error('runtime-layout test case already ended')
   }
   assertActive()
+  const end = testCase.observe('test.prepare')
   const run = prepareRuntimeLayout({
     version: VERSION,
     log: {
@@ -163,12 +311,15 @@ function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
       warn: (message, meta) => logged.push({ level: 'warn', message, meta }),
     },
     ...options,
+    observePhase: testCase.observe,
   }).then(
     (layout) => {
+      end()
       assertActive()
       return layout
     },
     (error) => {
+      end()
       assertActive()
       throw error
     },
@@ -186,9 +337,15 @@ const runtimeDir = () => runtimeLayoutLocation().stateHomeDir
 const stateRoot = () => join(root, 'state', 'cortexkit', 'openai-auth')
 
 function writePrivate(path: string, text: string) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-  writeFileSync(path, text, { mode: 0o600 })
-  chmodSync(path, 0o600)
+  testStep(
+    'test.write-fixture',
+    () => {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+      writeFileSync(path, text, { mode: 0o600 })
+      chmodSync(path, 0o600)
+    },
+    path,
+  )
 }
 
 /**
@@ -266,11 +423,19 @@ function seed(dir: string, files: Record<string, string>) {
 }
 
 function present(dir: string, files: Record<string, string>) {
-  return Object.fromEntries(
-    Object.keys(files).map((relative) => {
-      const path = join(dir, relative)
-      return [relative, existsSync(path) ? readFileSync(path, 'utf8') : null]
-    }),
+  return testStep(
+    'test.read-fixtures',
+    () =>
+      Object.fromEntries(
+        Object.keys(files).map((relative) => {
+          const path = join(dir, relative)
+          return [
+            relative,
+            existsSync(path) ? readFileSync(path, 'utf8') : null,
+          ]
+        }),
+      ),
+    dir,
   )
 }
 
@@ -295,25 +460,65 @@ const sha256 = (text: string) =>
 
 function marker(dir = runtimeDir()) {
   const path = join(dir, 'layout.json')
-  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined
+  return testStep(
+    'test.read-marker',
+    () =>
+      existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined,
+    path,
+  )
 }
 
 function authority() {
-  return enrollmentAuthority(
-    hostEnrollmentPaths({
-      stateDir: vaultStateDir(getAccountPaths().statePath),
-      host: 'opencode',
-    }),
-    vaultEnrollmentName('opencode'),
+  return testAsyncStep('test.read-enrollment-authority', () =>
+    enrollmentAuthority(
+      hostEnrollmentPaths({
+        stateDir: vaultStateDir(getAccountPaths().statePath),
+        host: 'opencode',
+      }),
+      vaultEnrollmentName('opencode'),
+    ),
   )
 }
 
 function heartbeat(pid: number, body: Record<string, unknown>) {
   const dir = processHeartbeatDir(join(root, 'state'))
-  mkdirSync(dir, { recursive: true })
   const path = join(dir, `${pid}.json`)
-  writeFileSync(path, JSON.stringify({ pid, startedAt: Date.now(), ...body }))
+  testStep(
+    'test.write-heartbeat-fixture',
+    () => {
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(
+        path,
+        JSON.stringify({ pid, startedAt: Date.now(), ...body }),
+      )
+    },
+    path,
+  )
   return path
+}
+
+// Only the subprocess that checks the real Bun hooks runs the intentional
+// assertion failure and timeout.
+if (process.env.OPENAI_AUTH_RUNTIME_LAYOUT_TRACE_PROBE === '1') {
+  it('phase trace probe: fast', () => {
+    testStep('test.fast-probe', () => expect(currentCase.ended).toBe(false))
+  })
+
+  it('phase trace probe: slow', async () => {
+    expect(
+      await prepare({
+        steps: { afterCopy: () => Bun.sleep(SLOW_CASE_MS + 10) },
+      }),
+    ).toBe('state-home')
+  })
+
+  it('phase trace probe: failed', () => {
+    expect(false).toBe(true)
+  })
+
+  it('phase trace probe: timed out', async () => {
+    await testAsyncStep('test.waiting-probe', () => Bun.sleep(150))
+  }, 50)
 }
 
 const REFUSED = /^openai-auth cannot start: /
@@ -861,11 +1066,16 @@ describe('moving an existing layout', () => {
     })
     const oldState = join(configDir(), 'openai-auth-state.json')
     // A writer holds the store's lock on the old state file and replaces it.
-    const held = await acquireRefreshFileLock({
-      name: 'save',
-      path: oldState,
-      ttlMs: 10_000,
-    })
+    const held = await testAsyncStep(
+      'test.acquire-store-lock',
+      () =>
+        acquireRefreshFileLock({
+          name: 'save',
+          path: oldState,
+          ttlMs: 10_000,
+        }),
+      oldState,
+    )
     expect(held).not.toBeNull()
     resetProcess()
     let settled = false
@@ -873,10 +1083,10 @@ describe('moving an existing layout', () => {
       settled = true
       return layout
     })
-    await Bun.sleep(300)
+    await testAsyncStep('test.wait-with-store-lock', () => Bun.sleep(300))
     expect(settled).toBe(false)
     writeFileSync(oldState, '{"refresh":"written-under-the-lock"}\n')
-    await held?.release()
+    await testAsyncStep('test.release-store-lock', async () => held?.release())
     await expect(run).rejects.toThrow(
       credentialConflictMessage('openai-auth-state.json'),
     )
@@ -1149,7 +1359,7 @@ describe('processes that could still write the old files', () => {
     expect(present(configDir(), files)).toEqual(files)
 
     a.child.kill()
-    await a.child.exited
+    await testAsyncStep('test.wait-for-child-exit', () => a.child.exited)
     // Process C starts after A exited (B has exited as well): it moves.
     const c = await spawnLayoutProcess('once')
     expect(c.result.layout).toBe('state-home')
@@ -1183,11 +1393,13 @@ describe('processes that could still write the old files', () => {
   it('a legacy-layout process keeps its heartbeat after its last owner releases it', async () => {
     heartbeat(process.ppid, { version: '1.6.2' })
     await prepare()
-    const handle = await startProcessHeartbeat({
-      version: VERSION,
-      logger: { warn() {} },
-    })
-    await handle.release()
+    const handle = await testAsyncStep('test.start-heartbeat', () =>
+      startProcessHeartbeat({
+        version: VERSION,
+        logger: { warn() {} },
+      }),
+    )
+    await testAsyncStep('test.release-heartbeat', () => handle.release())
     expect(existsSync(processHeartbeatPath())).toBe(true)
   })
 })
@@ -1835,45 +2047,74 @@ async function spawnLayoutProcess(
   mode: 'once' | 'hold',
   extra: Record<string, string | undefined> = {},
 ) {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    NODE_ENV: 'test',
-    RUNTIME_LAYOUT_TEST_VERSION: VERSION,
-    ...extra,
-  }
-  for (const [name, value] of Object.entries(env))
-    if (value === undefined) delete env[name]
-  const child = Bun.spawn(
-    [
-      process.execPath,
-      fileURLToPath(
-        new URL('./fixtures/runtime-layout-process.ts', import.meta.url),
-      ),
-      mode,
-    ],
-    { env, stdout: 'pipe', stderr: 'pipe' },
-  )
-  const reader = child.stdout.getReader()
-  let text = ''
-  while (!text.includes('\n')) {
-    const { value, done } = await reader.read()
-    if (done) break
-    text += new TextDecoder().decode(value)
-  }
-  reader.releaseLock()
-  if (!text.includes('\n')) {
-    const stderr = await new Response(child.stderr).text()
-    throw new Error(`layout process printed nothing: ${stderr}`)
-  }
-  if (mode === 'once') await child.exited
-  return {
-    child,
-    result: JSON.parse(text.trim()) as {
-      layout?: string
-      error?: string
-      pid?: number
-      statePath?: string
-      runtimeDir?: string
+  const testCase = currentCase
+  return testAsyncStep(
+    'test.spawn-layout-process',
+    async () => {
+      const phases = new Map<number, (time: number) => void>()
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        NODE_ENV: 'test',
+        RUNTIME_LAYOUT_TEST_VERSION: VERSION,
+        ...extra,
+      }
+      for (const [name, value] of Object.entries(env))
+        if (value === undefined) delete env[name]
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          fileURLToPath(
+            new URL('./fixtures/runtime-layout-process.ts', import.meta.url),
+          ),
+          mode,
+        ],
+        {
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+          ipc(event: LayoutPhaseMessage, child) {
+            if (testCase.ended) return
+            const time = event.time - performance.timeOrigin
+            if (event.name !== undefined) {
+              phases.set(
+                event.id,
+                testCase.record(
+                  `child[${child.pid}].${event.name}`,
+                  event.subject,
+                  time,
+                ),
+              )
+            } else {
+              phases.get(event.id)?.(time)
+              phases.delete(event.id)
+            }
+          },
+        },
+      )
+      const reader = child.stdout.getReader()
+      let text = ''
+      while (!text.includes('\n')) {
+        const { value, done } = await reader.read()
+        if (done) break
+        text += new TextDecoder().decode(value)
+      }
+      reader.releaseLock()
+      if (!text.includes('\n')) {
+        const stderr = await new Response(child.stderr).text()
+        throw new Error(`layout process printed nothing: ${stderr}`)
+      }
+      if (mode === 'once') await child.exited
+      return {
+        child,
+        result: JSON.parse(text.trim()) as {
+          layout?: string
+          error?: string
+          pid?: number
+          statePath?: string
+          runtimeDir?: string
+        },
+      }
     },
-  }
+    mode,
+  )
 }

@@ -7,12 +7,38 @@ import { dirname } from 'node:path'
 import { getAccountPaths, getCodexSessionsPath } from '../../core/account-paths'
 import { prepareRuntimeLayout } from '../../core/runtime-layout'
 
+export type LayoutPhaseMessage = { id: number; time: number } & (
+  | { name: string; subject?: string }
+  | { name?: undefined }
+)
+
+let nextId = 0
+function report(message: LayoutPhaseMessage) {
+  process.send?.(message)
+}
+
+const observePhase: Parameters<typeof prepareRuntimeLayout>[0]['observePhase'] =
+  process.send
+    ? (name, subject) => {
+        const id = nextId++
+        report({
+          id,
+          name,
+          subject,
+          time: performance.timeOrigin + performance.now(),
+        })
+        return () =>
+          report({ id, time: performance.timeOrigin + performance.now() })
+      }
+    : undefined
+
 const mode = process.argv[2] ?? 'once'
 let line: Record<string, unknown>
 try {
   const layout = await prepareRuntimeLayout({
     version: process.env.RUNTIME_LAYOUT_TEST_VERSION ?? '1.7.0',
     log: { info() {}, warn() {} },
+    observePhase,
   })
   const statePath = getAccountPaths().statePath
   line = {
