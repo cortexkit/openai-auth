@@ -1451,8 +1451,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           continuation: { previousId: from, exhausted: feedback.exhausted },
           sessionId: input.sessionID,
           request: { modelId: input.modelID, kind: input.kind },
-          // The host's retry hook supplies no signal. The refused attempt's
-          // signal belongs to that attempt and must not cancel its replacement.
+          // Only this input's own signal, which the host's retry hook leaves
+          // unset. Never borrow the refused attempt's request signal: it belongs
+          // to that attempt and must not cancel its replacement.
           signal: input.signal,
           routes: vault?.routes() ?? [],
           routing,
