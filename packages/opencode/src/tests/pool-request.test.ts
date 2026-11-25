@@ -718,6 +718,8 @@ describe('OC1 HTTP limits', () => {
     const refreshHeaders = quotaHeaders(40, 3 * HOUR)
     let first = true
     const wire = installWire({
+      // The second send supplies A's reset; a startup poll must not replace it.
+      usage: () => new Response('', { status: 503 }),
       respond: (sent) => {
         if (sent === 'Bearer fallback-1-token')
           return new Response('B sentinel')
