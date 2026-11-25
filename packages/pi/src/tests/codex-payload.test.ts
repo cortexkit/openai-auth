@@ -33,6 +33,7 @@ import {
 import { closeOpenAICodexWebSocketSessions } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { streamSimple } from '@earendil-works/pi-ai/compat'
 import { chatgptAccessToken } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { shapePiCodexHttpRequest } from '../codex-wire.ts'
 import { createPiMenu } from '../commands.ts'
 import { installRawCodexWebSocket } from '../index.ts'
 import { RawWebSocket } from '../raw-ws-node.ts'
@@ -172,6 +173,7 @@ function mockFetch(
 let dir: string
 let runtime: PiOpenAIRuntime
 let sdkHttpEncodings: (string | null)[]
+let sdkOutputLimits: unknown[]
 let wireHttpEncodings: (string | null)[]
 let savedEnv: [string, string | undefined][]
 let snapshots: SettingsSnapshot[]
@@ -183,6 +185,7 @@ beforeEach(() => {
   for (const [name] of savedEnv) delete process.env[name]
   dir = mkdtempSync(join(tmpdir(), 'pi-codex-payload-'))
   sdkHttpEncodings = []
+  sdkOutputLimits = []
   wireHttpEncodings = []
   snapshots = []
   now = wireNow
@@ -198,6 +201,12 @@ function makeRuntime(directory: string, settings?: SettingsSnapshot) {
       const fetch = options?.fetch
       return streamSimple(model, context, {
         ...options,
+        onPayload(payload, payloadModel) {
+          sdkOutputLimits.push(
+            (payload as Record<string, unknown>).max_output_tokens,
+          )
+          return options?.onPayload?.(payload, payloadModel)
+        },
         fetch: mockFetch(async (input, init) => {
           sdkHttpEncodings.push(
             new Headers(init?.headers).get('content-encoding'),
@@ -427,7 +436,7 @@ test('Pi HTTP sends the OC1 body bytes and application headers with omitted and 
         tools: [{ ...expectedReadTool, strict: explicit }],
         ...(explicit && { tool_choice: 'auto' }),
         parallel_tool_calls: true,
-        reasoning: { effort: 'none' },
+        reasoning: { effort: 'none', summary: 'auto' },
         store: false,
         stream: true,
         include: ['reasoning.encrypted_content'],
@@ -545,7 +554,7 @@ test('Pi shapes a helper without sending any primary cache identity', async () =
       tools: [expectedReadTool],
       tool_choice: 'required',
       parallel_tool_calls: true,
-      reasoning: { effort: 'none' },
+      reasoning: { effort: 'none', summary: 'auto' },
       store: false,
       stream: true,
       include: ['reasoning.encrypted_content'],
@@ -620,10 +629,7 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
     const sent = await httpBody(
       {
         onPayload(raw) {
-          const { instructions: _instructions, ...body } = raw as {
-            instructions?: string
-            input: unknown[]
-          }
+          const body = raw as { input: unknown[] }
           sdkInput = body.input
           expect(sdkInput[1]).toEqual(replayed)
           body.input = [
@@ -664,6 +670,49 @@ test('Codex HTTP sends system instructions as the leading developer message', as
       content: [{ type: 'input_text', text: firstUser.content }],
     },
   ])
+})
+
+test('Pi HTTP preserves the base-instructions shape for a Pi 1.5 payload', () => {
+  const result = shapePiCodexHttpRequest(
+    {
+      body: JSON.stringify({
+        model: model.id,
+        instructions: systemPrompt,
+        input: [userItem(firstUser.content)],
+        reasoning: { effort: 'none' },
+      }),
+    },
+    {
+      threadID: sessionId,
+      windowID: `${sessionId}:0`,
+      installationID,
+      now: () => wireNow,
+      turn: () => ({ turnID: firstTurnID, turnStartedAt: wireNow }),
+    },
+    false,
+  )
+  const body = JSON.parse(String(result?.body))
+  expect(body).not.toHaveProperty('instructions')
+  expect(body.prompt_cache_key).toBe(sessionId)
+  expect(body.reasoning).toEqual({ effort: 'none' })
+  expect(body.input).toEqual([
+    developerMessage(systemPrompt, systemId),
+    userItem(firstUser.content),
+  ])
+})
+
+test('Pi HTTP strips the SDK output limit but preserves a caller-set limit', async () => {
+  const implicit = await httpBody()
+  expect(sdkOutputLimits).toEqual([model.maxTokens])
+  expect(implicit).not.toHaveProperty('max_output_tokens')
+
+  const explicit = await httpBody({
+    onPayload(raw) {
+      const body = raw as Record<string, unknown>
+      body.max_output_tokens = 19
+    },
+  })
+  expect(explicit.max_output_tokens).toBe(19)
 })
 
 test('Pi pins gpt-6.2-sol HTTP effort and replays each update at its original user message', async () => {
@@ -714,6 +763,26 @@ test('Pi pins gpt-6.2-sol HTTP effort and replays each update at its original us
   ])
 })
 
+test('Pi leaves native effort updates and top-level effort alone in a pinned session', async () => {
+  const opening = await httpBody({ sessionId, reasoning: 'low' }, effortModel)
+  expect(opening.reasoning).toEqual({ effort: 'low', summary: 'auto' })
+
+  const changed = await httpBody(
+    { sessionId, reasoning: 'high' },
+    { ...effortModel, compat: { supportsMidConvoEffort: true } },
+    { systemPrompt, messages: [firstUser, secondUser] },
+  )
+  expect({ reasoning: changed.reasoning, input: changed.input }).toEqual({
+    reasoning: { effort: 'medium', summary: 'auto' },
+    input: [
+      developerMessage(systemPrompt, systemId),
+      userItem(firstUser.content),
+      userItem(secondUser.content),
+      effortUpdate('high'),
+    ],
+  })
+})
+
 test('Codex HTTP omits the base instructions id without a Pi session id', async () => {
   const body = await httpBody()
   expect(body).not.toHaveProperty('prompt_cache_key')
@@ -733,17 +802,30 @@ test('Codex transforms an awaited onPayload replacement after leading additional
     role: 'developer',
     tools: [],
   }
+  const moreTools = { ...additionalTools, tools: [expectedReadTool] }
+  const laterDeveloper = { role: 'developer', content: 'Later developer note.' }
+  const laterSystem = { role: 'system', content: 'Later system note.' }
   const body = await httpBody({
     sessionId,
     async onPayload(raw, receivedModel) {
       await Promise.resolve()
       expect(receivedModel.id).toBe(model.id)
-      const original = raw as { instructions: string; input: unknown[] }
-      expect(original.instructions).toBe(systemPrompt)
+      const original = raw as { input: unknown[] }
+      expect(original).not.toHaveProperty('instructions')
+      expect(original.input[0]).toEqual({
+        role: 'developer',
+        content: systemPrompt,
+      })
       return {
         ...original,
-        instructions: 'Replacement prompt.',
-        input: [additionalTools, ...original.input],
+        input: [
+          additionalTools,
+          moreTools,
+          { role: 'system', content: 'Replacement prompt.' },
+          ...original.input.slice(1),
+          laterDeveloper,
+          laterSystem,
+        ],
         metadata: { caller: 'replacement' },
       }
     },
@@ -752,26 +834,34 @@ test('Codex transforms an awaited onPayload replacement after leading additional
   expect(body.metadata).toEqual({ caller: 'replacement' })
   expect(body.input).toEqual([
     additionalTools,
+    moreTools,
     developerMessage(
       'Replacement prompt.',
       'msg_863029c1-4b0c-5d97-a1b6-4156e117721d',
     ),
-    {
-      role: 'user',
-      content: [{ type: 'input_text', text: firstUser.content }],
-    },
+    userItem(firstUser.content),
+    laterDeveloper,
+    laterSystem,
   ])
 })
 
 test('Codex transforms in-place onPayload edits without mutating the SDK body', async () => {
-  let sdkBody: Record<string, unknown> | undefined
+  type HookBody = {
+    input: [{ role: string; content: string }, ...unknown[]]
+    metadata?: Record<string, unknown>
+  }
+  let sdkBody: HookBody | undefined
   const body = await httpBody({
     sessionId,
     async onPayload(raw) {
       await Promise.resolve()
-      sdkBody = raw as Record<string, unknown>
-      expect(sdkBody.instructions).toBe(systemPrompt)
-      sdkBody.instructions = 'Edited prompt.'
+      sdkBody = raw as HookBody
+      expect(sdkBody).not.toHaveProperty('instructions')
+      expect(sdkBody.input[0]).toEqual({
+        role: 'developer',
+        content: systemPrompt,
+      })
+      sdkBody.input[0].content = 'Edited prompt.'
       sdkBody.metadata = { caller: 'in-place' }
     },
   })
@@ -787,8 +877,24 @@ test('Codex transforms in-place onPayload edits without mutating the SDK body', 
       content: [{ type: 'input_text', text: firstUser.content }],
     },
   ])
-  expect(sdkBody?.instructions).toBe('Edited prompt.')
-  expect(sdkBody?.input).toHaveLength(1)
+  expect(sdkBody?.input).toEqual([
+    { role: 'developer', content: 'Edited prompt.' },
+    userItem(firstUser.content),
+  ])
+})
+
+test('Pi HTTP gives explicit instructions precedence over the bare SDK prompt', async () => {
+  const body = await httpBody({
+    onPayload(raw) {
+      return { ...(raw as object), instructions: 'Explicit base prompt.' }
+    },
+  })
+  expect(body).not.toHaveProperty('instructions')
+  expect(body.input).toEqual([
+    developerMessage('Explicit base prompt.'),
+    { role: 'developer', content: systemPrompt },
+    userItem(firstUser.content),
+  ])
 })
 
 function spyOnRawCodexFrames() {
@@ -1375,9 +1481,11 @@ test('Pi does not complete a newer turn when a superseded attempt succeeds late'
 })
 
 test('Codex cached WebSocket sends the developer message once and only new input on turn two', async () => {
+  const followup = { ...secondUser, content: 'Name another. '.repeat(64) }
   const { frames, connections } = await captureWebSocketFrames(
     async (baseUrl) => {
-      const socketModel = { ...model, baseUrl }
+      // Leave little enough room that the added input reduces the SDK limit.
+      const socketModel = { ...model, baseUrl, contextWindow: 6_000 }
       const options: SimpleStreamOptions = {
         apiKey,
         transport: 'websocket-cached',
@@ -1394,7 +1502,7 @@ test('Codex cached WebSocket sends the developer message once and only new input
           socketModel,
           {
             systemPrompt,
-            messages: [firstUser, first, secondUser],
+            messages: [firstUser, first, followup],
           },
           options,
         )
@@ -1407,6 +1515,11 @@ test('Codex cached WebSocket sends the developer message once and only new input
   expect(connections).toBe(1)
   expect(frames).toHaveLength(2)
   const [full, delta] = frames
+  expect(sdkOutputLimits).toHaveLength(2)
+  expect(sdkOutputLimits[0]).toBeGreaterThan(sdkOutputLimits[1] as number)
+  expect(delta?.previous_response_id).toBe('resp_1')
+  expect(full).not.toHaveProperty('max_output_tokens')
+  expect(delta).not.toHaveProperty('max_output_tokens')
   expect(full?.type).toBe('response.create')
   expect(full?.prompt_cache_key).toBe(sessionId)
   expect(full).not.toHaveProperty('instructions')
@@ -1421,11 +1534,10 @@ test('Codex cached WebSocket sends the developer message once and only new input
   expect(delta?.type).toBe('response.create')
   expect(delta?.prompt_cache_key).toBe(sessionId)
   expect(delta).not.toHaveProperty('instructions')
-  expect(delta?.previous_response_id).toBe('resp_1')
   expect(delta?.input).toEqual([
     {
       role: 'user',
-      content: [{ type: 'input_text', text: secondUser.content }],
+      content: [{ type: 'input_text', text: followup.content }],
     },
   ])
 })
@@ -1481,7 +1593,7 @@ test('Pi keeps gpt-6.2-sol WebSocket turns chained after injecting an effort upd
     [effortUpdate('high'), userItem(secondUser.content)],
     [userItem(thirdUser.content)],
   ])
-  expect(payloads.map((input) => input.length)).toEqual([1, 3, 5])
+  expect(payloads.map((input) => input.length)).toEqual([2, 4, 6])
 })
 
 test('Pi keeps Lite warm at the configured HTTP endpoint with a fresh same-account bearer', async () => {

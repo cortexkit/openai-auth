@@ -22,10 +22,11 @@ function baseInstructionsId(threadId: string, text: string): string {
 // GPT-6.2 caches the system prompt in input, but not in top-level instructions.
 export function moveInstructionsToDeveloperMessage(
   body: Record<string, unknown>,
-  options?: { responsesLite?: boolean },
+  options?: { responsesLite?: boolean; leadingBareInstructions?: boolean },
 ) {
-  const instructions = body.instructions
-  if (typeof instructions !== 'string' || instructions.length === 0) return
+  const topLevel = body.instructions
+  const hasTopLevel = typeof topLevel === 'string' && topLevel.length > 0
+  if (!hasTopLevel && !options?.leadingBareInstructions) return
   const items = Array.isArray(body.input)
     ? body.input
     : typeof body.input === 'string'
@@ -38,7 +39,27 @@ export function moveInstructionsToDeveloperMessage(
         ]
       : []
   const first = items[0]
-  const at = isRecord(first) && first.type === 'additional_tools' ? 1 : 0
+  let at = isRecord(first) && first.type === 'additional_tools' ? 1 : 0
+  let replace = false
+  let instructions: string
+  // Explicit instructions already supply the base prompt. Leave existing
+  // input alone in that case, rather than interpreting a second prompt.
+  if (hasTopLevel) {
+    instructions = topLevel
+  } else {
+    while (isRecord(items[at]) && items[at].type === 'additional_tools') at++
+    const leading = items[at]
+    if (
+      !isRecord(leading) ||
+      (leading.role !== 'developer' && leading.role !== 'system') ||
+      typeof leading.content !== 'string' ||
+      leading.content.length === 0 ||
+      Object.keys(leading).length !== 2
+    )
+      return
+    instructions = leading.content
+    replace = true
+  }
   const threadId = body.prompt_cache_key
   body.input = [
     ...items.slice(0, at),
@@ -59,7 +80,7 @@ export function moveInstructionsToDeveloperMessage(
         }),
       },
     },
-    ...items.slice(at),
+    ...items.slice(replace ? at + 1 : at),
   ]
   delete body.instructions
 }

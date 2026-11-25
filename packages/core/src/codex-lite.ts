@@ -47,7 +47,10 @@ function stripResponsesLiteImageDetails(value: unknown): unknown {
 }
 
 // Lite is opt-in because it disables parallel calls and excludes hosted tools.
-export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
+export function rewriteResponsesLiteBody(
+  parsed: Record<string, unknown>,
+  leadingBareInstructions?: boolean,
+) {
   const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
   reasoning.context = 'all_turns'
   parsed.reasoning = reasoning
@@ -64,7 +67,10 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
     { type: 'additional_tools', role: 'developer', tools },
     ...input,
   ]
-  moveInstructionsToDeveloperMessage(parsed, { responsesLite: true })
+  moveInstructionsToDeveloperMessage(parsed, {
+    responsesLite: true,
+    leadingBareInstructions,
+  })
   delete parsed.tools
   delete parsed.instructions
 }

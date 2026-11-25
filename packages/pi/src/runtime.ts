@@ -1328,6 +1328,14 @@ export class PiOpenAIRuntime {
   }
 
   private applyEffort(body: Record<string, unknown>, sessionId: string) {
+    // Pi's native updates already encode current and historical effort.
+    if (
+      Array.isArray(body.input) &&
+      body.input.some(
+        (item) => isRecord(item) && item.type === 'configuration_update',
+      )
+    )
+      return
     const previous = this.effortBySession.get(sessionId)
     const state = previous ?? {}
     applyMidConversationEffort(body, state)

@@ -6,7 +6,7 @@ The Pi package of [CortexKit OpenAI Auth](https://github.com/cortexkit/openai-au
 
 ## Install
 
-Requires Pi 1.0.1 or newer. The extension is tested with Pi 1.5.2, the version pinned in the workspace lockfile. See [Install](https://github.com/cortexkit/openai-auth#install) in the repository README; installing with Pi's own package manager is described in [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#installing-on-pi).
+Requires Pi 1.0.1 or newer. The extension is tested with Pi 1.6.0, the version pinned in the workspace lockfile. See [Install](https://github.com/cortexkit/openai-auth#install) in the repository README; installing with Pi's own package manager is described in [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#installing-on-pi).
 
 ## Documentation
 
@@ -17,7 +17,7 @@ Requires Pi 1.0.1 or newer. The extension is tested with Pi 1.5.2, the version p
 
 When Thalamus starts Pi, the plugin leaves the saved Pi login untouched and uses
 the vault. If Pi does not expose its in-memory credential override, a saved
-expired login may prevent Pi from reaching the plugin. Pi 1.5.2 was verified
+expired login may prevent Pi from reaching the plugin. Pi 1.6.0 was verified
 with the override.
 
 Pi's default compaction starts only above the same Codex OAuth input limit as

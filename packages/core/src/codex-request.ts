@@ -116,6 +116,8 @@ export interface CodexShapeInput {
   accountId?: string
   websocket?: boolean
   responsesLite?: boolean
+  /** Recognize Pi's bare instruction role message at the head of input. */
+  leadingBareInstructions?: boolean
 }
 
 /** Set the transport, Codex client and account headers, without session identity. */
@@ -151,6 +153,7 @@ export function shapeCodexRequest(
       supportsResponsesLite(input.body.model),
     restoreCallStatus: !chained,
     instructions: chained ? 'drop' : 'move',
+    leadingBareInstructions: input.leadingBareInstructions,
   })
   return orderCodexBody(input.body)
 }
@@ -163,6 +166,7 @@ function shapeCodexBody(
     websocket?: boolean
     restoreCallStatus: boolean
     instructions: 'move' | 'drop' | 'preserve'
+    leadingBareInstructions?: boolean
     beforePlacement?: () => void
     rewriteLite?: (body: Record<string, unknown>) => void
   },
@@ -174,11 +178,14 @@ function shapeCodexBody(
   body.parallel_tool_calls ??= true
   if (Array.isArray(body.tools)) body.tools = body.tools.map(normalizeCodexTool)
   policy.beforePlacement?.()
-  if (policy.useResponsesLite)
-    (policy.rewriteLite ?? rewriteResponsesLiteBody)(body)
-  else if (policy.instructions === 'move')
-    moveInstructionsToDeveloperMessage(body)
-  else if (policy.instructions === 'drop') delete body.instructions
+  if (policy.useResponsesLite) {
+    if (policy.rewriteLite) policy.rewriteLite(body)
+    else rewriteResponsesLiteBody(body, policy.leadingBareInstructions)
+  } else if (policy.instructions === 'move') {
+    moveInstructionsToDeveloperMessage(body, {
+      leadingBareInstructions: policy.leadingBareInstructions,
+    })
+  } else if (policy.instructions === 'drop') delete body.instructions
   headers.delete('content-length')
 }
 

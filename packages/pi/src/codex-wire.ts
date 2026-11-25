@@ -56,8 +56,11 @@ export function omitPiCodexDefaults(
 ): unknown {
   if (!isRecord(payload)) return payload
   const body = { ...payload }
-  // Do this before the caller's hook so writing even 'auto' or 'low' there
-  // counts as explicit. pi-ai's simple provider does not forward textVerbosity.
+  // A context-clamped limit changes between turns and would prevent pi-ai
+  // from chaining. Strip it before the caller's hook so they can opt back in.
+  delete body.max_output_tokens
+  // Writing even 'auto' or 'low' in the hook counts as explicit.
+  // pi-ai's simple provider does not forward textVerbosity.
   if (options?.toolChoice == null && body.tool_choice === 'auto')
     delete body.tool_choice
   if (options?.textVerbosity) {
@@ -135,7 +138,13 @@ function shapePiCodexBody(
   } else {
     clearPiCodexSession(headers, body)
   }
-  return shapeCodexRequest({ body, headers, websocket, responsesLite })
+  return shapeCodexRequest({
+    body,
+    headers,
+    websocket,
+    responsesLite,
+    leadingBareInstructions: true,
+  })
 }
 
 export function shapePiCodexWebSocketFrame(
