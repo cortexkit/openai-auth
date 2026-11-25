@@ -744,27 +744,37 @@ function capacityClock(start: number) {
   }
 }
 
-test.each(['first ask', 'announced sleep', 'HTTP request signal'] as const)(
+test.each([
+  'first ask',
+  'announced sleep',
+  'HTTP first ask',
+  'HTTP request signal',
+] as const)(
   'capacity placement at the ten-minute deadline: %s',
   async (scenario) => {
     // These times are independent of the adapter's deadline constant.
     const start = Date.now()
     const clock = capacityClock(start)
-    const http = scenario === 'HTTP request signal'
-    const firstAsk = scenario === 'first ask'
+    const http = scenario.startsWith('HTTP ')
+    const firstAsk = scenario.endsWith('first ask')
     const entered = Promise.withResolvers<void>()
     const late = Promise.withResolvers<{ account_id: string }>()
     const account = { account_id: 'account-b' }
-    const accountFor = mock(async () => {
-      if (accountFor.mock.calls.length > 1) return account
-      if (firstAsk) {
-        entered.resolve()
-        return late.promise
-      }
-      return {
-        refused: { code: 'concurrency_full', resets_at_ms: start + 1_200_000 },
-      }
-    })
+    const accountFor = mock(
+      async (_ask: unknown, _options?: { signal?: AbortSignal }) => {
+        if (accountFor.mock.calls.length > 1) return account
+        if (firstAsk) {
+          entered.resolve()
+          return late.promise
+        }
+        return {
+          refused: {
+            code: 'concurrency_full',
+            resets_at_ms: start + 1_200_000,
+          },
+        }
+      },
+    )
     const report = mock((payload: Record<string, unknown>) => {
       if (payload.kind === 'wait' && payload.phase === 'start')
         entered.resolve()
@@ -808,6 +818,15 @@ test.each(['first ask', 'announced sleep', 'HTTP request signal'] as const)(
       if (http) {
         expect(await observe()).toBe('pending')
         controller.abort()
+      }
+      if (firstAsk) {
+        // Cancellation waits briefly for the pending account lookup. Resolve
+        // the lookup after the deadline so the test need not wait on a timer.
+        expect(await observe()).toBe('pending')
+        expect(accountFor.mock.calls[0]?.[1]?.signal?.aborted).toBe(true)
+        late.resolve(account)
+      }
+      if (http) {
         expect(await observe()).toHaveProperty('name', 'AbortError')
       } else {
         const error = await observe()
@@ -818,7 +837,6 @@ test.each(['first ask', 'announced sleep', 'HTTP request signal'] as const)(
         })
       }
 
-      late.resolve(account)
       clock.advance(600_000)
       await new Promise<void>((resolve) => setImmediate(resolve))
       expect(accountFor).toHaveBeenCalledTimes(1)
@@ -846,6 +864,7 @@ test.each(['first ask', 'announced sleep', 'HTTP request signal'] as const)(
       }
     } finally {
       controller.abort()
+      late.resolve(account)
       await installation.dispose()
       env.openai.dispose()
       clock.restore()

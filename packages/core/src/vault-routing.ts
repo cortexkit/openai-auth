@@ -123,6 +123,7 @@ export async function chooseVaultRouting(input: {
   continuation?: { previousId: string; exhausted: VaultRoutingExhausted }
   wait?: RoutingWaitInput
   warmAccountId?: string
+  signal?: AbortSignal
   capacityWait?: Parameters<typeof askRoutingUntilCapacity>[1]
 }): Promise<string | RoutingRefusal | { holdMs: number } | undefined> {
   const { request, sessionId, continuation } = input
@@ -190,6 +191,7 @@ export async function chooseVaultRouting(input: {
     )?.credentialId,
     refusals: true as const,
     holdWaitMaxS,
+    signal: input.signal,
   }
   const answer = continuation
     ? await askRouting({

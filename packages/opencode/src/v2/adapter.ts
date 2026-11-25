@@ -1233,8 +1233,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   activity && limits?.accountKey(activity.accountKey.accountId),
                 maxSameAccountWait: storage?.routing?.maxSameAccountWait,
               },
+              signal: capacitySignal,
               capacityWait: {
-                signal: capacitySignal,
                 now,
                 sleep: async (delayMs, signal) => {
                   capacityWaited = true
@@ -1451,6 +1451,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           continuation: { previousId: from, exhausted: feedback.exhausted },
           sessionId: input.sessionID,
           request: { modelId: input.modelID, kind: input.kind },
+          // The host's retry hook supplies no signal. The refused attempt's
+          // signal belongs to that attempt and must not cancel its replacement.
+          signal: input.signal,
           routes: vault?.routes() ?? [],
           routing,
           wait: {

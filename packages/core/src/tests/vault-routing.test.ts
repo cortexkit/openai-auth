@@ -297,6 +297,40 @@ test('a continue hold beyond the remaining cache lifetime is refused', async () 
   ).toEqual({ refused: { code: 'account_selection_refused' } })
 })
 
+test('a cancelled continuation discards a late routing choice', async () => {
+  const request = input()
+  const controller = new AbortController()
+  const entered = Promise.withResolvers<void>()
+  const late = Promise.withResolvers<{ account_id: string }>()
+  const accountFor = mock(async () => {
+    entered.resolve()
+    return late.promise
+  })
+  Reflect.set(globalThis, key, () => ({ accountFor }))
+  const outcome = chooseVaultRouting({
+    ...request,
+    fresh: false,
+    signal: controller.signal,
+    continuation: {
+      previousId: 'route-a',
+      exhausted: {
+        accountId: 'account-a',
+        credentialId: 'credential-a',
+        limitWindow: 'five_hour',
+        observedAtMs: request.routing.now,
+      },
+    },
+  })
+  await entered.promise
+  controller.abort()
+  late.resolve({ account_id: 'account-b' })
+  await expect(outcome).rejects.toBe(controller.signal.reason)
+  expect(accountFor).toHaveBeenCalledWith(
+    expect.objectContaining({ mode: 'continue' }),
+    { deadlineMs: 1500, signal: controller.signal },
+  )
+})
+
 test('a continue asks with the held route but does not offer confirmed exhausted alternatives', async () => {
   const request = input()
   request.routing.rows[1]!.quota.limits[0]!.usedPercent = 100
