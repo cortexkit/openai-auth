@@ -16,7 +16,6 @@ import {
   type CacheKeepManagerOptions,
   type CacheKeepProfile,
   type CacheKeepTargetView,
-  type CacheKeepTrackInput,
   type CacheKeepWindow,
   normalizeCacheKeepWindow,
 } from '@cortexkit/common-auth/cachekeep'
@@ -457,17 +456,13 @@ export function resolveCacheKeepAccountIdentity(
 export function createOpenAICacheKeepAdapter(
   options: OpenAICacheKeepAdapterOptions,
   dropTarget?: (sessionKey: string, diagnostic: string) => void,
-  transformedWarms = new Set<string>(),
 ): CacheKeepAdapter<OpenAICacheKeepMeta> {
   const log = options.logger
   const activeAccount = options.activeAccount
   const observedReplies = new WeakMap<Response, KeepwarmReply>()
   return {
     plan: sessionCacheKeepPlan,
-    onWarmed(sessionKey, input) {
-      if (!transformedWarms.delete(sessionKey))
-        reportSessionCacheWarmed(sessionKey, input)
-    },
+    onWarmed: reportSessionCacheWarmed,
     onWarmStopped: reportSessionCacheWarmStopped,
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
@@ -687,12 +682,7 @@ export function createOpenAICacheKeepAdapter(
         reply = reader.finish()
       }
       if (reply.transformedResponse) {
-        if (dropTarget) {
-          // Common-auth's CacheKeepManager calls onWarmed even after readUsage
-          // removes the target. Remember which warm touch to suppress.
-          transformedWarms.add(target.sessionKey)
-          dropTarget(target.sessionKey, 'provider transformed input')
-        }
+        dropTarget?.(target.sessionKey, 'provider transformed input')
         let chained: boolean | undefined
         try {
           const request: unknown = JSON.parse(target.bodyText)
@@ -767,15 +757,7 @@ export function createCacheKeepManager(
           getMainToken: options.getMainToken,
           refreshFallback: options.refreshFallback,
         }
-  const transformedWarms = new Set<string>()
-  class ReplayManager extends CacheKeepManager<OpenAICacheKeepMeta> {
-    override track(input: CacheKeepTrackInput<OpenAICacheKeepMeta>) {
-      const result = super.track(input)
-      if (result.tracked) transformedWarms.delete(input.sessionKey)
-      return result
-    }
-  }
-  const manager: OpenAICacheKeepManager = new ReplayManager({
+  const manager: OpenAICacheKeepManager = new CacheKeepManager({
     ...managerOptions,
     logger,
     adapter: createOpenAICacheKeepAdapter(
@@ -799,7 +781,6 @@ export function createCacheKeepManager(
           sessionKey,
         })
       },
-      transformedWarms,
     ),
   })
   return manager
