@@ -1076,10 +1076,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return { hostRetry: 'veto' }
     let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
-    const storage = getResolvedSettingsView(
-      await deps.storage(),
-      deps.configPath,
-    )
+    const readStorage = async () =>
+      getResolvedSettingsView(await deps.storage(), deps.configPath)
+    let storage = await readStorage()
     // Vault mode: only the vault's accounts serve this host.
     const vaultMode = modeAuthority !== undefined && modeAuthority !== 'local'
     const routingEnabled = vaultMode && hasVaultRoutingAccessor()
@@ -1186,17 +1185,18 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         place && !input.signal ? new AbortController() : undefined
       const capacitySignal = input.signal ?? deadline?.signal
       let capacityTimer: ReturnType<typeof setTimeout> | undefined
+      // Missing or expired readings do not establish that a floor was breached.
+      const floorSettings = () =>
+        storage && {
+          ...storage,
+          quota: { ...storage.quota, failClosedOnUnknownQuota: false },
+        }
       try {
         for (let retried = false; ; retried = true) {
           const routes = (vault?.routes() ?? [])
             .filter((route) => route.kind === 'oauth')
             .map((route) => ({ ...route, quota: route.quota }))
-          // Missing or expired readings do not establish that a floor was breached.
-          const floorSettings = storage && {
-            ...storage,
-            quota: { ...storage.quota, failClosedOnUnknownQuota: false },
-          }
-          const floors = poolKillswitchVerdicts(routes, floorSettings, at)
+          const floors = poolKillswitchVerdicts(routes, floorSettings(), at)
           const eligible = routes.filter(
             (route) => floors.get(route.id) !== false,
           )
@@ -1257,6 +1257,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             })
             deadline?.signal.throwIfAborted()
             if (capacityWaited) {
+              // The capacity retry API reuses the original candidates without
+              // a refresh hook. Refuse a stale pick without replacing it.
+              storage = await readStorage()
+              capacitySignal?.throwIfAborted()
               at = now()
               selection = currentTargets(storage, at, vaultMode)
               if (typeof answer === 'string') {
@@ -1270,7 +1274,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   !live ||
                   live.identity !== offered.identity ||
                   live.credentialId !== offered.credentialId ||
-                  poolKillswitchVerdicts([live], floorSettings, at).get(
+                  poolKillswitchVerdicts([live], floorSettings(), at).get(
                     answer,
                   ) === false
                 )
@@ -1306,6 +1310,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 end?.(input.signal?.aborted ? 'cancelled' : 'abandoned')
                 throw error
               }
+              storage = await readStorage()
+              signal.throwIfAborted()
               at = now()
               selection = currentTargets(storage, at, vaultMode)
               continue

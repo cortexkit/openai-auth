@@ -364,8 +364,12 @@ export class OpenAiVault {
       ...(options.clearTimeoutImpl
         ? { clearTimeoutImpl: options.clearTimeoutImpl }
         : {}),
-      onRoster: () => {
+      onRoster: (roster) => {
         this.#lastError = undefined
+        const current = new Set(roster.rows.map((row) => row.routeId))
+        for (const id of this.#lastQuotaSource.keys()) {
+          if (!current.has(id)) this.#lastQuotaSource.delete(id)
+        }
       },
       onDiscovery: (discovery) => this.#track(discovery),
       onError: (error) => this.#fail('vault roster refresh failed', error),
@@ -410,6 +414,8 @@ export class OpenAiVault {
     source: VaultQuotaSource,
     reason: VaultQuotaSourceReason,
   ): void {
+    // A poll may finish after its account was removed from the roster.
+    if (!this.owns(routeId)) return
     const previous = this.#lastQuotaSource.get(routeId)
     if (previous?.source === source && previous.reason === reason) return
     this.#lastQuotaSource.set(routeId, { source, reason })

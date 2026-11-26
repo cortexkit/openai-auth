@@ -296,7 +296,8 @@ const SPEND_CONTROL_LABEL = 'credits'
 // the wall clock — the label column is sized from these alone.
 function quotaRowLabels(quota: AccountQuota | null): string[] {
   const labels = getPresentQuotaWindows(quota).map((row) => row.label)
-  if (quota?.spendControl) labels.push(SPEND_CONTROL_LABEL)
+  if (hasSpendControlPercentages(quota?.spendControl))
+    labels.push(SPEND_CONTROL_LABEL)
   return labels
 }
 
@@ -385,7 +386,7 @@ export function buildQuotaRowsForDisplay(
       }
     })
   const spendControl = quota?.spendControl
-  if (spendControl) {
+  if (hasSpendControlPercentages(spendControl)) {
     const rowProjection = projection && { ...projection, limits: [] }
     const reset = quotaWindowParts(rowProjection, {
       now,
@@ -445,8 +446,20 @@ function pluralizeUnit(unit: string, count: number): string {
   return unit.endsWith('s') ? unit : `${unit}s`
 }
 
+function hasSpendControlPercentages(
+  reading: SpendControlReading | undefined,
+): reading is SpendControlReading & {
+  usedPercent: number
+  remainingPercent: number
+} {
+  return (
+    Number.isFinite(reading?.usedPercent) &&
+    Number.isFinite(reading?.remainingPercent)
+  )
+}
+
 export function formatSpendControlAmounts(
-  spendControl: SpendControlReading,
+  spendControl: SpendControlReading & { limit: number; used: number },
 ): string {
   const unit = pluralizeUnit(spendControl.unit ?? 'unit', spendControl.limit)
   return `${formatGroupedAmount(spendControl.used)} / ${formatGroupedAmount(spendControl.limit)} ${unit}`
@@ -466,10 +479,19 @@ export function getAccountMetadataRows(
   servingOnCredits = false,
 ): Array<{ label: string; value: string }> {
   const rows: Array<{ label: string; value: string }> = []
-  if (spendControl) {
+  if (
+    typeof spendControl?.limit === 'number' &&
+    Number.isFinite(spendControl.limit) &&
+    typeof spendControl.used === 'number' &&
+    Number.isFinite(spendControl.used)
+  ) {
     rows.push({
       label: 'credits',
-      value: formatSpendControlAmounts(spendControl),
+      value: formatSpendControlAmounts({
+        ...spendControl,
+        limit: spendControl.limit,
+        used: spendControl.used,
+      }),
     })
   }
   if (prepaidCredits !== undefined) {

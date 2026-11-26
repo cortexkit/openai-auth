@@ -72,10 +72,10 @@ class NamespaceLease {
   private releasing: Promise<void> | undefined
   private deadline: number | undefined
   private fallback = false
-  private fallbackResolve!: () => void
-  readonly fallbackSignal = new Promise<void>((resolve) => {
-    this.fallbackResolve = resolve
-  })
+  private readonly fallbackObservers = new Set<() => void>()
+  get fallbackObserverCount(): number {
+    return this.fallbackObservers.size
+  }
   private failureAt: number | undefined
   private retryAt = 0
   private retryDelay = RETRY_MS
@@ -99,7 +99,8 @@ class NamespaceLease {
     if (this.fallback) return
     this.fallback = true
     this.clock.clearTimeout(this.failureTimer)
-    this.fallbackResolve()
+    for (const notify of this.fallbackObservers) notify()
+    this.fallbackObservers.clear()
     this.options.log(
       'OpenAI limits tracking is unavailable; serving without timed marks for this process.',
     )
@@ -118,11 +119,15 @@ class NamespaceLease {
   }
 
   async bounded<T>(promise: Promise<T>, until: number): Promise<T | undefined> {
+    const fallback = Promise.withResolvers<undefined>()
+    const notify = () => fallback.resolve(undefined)
+    if (this.fallback) notify()
+    else this.fallbackObservers.add(notify)
     let timer: unknown
     try {
       return await Promise.race([
         promise,
-        this.fallbackSignal.then(() => undefined),
+        fallback.promise,
         new Promise<undefined>((resolve) => {
           timer = this.clock.setTimeout(
             () => resolve(undefined),
@@ -132,6 +137,7 @@ class NamespaceLease {
       ])
     } finally {
       this.clock.clearTimeout(timer)
+      this.fallbackObservers.delete(notify)
     }
   }
 
@@ -566,6 +572,15 @@ export function createLimitsLeaseManager(
   const leases = new Map<string, NamespaceLease>()
   const droppedSignalLog = options.droppedSignalLog ?? { logged: false }
   return {
+    /** @internal Observe the bounded wait lifecycle without measuring memory. */
+    forTest(namespace: string) {
+      const lease = leases.get(namespace)
+      if (!lease) throw new Error('Limits lease not acquired')
+      return {
+        bounded: lease.bounded.bind(lease),
+        fallbackObserverCount: () => lease.fallbackObserverCount,
+      }
+    },
     acquire(options: LeaseOptions): OpenAiLimitsOwner {
       let lease = leases.get(options.namespace)
       if (!lease) {

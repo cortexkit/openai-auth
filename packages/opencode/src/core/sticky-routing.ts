@@ -198,8 +198,18 @@ function candidateWeight(
   // reserve, and a malformed reading is ignored rather than allowed to zero the
   // account's weight.
   const spendControl = candidate.quota.spendControl
-  if (spendControl && Number.isFinite(spendControl.remainingPercent)) {
-    weights.push(sustainableWindowWeight(spendControl, 0, now))
+  const remainingPercent = spendControl?.remainingPercent
+  if (
+    typeof remainingPercent === 'number' &&
+    Number.isFinite(remainingPercent)
+  ) {
+    weights.push(
+      sustainableWindowWeight(
+        { remainingPercent, resetsAt: spendControl?.resetsAt },
+        0,
+        now,
+      ),
+    )
   }
   const weight = weights.length > 0 ? Math.min(...weights) : 0
   return weight > 0 ? { candidate, quotaCheckedAt, weight } : undefined

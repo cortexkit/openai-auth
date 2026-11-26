@@ -70,6 +70,37 @@ function fixture() {
   }
 }
 
+test('bounded waits remove fallback observers after completion, rejection and timeout', async () => {
+  const f = fixture()
+  const owner = f.manager.acquire(f.options)
+  const lease = f.manager.forTest(f.namespace)
+  const held = Promise.withResolvers<string>()
+  const until = f.clock.now() + 1
+  try {
+    const waits = Array.from({ length: 100 }, () =>
+      lease.bounded(held.promise, until),
+    )
+    expect(lease.fallbackObserverCount()).toBe(100)
+    held.resolve('done')
+    expect(await Promise.all(waits)).toEqual(Array(100).fill('done'))
+    expect(lease.fallbackObserverCount()).toBe(0)
+
+    const error = new Error('projection failed')
+    await expect(lease.bounded(Promise.reject(error), until)).rejects.toBe(
+      error,
+    )
+    expect(lease.fallbackObserverCount()).toBe(0)
+
+    const timed = lease.bounded(new Promise(() => {}), until)
+    expect(lease.fallbackObserverCount()).toBe(1)
+    await f.clock.tick(1)
+    expect(await timed).toBeUndefined()
+    expect(lease.fallbackObserverCount()).toBe(0)
+  } finally {
+    await owner.dispose()
+  }
+})
+
 test('provenance is shared by namespace owners, retired on clear and not inherited by same-expiry foreign marks', async () => {
   const f = fixture()
   const first = f.manager.acquire(f.options)

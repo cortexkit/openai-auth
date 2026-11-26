@@ -93,11 +93,11 @@ export interface OAuthQuotaSnapshot {
 }
 
 export interface OAuthSpendControlReading {
-  limit: number
-  used: number
-  remaining: number
-  usedPercent: number
-  remainingPercent: number
+  limit?: number
+  used?: number
+  remaining?: number
+  usedPercent?: number
+  remainingPercent?: number
   resetsAt?: string
   unit?: string
   source?: string

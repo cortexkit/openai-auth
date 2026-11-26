@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from 'node:util'
 import {
   type BuiltinSettingsPort,
   CommandError,
@@ -20,6 +19,8 @@ import { isRecord } from './util/record.js'
 
 const record = (value: unknown): Record<string, unknown> =>
   isRecord(value) ? value : {}
+const floorWindows = ['primary', 'secondary'] as const
+type FloorWindow = (typeof floorWindows)[number]
 
 /** A zero floor is an unset menu window, not an explicit zero-valued knob. */
 function menuView(snapshot: SettingsSnapshot): PoolSettings {
@@ -50,14 +51,25 @@ function menuView(snapshot: SettingsSnapshot): PoolSettings {
  * of an absent window, so an unusable list cannot masquerade as a no-op edit.
  */
 function trackFloors(value: PoolSettings) {
-  const accounts = new Set<string>()
+  const windows = new Map<string, Set<FloorWindow>>()
+  const add = (id: string, window: FloorWindow) => {
+    const own = windows.get(id) ?? new Set<FloorWindow>()
+    own.add(window)
+    windows.set(id, own)
+  }
   let touched = false
   let active = true
-  const changed = (path: string[]) => {
+  const changed = (path: string[], mutation = false) => {
     if (!active) return
     if (path[0] !== 'killswitch' || path[1] !== 'accounts') return
     touched = true
-    if (path[2] !== undefined) accounts.add(path[2])
+    const [, , id, window] = path
+    if (
+      mutation &&
+      id !== undefined &&
+      (window === 'primary' || window === 'secondary')
+    )
+      add(id, window)
   }
   const wrap = (
     target: Record<string, unknown>,
@@ -75,17 +87,18 @@ function trackFloors(value: PoolSettings) {
           : value
       },
       set(object, key, next) {
-        if (typeof key === 'string') changed([...path, key])
+        if (typeof key === 'string') changed([...path, key], true)
         return Reflect.set(object, key, next)
       },
       deleteProperty(object, key) {
-        if (typeof key === 'string') changed([...path, key])
+        if (typeof key === 'string') changed([...path, key], true)
         return Reflect.deleteProperty(object, key)
       },
     })
   return {
     value: wrap(value, []),
-    accounts,
+    windows,
+    add,
     touched: () => touched,
     finish: () => {
       active = false
@@ -127,9 +140,7 @@ export function createBuiltinSettingsPort(options: {
         const tracked = trackFloors(structuredClone(before))
         const edited = (await mutator(tracked.value)) ?? tracked.value
         tracked.finish()
-        // Compare a plain copy, not the tracking proxies: Bun 1.3's
-        // isDeepStrictEqual reports a Proxy unequal to an identical object,
-        // which would mark every account as edited and reorder the list.
+        // Read back a plain copy after tracking the mutator's explicit edits.
         const next = JSON.parse(JSON.stringify(edited)) as PoolSettings
         const edits: SettingsEdit[] = []
         const routing = record(next.routing)
@@ -157,10 +168,23 @@ export function createBuiltinSettingsPort(options: {
         for (const id of new Set([
           ...Object.keys(oldAccounts),
           ...Object.keys(accounts),
-        ]))
-          if (!isDeepStrictEqual(oldAccounts[id], accounts[id]))
-            tracked.accounts.add(id)
-        const editFloors = tracked.touched() || tracked.accounts.size > 0
+        ])) {
+          const clearedAccount =
+            Object.hasOwn(oldAccounts, id) &&
+            !Object.hasOwn(accounts, id) &&
+            !tracked.windows.has(id)
+          for (const window of floorWindows) {
+            if (
+              clearedAccount ||
+              !Object.is(
+                record(oldAccounts[id])[window],
+                record(accounts[id])[window],
+              )
+            )
+              tracked.add(id, window)
+          }
+        }
+        const editFloors = tracked.touched() || tracked.windows.size > 0
         if (editFloors) {
           if (
             snapshot
@@ -178,8 +202,8 @@ export function createBuiltinSettingsPort(options: {
           (current) => {
             const planned = [...edits]
             if (editFloors) {
-              // Merge against the locked file, not the menu snapshot: another
-              // host may have saved an unrelated account while the menu was open.
+              // Another writer may have changed a different window on the
+              // same account. Read its value from the locked file.
               const base =
                 current.status === 'ready' &&
                 Object.hasOwn(current.document, 'killswitch_account_floors')
@@ -191,21 +215,41 @@ export function createBuiltinSettingsPort(options: {
                   options.file,
                 )
               let floors: unknown[] = base
-              for (const id of tracked.accounts) {
+              for (const [id, windows] of tracked.windows) {
                 // Vault ids name one account on both hosts. Local ids name only
                 // this host's account; all entries belonging to the other host stay.
+                const vault = id.startsWith('vault:')
+                const matching = (entry: unknown) =>
+                  record(entry).account === id
+                const currentFloors = record(
+                  floors.find(
+                    (entry) => matching(entry) && record(entry).host === host,
+                  ) ??
+                    (vault
+                      ? floors.find(
+                          (entry) =>
+                            matching(entry) && record(entry).host === 'both',
+                        )
+                      : undefined),
+                )
                 floors = floors.filter(
                   (entry) =>
-                    record(entry).account !== id ||
-                    (!id.startsWith('vault:') && record(entry).host !== host),
+                    !matching(entry) || (!vault && record(entry).host !== host),
                 )
-                const own = record(accounts[id])
-                if (Object.keys(own).length > 0)
+                const editedFloors = record(accounts[id])
+                const valueFor = (window: FloorWindow) => {
+                  if (windows.has(window)) return editedFloors[window]
+                  const value = currentFloors[window]
+                  return value === 0 ? undefined : value
+                }
+                const primary = valueFor('primary')
+                const secondary = valueFor('secondary')
+                if (primary !== undefined || secondary !== undefined)
                   floors.push({
                     account: id,
-                    host: id.startsWith('vault:') ? 'both' : host,
-                    primary: own.primary ?? 0,
-                    secondary: own.secondary ?? 0,
+                    host: vault ? 'both' : host,
+                    primary: primary ?? 0,
+                    secondary: secondary ?? 0,
                   })
               }
               // The writer validates the complete list against its declaration

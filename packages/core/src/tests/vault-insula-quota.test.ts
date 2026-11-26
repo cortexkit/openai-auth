@@ -507,6 +507,47 @@ describe('vault insula quota', () => {
     expect(env.daemon.insulaOpens).toBe(1)
   })
 
+  test('background quota source logs again for a route that leaves and rejoins the roster', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const other = route(env.vault, 'account-b')
+    const logFile = join(env.dir, 'vault.log')
+    resetLoggerForTest()
+    initLogger({ file: logFile, level: 'info' })
+    const sourceCount = async (routeId: string) => {
+      await flushForTest()
+      return readFileSync(logFile, 'utf8')
+        .split('\n')
+        .filter(
+          (line) =>
+            line.includes('vault background quota source changed') &&
+            line.includes(`"routeId":"${routeId}"`),
+        ).length
+    }
+    try {
+      env.daemon.insula = {
+        reply: { result: [current(env.now), current(env.now, 'account-b')] },
+      }
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      expect(await env.vault.pollQuota(other)).toEqual({ ok: true })
+      expect(await sourceCount(id)).toBe(1)
+
+      const login = env.daemon.credentials.a!
+      delete env.daemon.credentials.a
+      await env.vault.refresh()
+      expect(env.vault.owns(id)).toBe(false)
+      env.daemon.credentials.a = login
+      await env.vault.refresh()
+      expect(route(env.vault)).toBe(id)
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      expect(await env.vault.pollQuota(other)).toEqual({ ok: true })
+      expect(await sourceCount(id)).toBe(2)
+      expect(await sourceCount(other)).toBe(1)
+    } finally {
+      resetLoggerForTest()
+    }
+  })
+
   test('background quota source logs only changes and never exposes account identity', async () => {
     const env = await setup()
     const id = route(env.vault)

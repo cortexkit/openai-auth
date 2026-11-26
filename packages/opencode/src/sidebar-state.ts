@@ -7,6 +7,7 @@ import {
   quotaWindowName,
 } from '@cortexkit/common-auth/quota'
 import { orderForPlacement } from '@cortexkit/common-auth/routing'
+import type { OAuthQuotaSnapshot } from '@cortexkit/openai-auth-core/internal'
 import {
   creditsUsable,
   orderedPlacement,
@@ -21,17 +22,9 @@ export interface QuotaWindow {
   windowMinutes?: number
 }
 
-export interface SpendControlReading {
-  limit: number
-  used: number
-  remaining: number
-  usedPercent: number
-  remainingPercent: number
-  resetsAt?: string
-  unit?: string
-  source?: string
-  reached: boolean
-}
+export type SpendControlReading = NonNullable<
+  OAuthQuotaSnapshot['spendControl']
+>
 
 export interface AccountQuota {
   checkedAt?: number

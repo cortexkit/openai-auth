@@ -897,6 +897,43 @@ test('capacity placement does not use a credential that changed while waiting', 
   }
 })
 
+test('capacity placement refuses a picked account below a floor raised during the wait', async () => {
+  const start = Date.UTC(2026, 6, 16)
+  let now = start
+  const env = await placementRequest(
+    [
+      { refused: { code: 'concurrency_full', resets_at_ms: start + 6000 } },
+      { account_id: 'account-b' },
+    ],
+    { now: () => now },
+  )
+  env.routes[1]!.quota = quotaMap(60, start)
+  env.storage.killswitch = {
+    enabled: true,
+    schema: 'floors-v1',
+    defaults: { primary: 25 },
+  }
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    env.storage.killswitch = {
+      ...env.storage.killswitch,
+      defaults: { primary: 50 },
+    }
+    now += wait.delay
+    wait.wake()
+    await expect(sent).rejects.toMatchObject({
+      kind: 'no-account',
+      message: VAULT_MODE_REFUSALS['vault-refused'],
+    })
+    expect(env.accountFor).toHaveBeenCalledTimes(2)
+    expect(env.authorized).toEqual([])
+    expect(env.providerFetch).not.toHaveBeenCalled()
+  } finally {
+    await env.dispose()
+  }
+})
+
 test('OpenCode 2 follows its recorded ordered account without asking again', async () => {
   const calls: unknown[] = []
   Reflect.set(globalThis, key, () => ({

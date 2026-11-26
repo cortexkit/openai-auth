@@ -458,6 +458,26 @@ describe('fresh list edits and refusals', () => {
     ])
   })
 
+  test('overlapping edits to different windows of the same vault account keep both values', async () => {
+    const id = 'vault:shared'
+    const { floors, finished } = await overlappingFloorEdits(
+      [floor(id, 'both', 30, 40)],
+      (settings) => {
+        const own = settings.killswitch as {
+          accounts: Record<string, { primary?: number; secondary?: number }>
+        }
+        own.accounts[id]!.primary = 71
+      },
+      (settings) => {
+        const own = settings.killswitch as {
+          accounts: Record<string, { primary?: number; secondary?: number }>
+        }
+        delete own.accounts[id]!.secondary
+      },
+    )
+    expect(floors, finished).toEqual([floor(id, 'both', 71, 0)])
+  })
+
   test.each([
     { name: 'non-array', value: {} },
     { name: 'null', value: null },

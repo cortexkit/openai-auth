@@ -354,33 +354,25 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
   // key being absent, which says nothing, so only the null form clears.
   if (json.spend_control === null || individualLimit === null) {
     snapshot.spendControlCleared = true
-  }
-  if (individualLimit && typeof json.spend_control?.reached === 'boolean') {
-    const limit = nonNegativeNumberish(individualLimit.limit)
-    const used = nonNegativeNumberish(individualLimit.used)
-    const remaining = nonNegativeNumberish(individualLimit.remaining)
-    const usedPercent = nonNegativeNumberish(individualLimit.used_percent)
+  } else if (typeof json.spend_control?.reached === 'boolean') {
+    // The backend's verdict remains useful even when it omits display values.
+    const limit = nonNegativeNumberish(individualLimit?.limit)
+    const used = nonNegativeNumberish(individualLimit?.used)
+    const remaining = nonNegativeNumberish(individualLimit?.remaining)
+    const usedPercent = nonNegativeNumberish(individualLimit?.used_percent)
     const remainingPercent = nonNegativeNumberish(
-      individualLimit.remaining_percent,
+      individualLimit?.remaining_percent,
     )
-    if (
-      limit !== undefined &&
-      used !== undefined &&
-      remaining !== undefined &&
-      usedPercent !== undefined &&
-      remainingPercent !== undefined
-    ) {
-      snapshot.spendControl = {
-        limit,
-        used,
-        remaining,
-        usedPercent,
-        remainingPercent,
-        resetsAt: toResetIso(individualLimit.reset_at),
-        unit: individualLimit.unit,
-        source: individualLimit.source,
-        reached: json.spend_control.reached,
-      }
+    snapshot.spendControl = {
+      ...(limit !== undefined && { limit }),
+      ...(used !== undefined && { used }),
+      ...(remaining !== undefined && { remaining }),
+      ...(usedPercent !== undefined && { usedPercent }),
+      ...(remainingPercent !== undefined && { remainingPercent }),
+      resetsAt: toResetIso(individualLimit?.reset_at),
+      unit: individualLimit?.unit,
+      source: individualLimit?.source,
+      reached: json.spend_control.reached,
     }
   }
   const credits = json.credits

@@ -34,38 +34,12 @@ const VAULT_STATES = new Map<string, SidebarAccountState['vaultState']>([
   ['corrupt', 'unavailable'],
 ])
 
-function finite(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value)
-}
-
-/**
- * The credit budget in the sidebar's reading shape, when the pool map holds a
- * full reading of it. A partial reading (no limit or usage numbers) is left
- * out rather than shown with made-up numbers.
- */
 function spendControlOf(map: unknown): SpendControlReading | undefined {
   if (!isQuotaMap(map)) return undefined
   const budget = map.budget
   if (budget?.kind !== 'reading') return undefined
-  const { limit, used, remaining, usedPercent, remainingPercent } = budget
-  if (
-    !finite(limit) ||
-    !finite(used) ||
-    !finite(remaining) ||
-    !finite(usedPercent) ||
-    !finite(remainingPercent)
-  )
-    return undefined
-  return {
-    limit,
-    used,
-    remaining,
-    usedPercent,
-    remainingPercent,
-    reached: budget.reached,
-    ...(budget.resetsAt !== undefined ? { resetsAt: budget.resetsAt } : {}),
-    ...(budget.unit !== undefined ? { unit: budget.unit } : {}),
-  }
+  const { kind: _kind, checkedAt: _checkedAt, ...reading } = budget
+  return reading
 }
 
 /** A row's pool quota map as the sidebar's quota snapshot, or null when it has no reading. */

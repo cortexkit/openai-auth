@@ -15,6 +15,7 @@ import {
   getCollapsedQuotaSummary,
   hashSidebarSessionId,
   type SidebarState,
+  spendControlExhaustedResetAt,
 } from '../sidebar-state.ts'
 import {
   buildApplyRequest,
@@ -283,6 +284,20 @@ describe('dynamic quota TUI rows', () => {
       ['secondary', '7d', 20],
       ['spendControl', 'credits', 20.071150665283206],
     ])
+  })
+
+  test('a partial pool budget keeps its verdict without showing missing numbers', () => {
+    const resetsAt = new Date(now + 60_000).toISOString()
+    const quota = sidebarQuotaFromPoolMap({
+      limits: [],
+      budget: { kind: 'reading', reached: true, checkedAt: now, resetsAt },
+    })
+    expect(spendControlExhaustedResetAt(quota, now)).toEqual({
+      resetsAt,
+      resetAtMs: now + 60_000,
+    })
+    expect(buildQuotaRowsForDisplay(quota, now, false)).toEqual([])
+    expect(getAccountMetadataRows(undefined, quota?.spendControl)).toEqual([])
   })
 
   test('renders the existing two-bar sidebar output without spend control', () => {
