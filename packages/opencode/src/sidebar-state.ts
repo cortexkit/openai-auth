@@ -419,29 +419,47 @@ function quotaRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function quotaNumber(value: unknown): boolean {
+function quotaNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
 }
 
-function quotaWindow(value: unknown): boolean {
-  return (
-    quotaRecord(value) &&
-    quotaNumber(value.usedPercent) &&
-    quotaNumber(value.remainingPercent) &&
-    (value.checkedAt === undefined || quotaNumber(value.checkedAt)) &&
-    (value.resetsAt === undefined || typeof value.resetsAt === 'string') &&
-    (value.windowMinutes === undefined || quotaNumber(value.windowMinutes))
+function readQuotaWindow(value: unknown): Partial<QuotaWindow> | undefined {
+  if (!quotaRecord(value)) return undefined
+  const { checkedAt, usedPercent, remainingPercent, resetsAt, windowMinutes } =
+    value
+  if (
+    (resetsAt !== undefined && typeof resetsAt !== 'string') ||
+    (windowMinutes !== undefined && !quotaNumber(windowMinutes))
   )
+    return undefined
+
+  // A structurally safe window can keep its label and a valid freshness stamp
+  // without supplying a percentage. A corrupt stamp invalidates the figures:
+  // the renderer must not make them look current using the quota-level stamp.
+  const hasReading =
+    quotaNumber(usedPercent) &&
+    (remainingPercent === undefined || quotaNumber(remainingPercent)) &&
+    (checkedAt === undefined || quotaNumber(checkedAt))
+  return {
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
+    ...(windowMinutes !== undefined ? { windowMinutes } : {}),
+    ...(quotaNumber(checkedAt) ? { checkedAt } : {}),
+    ...(hasReading ? { usedPercent } : {}),
+    ...(hasReading && remainingPercent !== undefined
+      ? { remainingPercent }
+      : {}),
+  }
 }
 
 function quotaSpendControl(value: unknown): boolean {
   return (
     quotaRecord(value) &&
-    quotaNumber(value.limit) &&
-    quotaNumber(value.used) &&
-    quotaNumber(value.remaining) &&
-    quotaNumber(value.usedPercent) &&
-    quotaNumber(value.remainingPercent) &&
+    (value.limit === undefined || quotaNumber(value.limit)) &&
+    (value.used === undefined || quotaNumber(value.used)) &&
+    (value.remaining === undefined || quotaNumber(value.remaining)) &&
+    (value.usedPercent === undefined || quotaNumber(value.usedPercent)) &&
+    (value.remainingPercent === undefined ||
+      quotaNumber(value.remainingPercent)) &&
     typeof value.reached === 'boolean' &&
     (value.resetsAt === undefined || typeof value.resetsAt === 'string') &&
     (value.unit === undefined || typeof value.unit === 'string') &&
@@ -462,21 +480,22 @@ function quotaCredits(value: unknown): boolean {
 }
 
 function readAccountQuota(value: unknown): AccountQuota | null {
-  if (
-    !quotaRecord(value) ||
-    (value.checkedAt !== undefined && !quotaNumber(value.checkedAt)) ||
-    (value.primary !== undefined && !quotaWindow(value.primary)) ||
-    (value.secondary !== undefined && !quotaWindow(value.secondary)) ||
-    (value.spendControl !== undefined &&
-      !quotaSpendControl(value.spendControl)) ||
-    (value.spendControlCleared !== undefined &&
-      value.spendControlCleared !== true) ||
-    (value.resetCreditsAvailable !== undefined &&
-      !quotaNumber(value.resetCreditsAvailable)) ||
-    (value.credits !== undefined && !quotaCredits(value.credits))
-  )
-    return null
-  return value as AccountQuota
+  if (!quotaRecord(value)) return null
+  const quota = { ...value }
+  for (const key of QUOTA_WINDOW_KEYS) {
+    const window = readQuotaWindow(quota[key])
+    if (window) quota[key] = window
+    else delete quota[key]
+  }
+  if (!quotaNumber(quota.checkedAt)) delete quota.checkedAt
+  if (!quotaSpendControl(quota.spendControl)) delete quota.spendControl
+  if (quota.spendControlCleared !== true) delete quota.spendControlCleared
+  if (!quotaNumber(quota.resetCreditsAvailable))
+    delete quota.resetCreditsAvailable
+  if (!quotaCredits(quota.credits)) delete quota.credits
+  // The writer's type describes complete readings; a safe, incomplete window
+  // from disk stays present so the sidebar can display a no-reading row.
+  return quota as AccountQuota
 }
 
 /**
@@ -2311,7 +2330,12 @@ export function sidebarQuotaProjection(
               scope: 'all',
               label,
               usedPercent: window.usedPercent,
-              checkedAt: window.checkedAt ?? quota.checkedAt ?? now,
+              checkedAt:
+                window.checkedAt ??
+                (quotaNumber(window.usedPercent)
+                  ? quota.checkedAt
+                  : undefined) ??
+                now,
               windowMinutes: window.windowMinutes,
               resetsAt: window.resetsAt,
             },
@@ -2510,7 +2534,7 @@ export function computeQuotaPacing(
   windowMs: number,
   now: number,
 ): QuotaPacing | null {
-  if (!window.resetsAt) return null
+  if (!window.resetsAt || !quotaNumber(window.usedPercent)) return null
   const resetsAt = new Date(window.resetsAt).getTime()
   if (!Number.isFinite(resetsAt)) return null
   const start = resetsAt - windowMs

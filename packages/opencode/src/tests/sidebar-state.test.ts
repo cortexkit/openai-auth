@@ -97,9 +97,12 @@ function make(overrides: Partial<SidebarState>): SidebarState {
 // SidebarState for every possible input.
 // ---------------------------------------------------------------------------
 
-test('a malformed nested sidebar quota reads as no reading for every account source', async () => {
+test('malformed sidebar quota members do not discard sibling readings from any account source', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'sidebar-malformed-quota-'))
   const file = join(dir, 'sidebar.json')
+  const spendControl = { reached: true, resetsAt: '2027-01-01T00:00:00Z' }
+  const checkedAt = 17
+  const secondary = { usedPercent: 25, windowMinutes: 10_080 }
   try {
     writeFileSync(
       file,
@@ -111,28 +114,47 @@ test('a malformed nested sidebar quota reads as no reading for every account sou
               remainingPercent: 20,
               resetsAt: { toString: 0 },
             },
+            secondary,
           },
         },
         fallbacks: [
-          { id: 'fallback', quota: { spendControl: { limit: Infinity } } },
+          {
+            id: 'fallback',
+            quota: {
+              primary: { checkedAt },
+              spendControl: { reached: true, limit: 'bad' },
+            },
+          },
         ],
         vaultAccounts: [
           {
             id: 'vault',
-            quota: { credits: { hasCredits: 'yes', unlimited: false } },
+            quota: {
+              checkedAt,
+              primary: {
+                checkedAt: 'bad',
+                usedPercent: 40,
+                remainingPercent: 60,
+                windowMinutes: 300,
+              },
+              credits: { hasCredits: 'yes', unlimited: false },
+              spendControl,
+            },
           },
         ],
       }),
     )
     const state = await getSidebarState(file)
-    const readings = [
-      state.main.quota,
-      state.fallbacks[0]!.quota,
-      state.vaultAccounts![0]!.quota,
-    ]
-    expect(readings).toEqual([null, null, null])
-    for (const reading of readings)
-      expect(getCollapsedQuotaSummary(reading).text).toBeNull()
+    expect<unknown>(state.main.quota).toStrictEqual({ secondary })
+    expect(getCollapsedQuotaSummary(state.main.quota).text).toContain('75%')
+    expect<unknown>(state.fallbacks[0]!.quota).toStrictEqual({
+      primary: { checkedAt },
+    })
+    expect<unknown>(state.vaultAccounts![0]!.quota).toStrictEqual({
+      checkedAt,
+      primary: { windowMinutes: 300 },
+      spendControl,
+    })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
