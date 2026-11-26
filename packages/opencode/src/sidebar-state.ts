@@ -53,7 +53,7 @@ export interface AccountCredits {
 
 /**
  * The prepaid-credits text for an account (`Unlimited`, `<n> credits` or
- * `Available`), or undefined when it has none or the file holds no
+ * `Available`), or undefined when it has none or the quota holds no
  * well-formed credits record.
  */
 export function accountCreditsText(

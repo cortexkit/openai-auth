@@ -184,8 +184,10 @@ class SidebarPublisher {
         )
       })
       .catch(() => {
-        // Retry a failed sidebar write on the next tick unless a newer
-        // observation is already queued. Routing updates are separate.
+        // Forget the observation of a failed quota write so the next tick
+        // writes again with unchanged inputs, unless a newer observation is
+        // already queued. A failed session-pin publication (`publication` set)
+        // is not retried here; the next pin change publishes again.
         if (!publication && this.observations.get(producer) === observation)
           this.observations.delete(producer)
         // File writers report I/O failures; do not log account snapshots or credentials.
