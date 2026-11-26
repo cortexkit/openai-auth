@@ -193,7 +193,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
-  it('setMain clears a mark when the only present window is healthy (single-primary wire)', async () => {
+  it('setMain clears a short mark when the only present window is a healthy 5h window', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -210,15 +210,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     qm.markRateLimited('main', now + 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
-    // The current wire sends a single present primary window (secondary is
-    // absent, not unhealthy) — a healthy primary alone is positive evidence,
-    // since an absent window is not applicable, not uncertain.
     qm.setMain('token-a', {
       quota: {
         primary: {
           usedPercent: 10,
           remainingPercent: 90,
-          windowMinutes: 10_080,
+          windowMinutes: 300,
           checkedAt: now,
         },
       },
@@ -228,7 +225,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
-  it('setMain does not clear the mark when a present window is still exhausted', async () => {
+  it('setMain does not clear a weekly mark while the weekly window is still exhausted', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -242,11 +239,9 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       },
     })
 
-    qm.markRateLimited('main', now + 60_000)
+    qm.markRateLimited('main', now + 24 * 60 * 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
-    // A present-and-still-exhausted window is not evidence of health, even
-    // alongside a healthy sibling — every present window must be under 100%.
     qm.setMain('token-a', {
       quota: {
         primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
@@ -256,6 +251,51 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       checkedAt: now,
     })
     expect(qm.isRateLimited('main')).toBe(true)
+  })
+
+  it('keeps a weekly mark until a reading carries usable weekly quota', async () => {
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const checkedAt = 4_060_000
+    const hour = 60 * 60_000
+    const resetAt = checkedAt + 6 * hour
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+      // At delivery the same expiry is less than 5h away. The age of the
+      // reading must not make its 5h window explain a weekly mark.
+      now: () => checkedAt + 2 * hour,
+    })
+    const primary = {
+      usedPercent: 10,
+      remainingPercent: 90,
+      windowMinutes: 300,
+      checkedAt,
+    }
+    const weekly = { ...primary, windowMinutes: 10_080 }
+    const entry = { checkedAt, refreshAfter: checkedAt + 60_000 }
+    qm.setFallback('fb-1', {
+      ...entry,
+      quota: {
+        primary,
+        secondary: { ...weekly, usedPercent: 100, remainingPercent: 0 },
+      },
+    })
+    qm.markRateLimited('fb-1', resetAt)
+    qm.setFallback('fb-1', { ...entry, quota: { primary } })
+    expect(qm.isRateLimited('fb-1')).toBe(true)
+
+    for (const secondary of [
+      { ...weekly, windowMinutes: 0 },
+      { ...weekly, usedPercent: NaN, remainingPercent: NaN },
+    ]) {
+      qm.setFallback('fb-1', { ...entry, quota: { primary, secondary } })
+      expect(qm.isRateLimited('fb-1')).toBe(true)
+    }
+
+    qm.setFallback('fb-1', { ...entry, quota: { secondary: weekly } })
+    expect(qm.isRateLimited('fb-1')).toBe(false)
   })
 
   it('setMain clears the mark when both present windows are healthy', async () => {
@@ -301,7 +341,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     })
 
     // A still-exhausted snapshot establishes the initial account identity
-    // without itself clearing anything (quotaLooksHealthy is false).
+    // without itself clearing anything.
     const exhaustedEntry = {
       quota: {
         primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
@@ -480,7 +520,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited(fallbackId)).toBe(true)
   })
 
-  it('refreshMain clears a stale main mark once a healthy quota poll lands (bypasses setMain)', async () => {
+  it('refreshMain clears a short main mark when its poll finds healthy short quota', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -498,9 +538,6 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     qm.markRateLimited('main', now + 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
-    // _fetchMain assigns this.main directly (not via setMain), so its own
-    // healthy-clear must fire independently — otherwise a known-healthy
-    // active poll leaves the mark stuck until its own unrelated expiry.
     await qm.refreshMain('token-a')
     expect(qm.isRateLimited('main')).toBe(false)
   })

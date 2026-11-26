@@ -328,7 +328,7 @@ export class QuotaManager {
     }
     if (accountId) this.mainQuotaAccountId = accountId
     this.main = entry
-    if (quotaLooksHealthy(entry.quota)) this.clearRateLimited('main')
+    this.clearRecoveredRateLimit('main', entry)
   }
 
   /**
@@ -401,7 +401,7 @@ export class QuotaManager {
     } else {
       this.fallbackTokenFps.delete(accountId)
     }
-    if (quotaLooksHealthy(entry.quota)) this.clearRateLimited(accountId)
+    this.clearRecoveredRateLimit(accountId, entry)
   }
 
   // =========================================================================
@@ -444,6 +444,27 @@ export class QuotaManager {
   /** Explicit early clear — read-time expiry in isRateLimited is primary. */
   clearRateLimited(accountId: string): void {
     this.rateLimitedUntilMap.delete(accountId)
+  }
+
+  private clearRecoveredRateLimit(accountId: string, entry: QuotaEntry): void {
+    const until = this.rateLimitedUntilMap.get(accountId)
+    if (until === undefined || !Number.isFinite(entry.checkedAt)) return
+    // Use the reading's time so a delayed delivery cannot make a weekly
+    // reset look like a short reset. An unrelated window cannot prove recovery.
+    const short = until - entry.checkedAt <= 5 * 60 * 60_000
+    const window = short ? entry.quota.primary : entry.quota.secondary
+    if (
+      window &&
+      (window.windowMinutes === undefined ||
+        window.windowMinutes === (short ? 300 : 10_080)) &&
+      Number.isFinite(window.usedPercent) &&
+      window.usedPercent >= 0 &&
+      window.usedPercent < 100 &&
+      Number.isFinite(window.remainingPercent) &&
+      window.remainingPercent > 0
+    ) {
+      this.clearRateLimited(accountId)
+    }
   }
 
   // =========================================================================
@@ -762,24 +783,18 @@ export class QuotaManager {
           const fetchStartedAt = this.now()
           const quota = await this._fetchQuota(accessToken)
           const now = this.now()
-          this.mainTokenFp = tokenFingerprint(accessToken)
-          this.main = {
-            quota,
-            refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
-            checkedAt: now,
-          }
-          // This assignment bypasses setMain (no accountId is threaded through
-          // this path), so its healthy-clear must be mirrored here — otherwise
-          // a known-healthy active poll leaves a stale mid-stream mark forcing
-          // fallback until the mark's own (unrelated) reset estimate.
-          if (quotaLooksHealthy(quota)) this.clearRateLimited('main')
-          this.mainLastApiError = undefined
-          this.onMainQuotaFetched?.(
-            quota,
-            now,
-            this.mainTokenFp,
-            fetchStartedAt,
+          this.setMain(
+            accessToken,
+            {
+              quota,
+              refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
+              checkedAt: now,
+            },
+            undefined,
+            true,
           )
+          this.mainLastApiError = undefined
+          this.onMainQuotaFetched?.(quota, now, thisFetchFp, fetchStartedAt)
           return quota
         } catch (error) {
           this._handleMainFetchError(error)
@@ -924,26 +939,4 @@ export class QuotaManager {
 // not count as "has a quota window" and bypass the conditional-push guard.
 function hasAnyQuotaWindow(quota: OAuthQuotaSnapshot): boolean {
   return Boolean(quota.primary || quota.secondary)
-}
-
-// ---------------------------------------------------------------------------
-// Mid-stream rate-limit mark: early-clear guard
-// ---------------------------------------------------------------------------
-
-/**
- * True when a freshly pushed snapshot shows at least one present window and
- * every PRESENT window is under 100% used — positive evidence the account
- * is no longer exhausted, so a stale mid-stream rate-limit mark can be
- * cleared before its read-time expiry. An absent window is not applicable
- * (not uncertainty), so it does not block the clear — the wire may only
- * ever report a single live window (e.g. one 7-day primary). A present
- * window still at 100% is real evidence the account remains exhausted, so
- * it blocks the clear even alongside a healthy sibling.
- */
-function quotaLooksHealthy(quota: OAuthQuotaSnapshot): boolean {
-  const { primary, secondary } = quota
-  if (!primary && !secondary) return false
-  if (primary && primary.usedPercent >= 100) return false
-  if (secondary && secondary.usedPercent >= 100) return false
-  return true
 }

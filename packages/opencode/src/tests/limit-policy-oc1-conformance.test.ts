@@ -327,14 +327,14 @@ describe('OC1 limit-policy conformance', () => {
     expect(manager.isRateLimited('other')).toBe(false)
   })
 
-  test('OA-19 legacy empty windows are not health and an exhausted sibling prevents clear', () => {
+  test('OA-19 legacy quota clears a live mark only with the matching window', () => {
     const manager = legacy()
     const entry = (quota: Parameters<QuotaManager['setMain']>[1]['quota']) => ({
       quota,
       checkedAt: NOW,
       refreshAfter: NOW + 60_000,
     })
-    manager.markRateLimited('main', NOW + 60_000)
+    manager.markRateLimited('main', NOW + 24 * 60 * 60_000)
     manager.setMain('a', entry({}))
     expect(manager.isRateLimited('main')).toBe(true)
     manager.setMain(
@@ -349,6 +349,13 @@ describe('OC1 limit-policy conformance', () => {
       'a',
       entry({
         primary: { usedPercent: 10, remainingPercent: 90, checkedAt: NOW },
+      }),
+    )
+    expect(manager.isRateLimited('main')).toBe(true)
+    manager.setMain(
+      'a',
+      entry({
+        secondary: { usedPercent: 10, remainingPercent: 90, checkedAt: NOW },
       }),
     )
     expect(manager.isRateLimited('main')).toBe(false)
