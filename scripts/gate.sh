@@ -122,9 +122,8 @@ run types bun run types
 run build bun run build
 run format bun run format:check
 run lint bun run lint
-step=ignored-worker-files
-ignored=$(git ls-files -ci --exclude-standard -- .cortexkit)
-if [[ -n "$ignored" ]]; then printf '%s\n' "$ignored"; exit 1; fi
+step=cortexkit-layout
+scripts/check-cortexkit-layout.sh
 
 step=packaging
 mkdir -p target/scratch

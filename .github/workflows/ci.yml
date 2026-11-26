@@ -29,6 +29,9 @@ jobs:
           done
       - name: Check source file sizes
         run: node scripts/check-source-size.mjs
+      - name: Check tracked CortexKit files
+        shell: bash
+        run: scripts/check-cortexkit-layout.sh
       - run: bun run types
       - run: bun run build
       - run: bun run test

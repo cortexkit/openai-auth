@@ -13,6 +13,9 @@ packages/opencode/src/tui-compiled/
 .claude/
 .alfonso/
 .cortexkit/*
+!.cortexkit/release-notes/
+!.cortexkit/skills/
+!.cortexkit/rules/
 !.cortexkit/WORKER.md
 HANDOVER.md
 
