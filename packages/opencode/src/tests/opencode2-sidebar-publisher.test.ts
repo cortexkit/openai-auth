@@ -490,7 +490,9 @@ test('OpenCode 2 publisher: an equivalent vault refresh does not rewrite the sid
 
 test('OpenCode 2 publisher retries a rejected observation write on the next unchanged tick', async () => {
   const observation = sidebarObserver()
-  const f = await fixture(undefined, false, undefined, observation)
+  // With no accounts, a deferred startup quota write can't change the
+  // config file between ticks and trigger another publication.
+  const f = await fixture(undefined, false, [], observation)
   await observation.tick(f.file)
   const publish = spyOn(
     sidebarState,
