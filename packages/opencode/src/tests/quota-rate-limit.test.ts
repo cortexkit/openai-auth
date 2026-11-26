@@ -253,6 +253,39 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(true)
   })
 
+  it('a lone weekly window in primary clears a weekly mark but not a 5h mark', async () => {
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const checkedAt = 4_055_000
+    const hour = 60 * 60_000
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+      now: () => checkedAt,
+    })
+    const entry = {
+      quota: {
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 10_080,
+          checkedAt,
+        },
+      },
+      refreshAfter: checkedAt + 60_000,
+      checkedAt,
+    }
+
+    qm.markRateLimited('main', checkedAt + 5 * hour)
+    qm.setMain('token-a', entry)
+    expect(qm.isRateLimited('main')).toBe(true)
+
+    qm.markRateLimited('main', checkedAt + 24 * hour)
+    qm.setMain('token-a', entry)
+    expect(qm.isRateLimited('main')).toBe(false)
+  })
+
   it('keeps a weekly mark until a reading carries usable weekly quota', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'

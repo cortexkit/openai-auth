@@ -452,11 +452,21 @@ export class QuotaManager {
     // Use the reading's time so a delayed delivery cannot make a weekly
     // reset look like a short reset. An unrelated window cannot prove recovery.
     const short = until - entry.checkedAt <= 5 * 60 * 60_000
-    const window = short ? entry.quota.primary : entry.quota.secondary
+    const { primary, secondary } = entry.quota
+    const windowMinutes = short ? 300 : 10_080
+    const hasLength =
+      primary?.windowMinutes !== undefined ||
+      secondary?.windowMinutes !== undefined
+    // Codex can put a single weekly window in primary. Trust slot names only
+    // for readings that give neither window's length.
+    const bySlot = short ? primary : secondary
+    const window = hasLength
+      ? [primary, secondary].find(
+          (reading) => reading?.windowMinutes === windowMinutes,
+        )
+      : bySlot
     if (
       window &&
-      (window.windowMinutes === undefined ||
-        window.windowMinutes === (short ? 300 : 10_080)) &&
       Number.isFinite(window.usedPercent) &&
       window.usedPercent >= 0 &&
       window.usedPercent < 100 &&
