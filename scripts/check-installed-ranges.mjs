@@ -15,13 +15,21 @@
 // and nothing on their side resolves it again. So this runs first in `build`,
 // where it guards the exact tree that gets bundled and published.
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dir, '..')
 const SECTIONS = ['dependencies', 'devDependencies']
 // Ranges that name no registry version, so there is nothing to compare.
-const UNVERSIONED = /^(workspace:|file:|link:|git|github:|https?:|npm:)/
+const UNVERSIONED = /^(workspace:|file:|link:|git|github:|https?:)/
+
+function declaredRange(spec) {
+  if (UNVERSIONED.test(spec)) return undefined
+  if (!spec.startsWith('npm:')) return spec
+  const target = spec.slice('npm:'.length)
+  const separator = target.lastIndexOf('@')
+  return separator > 0 ? target.slice(separator + 1) || undefined : undefined
+}
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'))
@@ -35,7 +43,7 @@ function readJson(path) {
 // node_modules also keeps the lookup from resolving a package hoisted at the
 // root instead of the fixture's pinned copy.
 function packageDirs() {
-  const dirs = [root]
+  const dirs = [{ dir: root, boundary: root }]
   const packages = join(root, 'packages')
   function walk(parent) {
     for (const entry of readdirSync(parent, { withFileTypes: true })) {
@@ -46,9 +54,14 @@ function packageDirs() {
       )
         continue
       const dir = join(parent, entry.name)
-      if (existsSync(join(dir, 'package.json'))) {
+      if (lstatSync(join(dir, 'package.json'), { throwIfNoEntry: false })) {
         const workspace = parent === packages
-        if (workspace || existsSync(join(dir, 'node_modules'))) dirs.push(dir)
+        if (
+          workspace ||
+          lstatSync(join(dir, 'node_modules'), { throwIfNoEntry: false })
+        ) {
+          dirs.push({ dir, boundary: workspace ? root : dir })
+        }
       }
       walk(dir)
     }
@@ -57,35 +70,35 @@ function packageDirs() {
   return dirs
 }
 
-// Node's own lookup: the nearest node_modules/<name> walking up from the
-// package. Reading package.json directly avoids `exports` maps that do not
-// expose it.
-function installedVersion(fromDir, name) {
+// Use the nearest installed dependency, stopping at the workspace root or the
+// fixture's own install. Reading package.json directly avoids `exports` maps.
+function installedVersion(fromDir, boundary, name) {
   let dir = fromDir
   while (true) {
     const manifest = join(dir, 'node_modules', name, 'package.json')
-    if (existsSync(manifest)) return readJson(manifest).version
-    const parent = dirname(dir)
-    if (parent === dir) return undefined
-    dir = parent
+    if (lstatSync(manifest, { throwIfNoEntry: false }))
+      return readJson(manifest).version
+    if (dir === boundary) return undefined
+    dir = dirname(dir)
   }
 }
 
 const problems = []
 let checked = 0
-for (const dir of packageDirs()) {
+for (const { dir, boundary } of packageDirs()) {
   const manifest = readJson(join(dir, 'package.json'))
   const label = manifest.name ?? dir
   for (const section of SECTIONS) {
-    for (const [name, range] of Object.entries(manifest[section] ?? {})) {
-      if (UNVERSIONED.test(range)) continue
-      const version = installedVersion(dir, name)
+    for (const [name, spec] of Object.entries(manifest[section] ?? {})) {
+      const range = declaredRange(spec)
+      if (range === undefined) continue
+      const version = installedVersion(dir, boundary, name)
       checked += 1
       if (version === undefined) {
-        problems.push(`${label}: ${name} (${range}) is not installed`)
+        problems.push(`${label}: ${name} (${spec}) is not installed`)
       } else if (!Bun.semver.satisfies(version, range)) {
         problems.push(
-          `${label}: ${name} is installed at ${version}, outside the declared ${range}`,
+          `${label}: ${name} is installed at ${version}, outside the declared ${spec}`,
         )
       }
     }

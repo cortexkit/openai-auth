@@ -35,7 +35,7 @@ On OpenCode 1 and 2, the plugin's `/openai` slash command opens its menu in the 
 
 What each section controls is described in [Accounts and routing](accounts-and-routing.md), [Cache keep-warm](cache-keep-warm.md), [Troubleshooting](troubleshooting.md) and [Claustrum vault](vault.md).
 
-The menu saves settings in the account pool, under `routing.mode`, `routing.maxSameAccountWait`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. It opens after the main login is transferred from OpenCode 1's `auth.json` into the shared pool. To avoid leaving a process that still reads only `auth.json`, the transfer waits for every running OpenCode process to use this plugin version or newer. Until it finishes, `/openai` shows **Accounts are moving** and lists any blocking processes.
+The menu saves preferences such as routing, limits, logging, cache warming and request dumps in the [shared settings file](configuration.md#settings), not in the account pool. Separate installs and processes that haven't moved their preferences to the shared file still use their account store for preferences. The menu opens after the main login is transferred from OpenCode 1's `auth.json` into the shared pool. To avoid leaving a process that still reads only `auth.json`, the transfer waits for every running OpenCode process to use this plugin version or newer. Until it finishes, `/openai` shows **Accounts are moving** and lists any blocking processes.
 
 The eight earlier commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone; their actions are sections of the menu.
 
@@ -78,4 +78,4 @@ The Pi extension registers one command, `openai`, which opens a menu:
 
 Sign in to Pi itself with `/login openai-codex`; this is separate from adding fallback accounts in the plugin menu.
 
-**Longest wait on the same account** offers **Don't wait**, **15 minutes** (default) and **Until the cache expires**, saved as `0`, `15` and `"max"` in `routing.maxSameAccountWait`. See [Routing](accounts-and-routing.md#routing) for the cache and reset requirements.
+**Longest wait on the same account** offers **Don't wait**, **15 minutes** (default) and **Until the cache expires**. See [Configuration](configuration.md#routing-wait-and-log-level) for the saved setting and [Routing](accounts-and-routing.md#routing) for the cache and reset requirements.

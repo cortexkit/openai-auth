@@ -46,7 +46,8 @@ For OpenCode 2's vault activation command and login method, see [Vault-only host
 While OpenCode or Pi holds a vault token (**vault mode**), its requests use only vault accounts:
 
 - They route through the same [routing modes and limits](accounts-and-routing.md) as local accounts.
-- Each request fetches its token from the vault, and a token the provider rejects is reported back to the vault.
+- Each request asks the vault for a token. If the vault is unreachable, the plugin can reuse the last token it served for that account from memory, but only while more than one minute remains before it expires.
+- When the plugin reports a provider HTTP 401, the report names the exact version of the vault credential used for that send. OpenCode 2 never reports a refused WebSocket handshake. Before any output, it can retry an HTTP 401 once if the vault supplies a newer version of the same login. If a token kept for an outage gets a 401, the plugin neither reports it nor retries with it. That account stops serving until the vault is reachable again.
 - No local account (a pool row, OpenCode's slot login, Pi's own login) is sent with, refreshed, polled or warmed, and the local pool files are left exactly as they are.
 - The OpenCode sidebar lists vault accounts only, including accounts that need sign-in or are unavailable. It keeps their last quota reading and shows your `/openai` on/off choice separately from the vault's state. A **blocked** account is below its configured quota floor and will not route. On OpenCode 1 and 2, `/openai` lists vault accounts only. On OpenCode 1, the `opencode auth login` menu does too.
 - A request no vault account can serve is refused locally. The request error explains the cause and remedy: make accounts available in the vault, or disconnect the affected OpenCode or Pi installation.
@@ -64,7 +65,7 @@ In vault mode, "main" in the **Main first** and **Fallback first** routing modes
 
 Routing → **Set order** shows the vault accounts by the same names as Accounts (email first) and changes this host's vault roster. This works on OpenCode 1, OpenCode 2 and Pi, including unavailable or disabled roster rows. It never reorders the local pool; other local-account actions remain refused while connected. Stale account names or route ids from the other mode are refused without writing an order.
 
-Routing → **Longest wait on the same account** applies to vault accounts too: **Don't wait** (`0`), **15 minutes** (`15`, default) or **Until the cache expires** (`"max"`), stored in the settings-only `routing.maxSameAccountWait` field. A wait never makes a refused or withdrawn vault credential usable, never bypasses killswitch floors and never falls back to local credentials. Vault routing advice cannot extend the session's cache/setting bound. See [Routing](accounts-and-routing.md#routing).
+Routing → **Longest wait on the same account** applies to vault accounts too: **Don't wait**, **15 minutes** (default) or **Until the cache expires**. Waiting does not make a refused or withdrawn vault credential usable, bypass quota floors or fall back to local credentials. Vault advice cannot extend the wait beyond the setting or the remaining cache lifetime. See [Routing](accounts-and-routing.md#routing).
 
 Insula background quota includes its `credits` spend pool as well as usage windows, workspace spending limits and saved resets, so [prepaid-credit routing](accounts-and-routing.md#prepaid-credits) need not wait for a model request. Credits keep Insula's fetch time. An absent credits pool preserves the prior reading without renewing it. Insula's `unlimited` boolean is used when present. Older builds omit it: a balance-less pool then preserves a known unlimited reading; without one it is shown as available credits, not unlimited. An explicit `false` does replace a prior unlimited verdict.
 
@@ -73,6 +74,8 @@ Disconnecting OpenCode or Pi makes its local pool eligible again. Pi's previous 
 ### OpenCode's login slot in vault mode
 
 In OpenCode's vault mode, real logins in OpenCode 1's `openai` slot stay unused. Neither the initial main login nor later replacements are transferred from that slot into the [account pool](accounts-and-routing.md#the-account-pool). After OpenCode disconnects, the slot login moves into the pool on the next request or a periodic check, within about a minute. Use the vault login method while connected; [OpenCode 2's browser and headless pool logins](opencode-2.md#signing-in) refuse to add local credentials until OpenCode disconnects.
+
+On OpenCode 2, vault activation requires an approved enrollment or a working connection to the vault through the host. If enrollment cannot be read or the host's connection fails its check, activation is refused. The plugin does not switch to a local login.
 
 Do not delete OpenCode 1's placeholder as a repair: OpenCode 1 installs the plugin's request handler (its custom `fetch`) only for a provider with an OAuth login. The placeholder supplies that login record without a real token.
 

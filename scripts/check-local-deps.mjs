@@ -4,12 +4,12 @@
 // locally from whatever happens to be on disk there, and fails or silently
 // differs everywhere else (CI, other machines, a release build).
 // Usage: bun scripts/check-local-deps.mjs [repo-root]
-import { readdirSync, readFileSync } from 'node:fs'
-import { dirname, join, resolve, sep } from 'node:path'
+import { readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
-const root = resolve(
-  process.argv[2] ?? import.meta.dir,
-  process.argv[2] ? '.' : '..',
+const root = realpathSync(
+  resolve(process.argv[2] ?? import.meta.dir, process.argv[2] ? '.' : '..'),
 )
 const sections = [
   'dependencies',
@@ -23,8 +23,10 @@ const offenders = []
 let manifests = 0
 
 function outside(path) {
-  const resolved = resolve(path)
-  return resolved !== root && !resolved.startsWith(root + sep)
+  const fromRoot = relative(root, path)
+  return (
+    fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)
+  )
 }
 function inspect(spec, file, field, name, base) {
   if (typeof spec !== 'string' || spec.startsWith('workspace:')) return
@@ -35,15 +37,37 @@ function inspect(spec, file, field, name, base) {
   if (/^(file|link|portal):/.test(spec))
     local = spec.slice(spec.indexOf(':') + 1)
   else if (
-    spec.startsWith('/') ||
+    isAbsolute(spec) ||
     spec.startsWith('./') ||
     spec.startsWith('../') ||
     spec.startsWith('~/')
   )
     local = spec
   else return
-  if (outside(resolve(base, local)))
-    offenders.push({ file, field, name, spec, path: resolve(base, local) })
+  const path = local.startsWith('~/')
+    ? resolve(homedir(), local.slice(2))
+    : resolve(base, local)
+  let real
+  try {
+    real = realpathSync(path)
+  } catch (error) {
+    offenders.push({
+      file,
+      field,
+      name,
+      spec,
+      problem: `cannot resolve ${path}: ${error.message}`,
+    })
+    return
+  }
+  if (outside(real))
+    offenders.push({
+      file,
+      field,
+      name,
+      spec,
+      problem: `resolves outside the repository to ${real}`,
+    })
 }
 function inspectTree(value, file, field, base) {
   if (!value || typeof value !== 'object') return
@@ -121,7 +145,7 @@ if (manifests === 0) {
 if (offenders.length) {
   for (const item of offenders)
     console.error(
-      `${item.file}: ${item.field} ${item.name} ${item.spec} resolves to ${item.path}`,
+      `${item.file}: ${item.field} ${item.name} ${item.spec} ${item.problem}`,
     )
   process.exit(1)
 }

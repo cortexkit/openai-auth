@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -79,9 +86,24 @@ describe('local dependency build gate', () => {
   it('resolves lockfile file specs from their workspace directories', () => {
     fixture((root) => {
       manifest(root, {})
+      writeFileSync(join(root, 'x.tgz'), '')
       lock(root, 'file:../../x.tgz')
       const result = check(root)
       expect(result.status).toBe(0)
+    })
+  })
+
+  it('rejects an in-repository symlink that points outside the repository', () => {
+    fixture((outside) => {
+      fixture((root) => {
+        symlinkSync(outside, join(root, 'linked'), 'junction')
+        manifest(root, { sibling: 'file:./linked' })
+        const result = check(root)
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain(
+          `sibling file:./linked resolves outside the repository to ${realpathSync(outside)}`,
+        )
+      })
     })
   })
 

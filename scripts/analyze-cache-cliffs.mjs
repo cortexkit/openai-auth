@@ -6,16 +6,15 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
-const DEFAULT_DB = join(homedir(), '.local/share/opencode/opencode.db')
 const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-openai-auth-dumps')
 
 const args = parseArgs(process.argv.slice(2))
 const sessionID = args.session ?? args.s
-if (!sessionID) {
+if (typeof sessionID !== 'string' || typeof args.db !== 'string') {
   usage(1)
 }
 
-const dbPath = resolvePath(args.db ?? DEFAULT_DB)
+const dbPath = resolvePath(args.db)
 const dumpDir = resolvePath(args['dump-dir'] ?? args.dumps ?? DEFAULT_DUMP_DIR)
 const threshold = Number(args.threshold ?? 0.05)
 const minUncached = Number(args['min-uncached'] ?? 1024)
@@ -67,11 +66,10 @@ function parseArgs(argv) {
 }
 
 function usage(code) {
-  console.error(`Usage: bun scripts/analyze-cache-cliffs.mjs --session <session-id> [options]
+  console.error(`Usage: bun scripts/analyze-cache-cliffs.mjs --session <session-id> --db <path> [options]
 
 Options:
   --dump-dir <path>       Dump directory (default: ${DEFAULT_DUMP_DIR})
-  --db <path>             OpenCode sqlite DB (default: ${DEFAULT_DB})
   --threshold <ratio>     Drop threshold from previous hit ratio (default: 0.05)
   --min-uncached <tokens> Minimum uncached input tokens to flag (default: 1024)
   --limit <n>             Limit printed cliffs
@@ -573,13 +571,17 @@ function describeInputSummary(summary) {
 function printWireContext(comparison, contextBytes) {
   const firstDiff = comparison.rawFirstDiffByte
   if (typeof firstDiff !== 'number') return
-  const previous = readFileSync(comparison.previousBodyPath, 'utf8')
-  const current = readFileSync(comparison.currentBodyPath, 'utf8')
+  const previous = readFileSync(comparison.previousBodyPath)
+  const current = readFileSync(comparison.currentBodyPath)
   const start = Math.max(0, firstDiff - contextBytes)
   const end = firstDiff + contextBytes
   console.log(`wireFirstDiffByte: ${firstDiff}`)
-  console.log(`wirePrev: ${JSON.stringify(previous.slice(start, end))}`)
-  console.log(`wireCurr: ${JSON.stringify(current.slice(start, end))}`)
+  console.log(
+    `wirePrev: ${JSON.stringify(previous.toString('utf8', start, end))}`,
+  )
+  console.log(
+    `wireCurr: ${JSON.stringify(current.toString('utf8', start, end))}`,
+  )
 }
 
 function classifyCliff(cliff) {

@@ -14,7 +14,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/
+const NUMBER = String.raw`(?:0|[1-9]\d*)`
+const IDENTIFIER = '[0-9A-Za-z-]+'
+const PRERELEASE = String.raw`(?:${NUMBER}|\d*[A-Za-z-][0-9A-Za-z-]*)`
+const SEMVER = String.raw`${NUMBER}\.${NUMBER}\.${NUMBER}(?:-${PRERELEASE}(?:\.${PRERELEASE})*)?(?:\+${IDENTIFIER}(?:\.${IDENTIFIER})*)?`
+const SEMVER_RE = new RegExp(`^${SEMVER}$`)
 const packageJsonPaths = [
   join(root, 'packages', 'opencode', 'package.json'),
   join(root, 'packages', 'pi', 'package.json'),
@@ -31,8 +35,10 @@ const readmePaths = [
   join(root, 'docs', 'configuration.md'),
   join(root, 'docs', 'opencode-2.md'),
 ]
-const PINNED_INSTALL_RE =
-  /(@cortexkit\/(?:opencode|pi)-openai-auth)@\d+\.\d+\.\d+(?:-[\w.]+)?/g
+const PINNED_INSTALL_RE = new RegExp(
+  `(@cortexkit/(?:opencode|pi)-openai-auth)@${SEMVER}(?![0-9A-Za-z.+_-])`,
+  'g',
+)
 
 function parseArgs(argv) {
   const args = argv.slice(2)

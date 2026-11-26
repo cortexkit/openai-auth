@@ -1,50 +1,51 @@
 // CPU-only transport benchmark: no sockets, authentication, timers or network.
-// Copies expose private functions without changing the plugin's public exports.
-import { execFileSync } from 'node:child_process'
-import { readFile, unlink, writeFile } from 'node:fs/promises'
+// The scratch copy exposes private functions without changing the plugin's exports.
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'false'
-const dir = new URL('../packages/opencode/src/', import.meta.url)
-const baseline = process.argv.includes('--baseline')
-const base = '20ecc8aba6d75cf17cae3c7c4b1ce93e57dc698d'
-const copies = ['index', 'ws-pool', 'dump']
-// The HTTP request helpers lived in index.ts at the baseline and now live in
-// codex-request.ts; the copy keeps the name 'index' either way.
-const sourceFile = (name) =>
-  name === 'index' && !baseline ? 'codex-request' : name
+const dir = fileURLToPath(new URL('../packages/opencode/src/', import.meta.url))
+const scratch = fileURLToPath(new URL('../target/scratch/', import.meta.url))
+if (process.argv.length !== 2) {
+  console.error('Usage: bun scripts/bench-request-cpu.mjs')
+  process.exit(2)
+}
+await mkdir(scratch, { recursive: true })
+const work = await mkdtemp(join(scratch, 'request-cpu-'))
 try {
-  for (const name of copies) {
-    const source = baseline
-      ? execFileSync(
-          'git',
-          ['show', `${base}:packages/opencode/src/${name}.ts`],
-          { encoding: 'utf8' },
-        )
-      : await readFile(new URL(`${sourceFile(name)}.ts`, dir), 'utf8')
-    const names =
-      name === 'dump'
-        ? 'dumpCodexRequest'
-        : name === 'index'
-          ? 'updateHttpTurnMetadata, prepareCodexRequest'
-          : 'normalizeResponseBody, shouldPrewarm, withContinuation, applyTurnId, updateContinuation, bodySignature'
-    const comparisonExport = source.includes('function requestComparison(')
-      ? ', requestComparison'
-      : ''
-    await writeFile(
-      new URL(`.cpu-bench-${name}.ts`, dir),
-      `${source}\nexport const cpuBench = { ${names}${comparisonExport} };\n`,
+  // Keep relative imports working without writing into the plugin's source tree.
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue
+    await symlink(
+      join(dir, entry.name),
+      join(work, entry.name),
+      entry.isDirectory() ? 'junction' : 'file',
     )
   }
-  const { cpuBench: http } = await import(
-    fileURLToPath(new URL('.cpu-bench-index.ts', dir))
+  await symlink(
+    join(dirname(dir), 'node_modules'),
+    join(work, 'node_modules'),
+    'junction',
   )
-  const { cpuBench: ws } = await import(
-    fileURLToPath(new URL('.cpu-bench-ws-pool.ts', dir))
+  const wsPath = join(work, '.cpu-bench-ws-pool.ts')
+  const wsSource = await readFile(join(dir, 'ws-pool.ts'), 'utf8')
+  await writeFile(
+    wsPath,
+    `${wsSource}\nexport const cpuBench = { normalizeResponseBody, shouldPrewarm, withContinuation, applyTurnId, updateContinuation, bodySignature, requestComparison };\n`,
+    { flag: 'wx' },
   )
-  const { dumpCodexRequest } = await import(
-    fileURLToPath(new URL('.cpu-bench-dump.ts', dir))
-  )
+  const http = await import('../packages/opencode/src/codex-request.ts')
+  const { cpuBench: ws } = await import(wsPath)
+  const { dumpCodexRequest } = await import('../packages/opencode/src/dump.ts')
   const { stableStringify } = await import(
     '../packages/core/src/util/stable-json.ts'
   )
@@ -113,7 +114,7 @@ try {
     )
   }
   console.log(
-    `Bun ${Bun.version}; ${baseline ? 'baseline' : 'working tree'}; ${runs} measured requests + 20 warmups per row; dumps disabled`,
+    `Bun ${Bun.version}; working tree; ${runs} measured requests + 20 warmups per row; dumps disabled`,
   )
   for (const count of [50, 200, 400]) {
     const previous = {
@@ -141,7 +142,7 @@ try {
     const setupWs = () => {
       const e = { ...wsPrior }
       const body = ws.normalizeResponseBody(clone(current))
-      const comparison = ws.requestComparison?.(e, body)
+      const comparison = ws.requestComparison(e, body)
       return { e, body, comparison }
     }
     console.log(
@@ -166,20 +167,17 @@ try {
           installationID: 'bench',
           websocket: false,
           responsesLite: false,
-          // Required by the current helper, ignored by the baseline; Lite is off.
           rewriteLite: () => {},
         }),
     )
     await measure('WS bodySignature', setupWs, ({ body }) =>
       ws.bodySignature(body),
     )
-    if (ws.requestComparison) {
-      await measure(
-        'WS requestComparison (canonical items + signature)',
-        setupWs,
-        ({ e, body }) => ws.requestComparison(e, body),
-      )
-    }
+    await measure(
+      'WS requestComparison (canonical items + signature)',
+      setupWs,
+      ({ e, body }) => ws.requestComparison(e, body),
+    )
     await measure('WS shouldPrewarm', setupWs, ({ e, body, comparison }) =>
       ws.shouldPrewarm(e, body, comparison),
     )
@@ -197,7 +195,7 @@ try {
         sessionID: 'bench',
         transport: 'websocket',
         phase: 'main',
-        bodyText: baseline ? JSON.stringify(body) : () => JSON.stringify(body),
+        bodyText: () => JSON.stringify(body),
       }),
     )
     await measure(
@@ -205,7 +203,7 @@ try {
       setupWs,
       async ({ e }) => {
         const body = ws.normalizeResponseBody(JSON.parse(bodyText))
-        const comparison = ws.requestComparison?.(e, body)
+        const comparison = ws.requestComparison(e, body)
         ws.shouldPrewarm(e, body, comparison)
         const continued = ws.withContinuation(e, body, comparison)
         const sent = ws.applyTurnId(e, continued, body, comparison)
@@ -213,9 +211,7 @@ try {
           sessionID: 'bench',
           transport: 'websocket',
           phase: 'main',
-          bodyText: baseline
-            ? JSON.stringify(sent)
-            : () => JSON.stringify(sent),
+          bodyText: () => JSON.stringify(sent),
         })
         JSON.stringify({ type: 'response.create', ...sent })
         ws.updateContinuation(e, body, event, finalized, true, comparison)
@@ -223,9 +219,5 @@ try {
     )
   }
 } finally {
-  await Promise.all(
-    copies.map((name) =>
-      unlink(new URL(`.cpu-bench-${name}.ts`, dir)).catch(() => {}),
-    ),
-  )
+  await rm(work, { recursive: true })
 }

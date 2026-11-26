@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import {
-  existsSync,
+  lstatSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -38,42 +38,33 @@ function installed(directory) {
     if (entry.startsWith('.')) continue
     const path = join(directory, entry)
     if (entry.startsWith('@')) {
-      if (!isDirectory(path)) continue
+      if (!statSync(path).isDirectory()) continue
       for (const name of readdirSync(path))
         visitPackage(join(path, name), `${entry}/${name}`)
     } else visitPackage(path, entry)
   }
 }
 
-function isDirectory(path) {
-  try {
-    return statSync(path).isDirectory()
-  } catch {
-    return false
-  }
-}
-
 function visitPackage(path, name) {
-  let real
-  try {
-    real = realpathSync(path)
-  } catch {
-    return
-  }
-  if (!isDirectory(real) || visitedPackages.has(real)) return
-  visitedPackages.add(real)
-  const found = tracked[name]
-  if (found) {
+  if (!statSync(path).isDirectory()) return
+  const real = realpathSync(path)
+  // A directory can be reached first under an alias. Classify each name before
+  // skipping directories whose dependencies have already been traversed.
+  if (Object.hasOwn(tracked, name)) {
+    const found = tracked[name]
     const manifest = JSON.parse(
-      readFileSync(join(real, 'package.json'), 'utf8'),
+      readFileSync(join(path, 'package.json'), 'utf8'),
     )
     found.set(real, manifest.version)
   }
+  if (visitedPackages.has(real)) return
+  visitedPackages.add(real)
   // npm-style trees nest a package's own dependencies under it.
   const nested = join(real, 'node_modules')
-  if (existsSync(nested)) installed(nested)
+  if (lstatSync(nested, { throwIfNoEntry: false })) installed(nested)
   // Bun's isolated layout puts them beside it in the enclosing node_modules.
-  const enclosing = name.includes('/') ? dirname(dirname(real)) : dirname(real)
+  const parent = dirname(real)
+  const enclosing = basename(parent).startsWith('@') ? dirname(parent) : parent
   if (basename(enclosing) === 'node_modules') installed(enclosing)
 }
 

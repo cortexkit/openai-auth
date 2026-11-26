@@ -52,14 +52,14 @@ bun run dev:clean
 
 ## Analyzing cache cliffs
 
-To inspect a **cache cliff**, a sudden drop in prompt-cache reuse between turns, enable [request dumps](troubleshooting.md#request-dumps) and run:
+To inspect a **cache cliff**, a sudden drop in prompt-cache reuse between turns, enable [request dumps](troubleshooting.md#request-dumps). Pass the SQLite database for the OpenCode instance that made the dumps:
 
 ```sh
-bun run analyze:cache -- --session ses_... --no-timeline
+bun run analyze:cache -- --session ses_... --db /path/to/opencode.db --no-timeline
 ```
 
 To print previous and current request-body text around the first differing byte, add `--wire-context` with the number of surrounding bytes:
 
 ```sh
-bun run analyze:cache -- --session ses_... --no-timeline --wire-context 180
+bun run analyze:cache -- --session ses_... --db /path/to/opencode.db --no-timeline --wire-context 180
 ```

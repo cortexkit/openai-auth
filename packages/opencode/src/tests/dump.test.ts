@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
@@ -942,6 +943,68 @@ describe('request dumps', () => {
         .split('\n')
         .find((line) => line.endsWith(`\t${mainMeta.id}`))
       expect(row?.split('\t')[7]).toBe('2')
+    })
+  })
+
+  test('the cache-cliff analyzer selects wire context by UTF-8 bytes', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const session = 'ses_utf8'
+      await mkdir(dumpDir)
+      const dbPath = join(dumpDir, '..', 'opencode.db')
+      const db = new Database(dbPath)
+      db.run(
+        'create table part (id text, message_id text, session_id text, time_created integer, data text)',
+      )
+      const prefix = '{"text":"éééabc'
+      const firstByte = Buffer.byteLength(prefix)
+      for (const [index, letter] of ['X', 'Y'].entries()) {
+        // The analyzer pairs rows with dumps by their timestamps.
+        const time = 10_000 + 5_000 * index
+        const dump = join(dumpDir, `${session}-${index}`)
+        const body = `${prefix}${letter}def"}`
+        await writeFile(`${dump}.body.json`, body)
+        await writeFile(
+          `${dump}.meta.json`,
+          JSON.stringify({
+            id: `${session}-${index}`,
+            createdAt: new Date(time).toISOString(),
+            phase: 'main',
+            bodyBytes: Buffer.byteLength(body),
+            diff: index === 1 ? { firstByte } : undefined,
+          }),
+        )
+        db.run('insert into part values (?, ?, ?, ?, ?)', [
+          `prt_${index}`,
+          `msg_${index}`,
+          session,
+          time,
+          JSON.stringify({
+            type: 'step-finish',
+            tokens: {
+              input: index === 0 ? 10 : 100,
+              cache: { read: index === 0 ? 90 : 0 },
+            },
+          }),
+        ])
+      }
+      db.close()
+
+      const run = Bun.spawnSync([
+        process.execPath,
+        join(import.meta.dir, '../../../../scripts/analyze-cache-cliffs.mjs'),
+        '--session',
+        session,
+        '--dump-dir',
+        dumpDir,
+        '--db',
+        dbPath,
+        '--wire-context',
+        '3',
+      ])
+      expect(run.exitCode).toBe(0)
+      const stdout = run.stdout.toString()
+      expect(stdout).toContain('wirePrev: "abcXde"')
+      expect(stdout).toContain('wireCurr: "abcYde"')
     })
   })
 

@@ -27,11 +27,10 @@ Turn dumps off after debugging: `.body.json` files contain the full rewritten pr
 
 ## OpenCode keeps using an old build
 
-Clear OpenCode's plugin cache and restart OpenCode:
-
-```sh
-rm -rf ~/.cache/opencode
-```
+1. Check the version in the **OPENAI** quota sidebar. Check the `@cortexkit/opencode-openai-auth` entry in the active OpenCode config (`plugin` on OpenCode 1, `plugins` on OpenCode 2). If it pins an old version, update the pin first. Clearing the cache does not change a pin.
+2. On OpenCode 2, run `opencode service status` with the executable you use. Closing the window does not stop its background server or unload the plugin. Restart the service with `opencode service restart` and check the sidebar again. On OpenCode 1, quit and reopen OpenCode.
+3. If the wrong build is still loaded, quit OpenCode and stop its background service if it is running. Run `opencode debug paths` with the same executable and environment to find the `cache` path. The default is `~/.cache/opencode` on Linux and macOS, and `%USERPROFILE%\.cache\opencode` on Windows. If set, `XDG_CACHE_HOME` changes the cache base.
+4. In that cache, remove only the matching `@cortexkit/opencode-openai-auth@<version>` folder, under `packages/` on OpenCode 1 or `npm/` on OpenCode 2. The folder can end in `@latest` for an unpinned entry. On older OpenCode 1 installs with a shared `node_modules/`, remove only `node_modules/@cortexkit/opencode-openai-auth` if present. Leave the rest of the cache and your config alone. Start OpenCode again and confirm the version in the sidebar.
 
 ## Problems with stored credentials
 

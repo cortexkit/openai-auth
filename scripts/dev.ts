@@ -1,10 +1,11 @@
 import {
-  existsSync,
+  lstatSync,
   mkdirSync,
   readlinkSync,
   symlinkSync,
   unlinkSync,
 } from 'node:fs'
+import { constants } from 'node:os'
 import { resolve } from 'node:path'
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
@@ -16,28 +17,36 @@ const TARGET = '../../packages/opencode/dist/index.js' // relative from .opencod
 function createSymlink() {
   mkdirSync(PLUGINS_DIR, { recursive: true })
 
-  if (existsSync(SYMLINK_PATH)) {
-    try {
-      const current = readlinkSync(SYMLINK_PATH)
-      if (current === TARGET) {
-        console.log(
-          `[dev] Symlink already exists: ${SYMLINK_PATH} -> ${TARGET}`,
-        )
-        return
-      }
-    } catch {}
-    unlinkSync(SYMLINK_PATH)
+  const existing = lstatSync(SYMLINK_PATH, { throwIfNoEntry: false })
+  if (existing) {
+    if (existing.isSymbolicLink() && readlinkSync(SYMLINK_PATH) === TARGET) {
+      console.log(`[dev] Symlink already exists: ${SYMLINK_PATH} -> ${TARGET}`)
+      return
+    }
+    throw new Error(`[dev] Refusing to replace ${SYMLINK_PATH}`)
   }
 
+  // OpenCode discovers project plugins at this path, not in a scratch folder.
+  // Only this invocation's own link is eligible for automatic cleanup.
   symlinkSync(TARGET, SYMLINK_PATH)
+  const created = lstatSync(SYMLINK_PATH, { bigint: true })
   console.log(`[dev] Created symlink: ${SYMLINK_PATH} -> ${TARGET}`)
-}
-
-function removeSymlink() {
-  try {
+  return () => {
+    const current = lstatSync(SYMLINK_PATH, {
+      bigint: true,
+      throwIfNoEntry: false,
+    })
+    if (
+      !current?.isSymbolicLink() ||
+      current.dev !== created.dev ||
+      current.ino !== created.ino ||
+      current.ctimeNs !== created.ctimeNs ||
+      readlinkSync(SYMLINK_PATH) !== TARGET
+    )
+      return
     unlinkSync(SYMLINK_PATH)
     console.log('[dev] Removed symlink')
-  } catch {}
+  }
 }
 
 // --- Main ---
@@ -49,35 +58,51 @@ const opencodeBuild = Bun.spawnSync(['tsc', '-p', 'tsconfig.build.json'], {
   stdout: 'inherit',
   stderr: 'inherit',
 })
-if (opencodeBuild.exitCode !== 0) {
+function exitStatus(
+  code: number | null,
+  signal: number | NodeJS.Signals | null | undefined,
+) {
+  return signal
+    ? 128 + (typeof signal === 'number' ? signal : constants.signals[signal])
+    : (code ?? 1)
+}
+
+if (opencodeBuild.exitCode !== 0 || opencodeBuild.signalCode) {
   console.error('[dev] OpenCode build failed, aborting')
-  process.exit(1)
+  process.exit(exitStatus(opencodeBuild.exitCode, opencodeBuild.signalCode))
 }
 
 // 2. Create symlink
-createSymlink()
+const removeOwnSymlink = createSymlink()
 
 // 3. Start tsc --watch
 console.log('[dev] Starting tsc --watch for OpenCode...')
 console.log('[dev] Restart OpenCode to pick up the linked plugin.')
-const opencodeChild = Bun.spawn(
-  ['tsc', '-p', 'tsconfig.build.json', '--watch', '--preserveWatchOutput'],
-  {
-    cwd: OPENCODE_PACKAGE_ROOT,
-    stdout: 'inherit',
-    stderr: 'inherit',
-  },
-)
-
-function cleanup() {
-  console.log('\n[dev] Cleaning up...')
-  opencodeChild.kill()
-  removeSymlink()
-  process.exit(0)
+try {
+  const opencodeChild = Bun.spawn(
+    ['tsc', '-p', 'tsconfig.build.json', '--watch', '--preserveWatchOutput'],
+    {
+      cwd: OPENCODE_PACKAGE_ROOT,
+      stdout: 'inherit',
+      stderr: 'inherit',
+    },
+  )
+  const interrupt = () => opencodeChild.kill('SIGINT')
+  const terminate = () => opencodeChild.kill('SIGTERM')
+  process.on('SIGINT', interrupt)
+  process.on('SIGTERM', terminate)
+  try {
+    const code = await opencodeChild.exited
+    process.exitCode = exitStatus(code, opencodeChild.signalCode)
+  } finally {
+    process.off('SIGINT', interrupt)
+    process.off('SIGTERM', terminate)
+  }
+} finally {
+  try {
+    removeOwnSymlink?.()
+  } catch (error) {
+    console.error('[dev] Could not remove dev symlink:', error)
+    process.exitCode ||= 1
+  }
 }
-
-process.on('SIGINT', cleanup)
-process.on('SIGTERM', cleanup)
-
-await opencodeChild.exited
-cleanup()

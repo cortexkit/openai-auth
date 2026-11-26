@@ -1,10 +1,9 @@
 # Request preparation CPU benchmark
 
-Run `bun scripts/bench-request-cpu.mjs --baseline` and then
-`bun scripts/bench-request-cpu.mjs`. The baseline reads the actual private
-functions from commit `20ecc8aba6d75cf17cae3c7c4b1ce93e57dc698d`, not a
-reimplementation of the old comparison. Temporary sibling modules expose those
-functions and are removed in `finally`; do not run two copies concurrently.
+Run `bun scripts/bench-request-cpu.mjs` to measure the current code. Each run
+exposes private functions in a temporary module under its own `target/scratch/`
+folder and removes that folder on exit. The baseline numbers below are historical
+measurements from the old code at `20ecc8aba6d75cf17cae3c7c4b1ce93e57dc698d`.
 
 Measurements below used Bun 1.4.2 on macOS, 300 requests per row after 20 warmups,
 with dumps explicitly disabled. Numbers are median **wall milliseconds per
