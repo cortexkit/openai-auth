@@ -183,9 +183,11 @@ export async function exchangeCodeForTokens(
   code: string,
   redirectUri: string,
   pkce: PkceCodes,
+  signal?: AbortSignal,
 ): Promise<TokenResponse> {
   const response = await fetch(`${ISSUER}/oauth/token`, {
     method: 'POST',
+    signal,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
@@ -198,7 +200,9 @@ export async function exchangeCodeForTokens(
   if (!response.ok) {
     throw new Error(`Token exchange failed: ${response.status}`)
   }
-  return (await response.json()) as TokenResponse
+  const tokens = (await response.json()) as TokenResponse
+  signal?.throwIfAborted()
+  return tokens
 }
 
 // ---------------------------------------------------------------------------
@@ -325,12 +329,14 @@ let serverStarting:
     }>
   | undefined
 
+type PendingFlow = PendingOAuth & { signal: AbortSignal }
+
 /**
  * Map of in-flight OAuth flows, keyed by the opaque state parameter.
  * Multiple concurrent flows share the same loopback HTTP server;
  * each callback is routed to the correct flow via the state query param.
  */
-const pendingFlows = new Map<string, PendingOAuth>()
+const pendingFlows = new Map<string, PendingFlow>()
 
 function listenOAuthServer(server: OAuthServer, host: '127.0.0.1' | '::1') {
   return new Promise<void>((resolve, reject) => {
@@ -445,7 +451,7 @@ export async function startOAuthServer(): Promise<{
 
         flowCleanup(state)
 
-        exchangeCodeForTokens(code, redirectUri, entry.pkce)
+        exchangeCodeForTokens(code, redirectUri, entry.pkce, entry.signal)
           .then((tokens) => entry.resolve(tokens))
           .catch((err) => entry.reject(err))
 
@@ -526,47 +532,38 @@ export function waitForOAuthCallback(
       return
     }
 
-    const timeout = setTimeout(() => {
-      const entry = pendingFlows.get(state)
-      if (entry) {
-        flowCleanup(state)
-        reject(
-          new Error('OAuth callback timeout — authorization took too long'),
-        )
-      }
-    }, timeoutMs)
-
-    const onAbort = () => {
+    const controller = new AbortController()
+    const settle = () => {
       clearTimeout(timeout)
-      const entry = pendingFlows.get(state)
-      if (entry) {
-        flowCleanup(state)
-        reject(new Error('Login cancelled'))
-      }
+      signal?.removeEventListener('abort', onAbort)
     }
-
-    if (signal) {
-      signal.addEventListener('abort', onAbort)
+    const abort = (error: Error) => {
+      if (pendingFlows.get(state) === entry) flowCleanup(state)
+      controller.abort(error)
+      entry.reject(error)
     }
+    // Receiving the callback consumes the state but does not end the flow:
+    // the same deadline must still cover the exchange and its response body.
+    const timeout = setTimeout(() => {
+      abort(new Error('OAuth callback timeout — authorization took too long'))
+    }, timeoutMs)
+    const onAbort = () => abort(new Error('Login cancelled'))
 
-    pendingFlows.set(state, {
+    const entry: PendingFlow = {
       pkce,
       state,
+      signal: controller.signal,
       resolve: (tokens) => {
-        clearTimeout(timeout)
-        if (signal) {
-          signal.removeEventListener('abort', onAbort)
-        }
+        settle()
         resolve(tokens)
       },
       reject: (error) => {
-        clearTimeout(timeout)
-        if (signal) {
-          signal.removeEventListener('abort', onAbort)
-        }
+        settle()
         reject(error)
       },
-    })
+    }
+    signal?.addEventListener('abort', onAbort)
+    pendingFlows.set(state, entry)
   })
 }
 
@@ -624,18 +621,49 @@ export async function completeDeviceAuth(
     !Number.isNaN(expires_in) && expires_in > 0
       ? expires_in * 1000
       : 15 * 60 * 1000 // default 15 minutes
-  const startTime = Date.now()
-
-  while (true) {
-    if (signal?.aborted) {
+  if (signal?.aborted) throw new Error('Device authorization cancelled')
+  const deadline = new AbortController()
+  const expired = new Error('Device authorization expired')
+  const expiresAt = Date.now() + maxDurationMs
+  const timeout = setTimeout(() => deadline.abort(expired), maxDurationMs)
+  const flowSignal = signal
+    ? AbortSignal.any([signal, deadline.signal])
+    : deadline.signal
+  try {
+    return await pollDeviceAuth(
+      deviceData,
+      version,
+      interval,
+      expiresAt,
+      flowSignal,
+    )
+  } catch (error) {
+    if (flowSignal.aborted) {
+      if (flowSignal.reason === expired) throw expired
       throw new Error('Device authorization cancelled')
     }
-    if (Date.now() - startTime > maxDurationMs) {
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function pollDeviceAuth(
+  deviceData: DeviceAuthInit,
+  version: string,
+  interval: number,
+  expiresAt: number,
+  signal: AbortSignal,
+): Promise<TokenResponse> {
+  while (true) {
+    signal.throwIfAborted()
+    if (Date.now() >= expiresAt) {
       throw new Error('Device authorization expired')
     }
 
     const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
       method: 'POST',
+      signal,
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': buildUserAgent(version),
@@ -654,6 +682,7 @@ export async function completeDeviceAuth(
 
       const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
         method: 'POST',
+        signal,
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
@@ -670,14 +699,16 @@ export async function completeDeviceAuth(
         throw new Error(`Token exchange failed: ${tokenResponse.status}`)
       }
 
-      return (await tokenResponse.json()) as TokenResponse
+      const tokens = (await tokenResponse.json()) as TokenResponse
+      signal.throwIfAborted()
+      return tokens
     }
 
     if (response.status !== 403 && response.status !== 404) {
       throw new Error(`Device authorization failed: ${response.status}`)
     }
 
-    const remainingMs = maxDurationMs - (Date.now() - startTime)
+    const remainingMs = expiresAt - Date.now()
     if (remainingMs <= 0) {
       throw new Error('Device authorization expired')
     }
@@ -685,14 +716,7 @@ export async function completeDeviceAuth(
       interval + OAUTH_POLLING_SAFETY_MARGIN_MS,
       remainingMs,
     )
-    try {
-      await sleep(sleepMs, undefined, { signal })
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error('Device authorization cancelled')
-      }
-      throw err
-    }
+    await sleep(sleepMs, undefined, { signal })
   }
 }
 

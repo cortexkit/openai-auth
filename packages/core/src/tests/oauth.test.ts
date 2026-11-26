@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
 import { createServer } from 'node:http'
 import {
   base64UrlEncode,
@@ -28,6 +36,55 @@ const RESERVED_ACCOUNT_ID_ERROR =
 // these tests; the byte-for-byte User-Agent OpenCode sends is pinned separately
 // in user-agent.test.ts.
 const TEST_VERSION = '9.9.9'
+
+function heldProviderResponse() {
+  const entered = Promise.withResolvers<AbortSignal | null | undefined>()
+  const response = Promise.withResolvers<Response>()
+  const body = Promise.withResolvers<unknown>()
+  function hold<T>(
+    signal: AbortSignal | null | undefined,
+    pending: Promise<T>,
+  ) {
+    signal?.addEventListener(
+      'abort',
+      () => {
+        response.reject(signal.reason)
+        body.reject(signal.reason)
+      },
+      { once: true },
+    )
+    entered.resolve(signal)
+    return pending
+  }
+  void response.promise.catch(() => {})
+  void body.promise.catch(() => {})
+  return {
+    entered: entered.promise,
+    fetch: (
+      signal: AbortSignal | null | undefined,
+      stage: 'request' | 'body',
+    ) =>
+      stage === 'request'
+        ? hold(signal, response.promise)
+        : Promise.resolve({
+            ok: true,
+            json: () => hold(signal, body.promise),
+          } as Response),
+    finish() {
+      response.resolve(Response.json({}))
+      body.resolve({})
+    },
+  }
+}
+
+function fireDeadline(
+  timer: ReturnType<typeof spyOn<typeof globalThis, 'setTimeout'>>,
+  delay: number,
+) {
+  const call = timer.mock.calls.find(([, ms]) => ms === delay)
+  if (!call) throw new Error('Did not schedule the flow deadline')
+  call[0]()
+}
 
 async function canBindIPv6Loopback(): Promise<boolean> {
   const probe = createServer()
@@ -529,6 +586,40 @@ describe('OAuth server concurrency (C1/C2)', () => {
     }
   })
 
+  for (const stage of ['request', 'body'] as const) {
+    test(`browser OAuth deadline aborts a held token exchange ${stage} after its callback`, async () => {
+      await startOAuthServer()
+      const held = heldProviderResponse()
+      const timer = spyOn(globalThis, 'setTimeout')
+      const timeout = 61_000
+      globalThis.fetch = mock((_url: unknown, init?: RequestInit) =>
+        held.fetch(init?.signal, stage),
+      ) as unknown as typeof globalThis.fetch
+      const pending = waitForOAuthCallback(
+        { verifier: 'v', challenge: 'c' },
+        'held-exchange',
+        timeout,
+      )
+      const outcome = pending.catch((error: unknown) => error)
+      try {
+        const callback = await originalFetch(
+          `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=code&state=held-exchange`,
+        )
+        expect(callback.status).toBe(200)
+        const signal = await held.entered
+        fireDeadline(timer, timeout)
+        expect(signal?.aborted).toBe(true)
+        expect(await outcome).toEqual(
+          new Error('OAuth callback timeout — authorization took too long'),
+        )
+      } finally {
+        held.finish()
+        await outcome
+        timer.mockRestore()
+      }
+    })
+  }
+
   test('C1: two concurrent waitForOAuthCallback flows both resolve correctly via state-keyed map', async () => {
     const { redirectUri } = await startOAuthServer()
     expect(redirectUri).toContain(String(OAUTH_PORT))
@@ -907,6 +998,46 @@ describe('Device flow polling timeout and abort (Fix 2)', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch
   })
+
+  for (const endpoint of ['poll', 'exchange'] as const) {
+    for (const stage of ['request', 'body'] as const) {
+      test(`device OAuth deadline aborts a held ${endpoint} ${stage}`, async () => {
+        const held = heldProviderResponse()
+        const timer = spyOn(globalThis, 'setTimeout')
+        const expiry = 62
+        globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+          if (endpoint === 'exchange' && url.endsWith('/deviceauth/token'))
+            return Response.json({
+              authorization_code: 'code',
+              code_verifier: 'v',
+            })
+          return held.fetch(init?.signal, stage)
+        }) as unknown as typeof globalThis.fetch
+        const pending = completeDeviceAuth(
+          {
+            device_auth_id: 'device',
+            user_code: 'user',
+            interval: '1',
+            expires_in: expiry,
+          },
+          TEST_VERSION,
+        )
+        const outcome = pending.catch((error: unknown) => error)
+        try {
+          const signal = await held.entered
+          if (signal) fireDeadline(timer, expiry * 1000)
+          expect(signal?.aborted).toBe(true)
+          expect(await outcome).toEqual(
+            new Error('Device authorization expired'),
+          )
+        } finally {
+          held.finish()
+          await outcome
+          timer.mockRestore()
+        }
+      })
+    }
+  }
 
   test('completeDeviceAuth respects expires_in and times out', async () => {
     globalThis.fetch = mock(async () => {
