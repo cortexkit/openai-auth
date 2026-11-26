@@ -12,6 +12,7 @@ import {
   type FrameTurn,
   FrameTurnState,
   frameRequestMetadata,
+  isVaultHosted,
   prepareCodexRequest,
   restoreReplayedCallStatus,
   supportsMidConversationEffort,
@@ -294,9 +295,9 @@ export async function rewriteCodexHttpRequest(
   if (!/\/responses\/?$/.test(new URL(request.url).pathname)) return undefined
   const text = await request.clone().text()
   const body = parseObject(text)
-  // Codex does not accept output caps. Remove them only after the transport
-  // has established that this request belongs to the account pool.
-  if (body) delete body.max_output_tokens
+  // Codex honours output caps, and Thalamus requires them to bound each step.
+  // Elsewhere OpenCode's default cap would cut long replies short.
+  if (body && !isVaultHosted()) delete body.max_output_tokens
   const headers = new Headers(request.headers)
   const session = state.get(scope.sessionID)
   const primary = scope.kind === 'primary'
@@ -414,8 +415,8 @@ function frameInputMatches(host: unknown, sent: unknown): boolean {
  * builder (`prepareCodexRequest` with `websocket: true`): the thread cache
  * key, `parallel_tool_calls`, Codex tool shapes, the Codex `client_metadata`
  * (installation, window, turn metadata, send time) and Codex's body key
- * order, with output caps removed. Primary frames use the frame turn and
- * helpers borrow the latest primary turn, even when it was sent over HTTP.
+ * order. Primary frames use the frame turn. Auxiliary frames (such as for
+ * titles) borrow the latest primary turn, even when it was sent over HTTP.
  * Shaping never writes the session's HTTP turn state.
  *
  * `input` keeps the host's items except for the effort rule's
@@ -443,8 +444,9 @@ export function rewriteCodexFrame(
       : undefined
   const session = state.get(scope.sessionID)
   const chained = 'previous_response_id' in body
-  // Codex does not accept output caps.
-  delete body.max_output_tokens
+  // Codex honours output caps, and Thalamus requires them to bound each step.
+  // Elsewhere OpenCode's default cap would cut long replies short.
+  if (!isVaultHosted()) delete body.max_output_tokens
   const prepared = prepareCodexRequest({
     init: { body: JSON.stringify(body) },
     // The socket's handshake headers were fixed when it opened, and the host

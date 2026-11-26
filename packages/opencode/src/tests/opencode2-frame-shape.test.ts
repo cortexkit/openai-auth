@@ -27,6 +27,7 @@ import {
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
+import { restoreEnv } from './setup-env'
 
 const SESSION = { sessionID: 'ses_1', kind: 'primary' }
 const THREAD = '00000000-0000-7000-8000-000000000001'
@@ -147,6 +148,36 @@ const turnMetadata = (text: string) =>
   }
 
 describe('WebSocket frame shaping', () => {
+  for (const hosted of [false, true]) {
+    it(`applies the output cap policy to WebSocket frames (hosted=${hosted})`, () => {
+      const marker = process.env.CORTEXKIT_VAULT_HOST
+      restoreEnv('CORTEXKIT_VAULT_HOST', hosted ? 'thalamus' : undefined)
+      try {
+        const host = hostFrame([user('one')], {
+          model: 'gpt-6.2-sol',
+          max_output_tokens: hosted ? 300 : 32_000,
+          temperature: 0.5,
+        })
+        const sent = JSON.parse(
+          rewriteCodexFrame(JSON.stringify(host), SESSION, codexState()) ??
+            'null',
+        )
+        if (hosted) {
+          expect(sent.max_output_tokens).toBe(300)
+          expect(Object.keys(sent).slice(-3)).toEqual([
+            'client_metadata',
+            'max_output_tokens',
+            'temperature',
+          ])
+        } else {
+          expect(sent).not.toHaveProperty('max_output_tokens')
+        }
+      } finally {
+        restoreEnv('CORTEXKIT_VAULT_HOST', marker)
+      }
+    })
+  }
+
   it('restores status on full GPT-6.2 frames but not on chained or GPT-6.1 frames', () => {
     const replay = call('c1')
     const history = [user('one'), replay, output('c1')]

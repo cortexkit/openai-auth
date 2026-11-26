@@ -79,6 +79,8 @@ OpenCode 2 has no transcript-only feedback surface for this command: its [`execu
 
 ## Cost tracking under Thalamus
 
+When Thalamus hosts OpenCode 2, the plugin keeps the host's `max_output_tokens` on HTTP requests and WebSocket frames sent to Codex to bound each step; outside Thalamus, it drops the cap so OpenCode's default doesn't cut long replies short.
+
 Under Thalamus, the plugin reports token counts for each vault-served call, including title, compaction and keep-warm calls, to Thalamus for cost tracking. Both HTTP and WebSocket model calls are covered. Reports also identify caching as implicit (Codex chooses the lifetime) and include the session's current keep-warm state. Reports contain request metadata and measured token counts, not reply content, credentials or access tokens. Local-account calls are not reported.
 
 The report includes `chargeBasis: 'subscription_included'` only when routing admitted the account on its plan's free quota. It omits `chargeBasis` for prepaid ChatGPT credits, a probe sent despite a quota reading that shows exhaustion (the last path), unknown quota, or a same-account continuation without an admission decision. Keep-warm uses the warmed account's current quota reading: free headroom includes the field; otherwise it is omitted. ChatGPT credits are never reported as `metered_api`.

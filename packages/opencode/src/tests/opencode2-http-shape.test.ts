@@ -93,6 +93,39 @@ async function send(
 }
 
 describe('OpenCode 2 HTTP shape', () => {
+  for (const hosted of [false, true]) {
+    it(`applies the output cap policy to HTTP (hosted=${hosted})`, async () => {
+      const marker = process.env.CORTEXKIT_VAULT_HOST
+      restoreEnv('CORTEXKIT_VAULT_HOST', hosted ? 'thalamus' : undefined)
+      try {
+        const emitted = await rewriteCodexHttpRequest(
+          request({
+            model: 'gpt-6.2-sol',
+            max_output_tokens: hosted ? 300 : 32_000,
+            temperature: 0.5,
+            input: [user('one')],
+          }),
+          scope(),
+          new MidConversationEffort(),
+          false,
+        )
+        const sent = await emitted!.json()
+        if (hosted) {
+          expect(sent.max_output_tokens).toBe(300)
+          expect(Object.keys(sent).slice(-3)).toEqual([
+            'client_metadata',
+            'max_output_tokens',
+            'temperature',
+          ])
+        } else {
+          expect(sent).not.toHaveProperty('max_output_tokens')
+        }
+      } finally {
+        restoreEnv('CORTEXKIT_VAULT_HOST', marker)
+      }
+    })
+  }
+
   it('pins gpt-6.2-sol HTTP effort and keeps the prefix through a tool continuation', async () => {
     const host = await start()
     const first = user('one')
