@@ -145,7 +145,7 @@ export async function openControlDialog(
         ...(action.confirm ? { confirmed: true } : {}),
       })
       if (!active()) return
-      payload = { command: result.command, menu: result.menu }
+      payload = { command: result.command, menu: result.menu ?? payload.menu }
       await dialog.alert({ title: payload.menu.title, message: result.text })
     } catch (error) {
       if (!active()) return

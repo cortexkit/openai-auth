@@ -191,6 +191,7 @@ type Entry = {
   settings: CacheKeepSettingsView
   holders: Holder[]
   joinTimeoutMs: number
+  captures?: Map<string, { count: number }>
 }
 
 // OpenCode 1 and OpenCode 2 are separate bundle entries that one process may
@@ -456,6 +457,8 @@ export function acquireCacheKeep(
     entries.set(key, entry)
   }
   const owned = entry
+  owned.captures ??= new Map<string, { count: number }>()
+  const captures = owned.captures
   const mirror = acquireFrameMirror(paths)
   mirror.setEnabled(owned.settings.enabled)
   const holder: Holder = {
@@ -465,6 +468,8 @@ export function acquireCacheKeep(
   let released = false
 
   const capture = async (input: CacheKeepCaptureInput) => {
+    const { sessionID } = input
+    let pending: { count: number } | undefined
     try {
       const settings = holder.location.settings()
       if (
@@ -472,12 +477,15 @@ export function acquireCacheKeep(
         !shouldCaptureSessionCache(input.sessionID, settings.enabled)
       )
         return
+      if (input.kind !== 'primary' && input.kind !== 'generate') return
+      // Share the pending identity across locations, without keeping a
+      // tombstone for each session the host has deleted.
+      pending = captures.get(sessionID) ?? { count: 0 }
+      captures.set(sessionID, pending)
+      pending.count++
       if (input.kind !== 'primary') {
-        if (
-          input.kind === 'generate' &&
-          isHostWarm(await input.request.clone().text())
-        ) {
-          if (released) return
+        if (isHostWarm(await input.request.clone().text())) {
+          if (released || captures.get(sessionID) !== pending) return
           // The shared manager cannot defer an existing target without resetting
           // its idle and retry counters. Let the host own warming until the next
           // real request instead of replaying the same cache twice.
@@ -500,7 +508,7 @@ export function acquireCacheKeep(
           (await location.parentOf(input.sessionID)) !== undefined)
       if (isSubagent && !settings.subagents) return
       const bodyText = await input.request.clone().text()
-      if (released) return
+      if (released || captures.get(sessionID) !== pending) return
       const chatgptAccountId = headers.get('chatgpt-account-id') ?? undefined
       owned.manager.track({
         sessionKey: input.sessionID,
@@ -519,6 +527,13 @@ export function acquireCacheKeep(
       location.log?.warn('cachekeep capture failed', {
         error: error instanceof Error ? error.message : String(error),
       })
+    } finally {
+      if (
+        pending &&
+        --pending.count === 0 &&
+        captures.get(sessionID) === pending
+      )
+        captures.delete(sessionID)
     }
   }
 
@@ -529,7 +544,10 @@ export function acquireCacheKeep(
       mirror.setEnabled(owned.settings.enabled)
     },
     capture,
-    forget: (sessionID) => owned.manager.remove(sessionID),
+    forget: (sessionID) => {
+      captures.delete(sessionID)
+      owned.manager.remove(sessionID)
+    },
     async release() {
       if (released) return
       released = true

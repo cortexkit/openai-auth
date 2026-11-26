@@ -171,6 +171,7 @@ class SidebarPublisher {
   }
 
   publish(producer: Producer, publication?: Publication): Promise<void> {
+    const observation = this.observations.get(producer)
     this.chain = this.chain
       .then(async () => {
         if (!this.producers.has(producer)) return
@@ -183,6 +184,10 @@ class SidebarPublisher {
         )
       })
       .catch(() => {
+        // Retry a failed sidebar write on the next tick unless a newer
+        // observation is already queued. Routing updates are separate.
+        if (!publication && this.observations.get(producer) === observation)
+          this.observations.delete(producer)
         // File writers report I/O failures; do not log account snapshots or credentials.
         createLogger('opencode2').warn('sidebar publication failed')
       })
@@ -307,7 +312,7 @@ async function writeSidebarRouting(
 // replaced rather than reused, and it keeps serving only the producers it already
 // has until they release. Changes to how the file is built need no bump, because
 // each producer carries its own bundle's `write`.
-const PUBLISHER_PROTOCOL = 3
+const PUBLISHER_PROTOCOL = 4
 const registryKey = Symbol.for(
   '@cortexkit/openai-auth/opencode2-sidebar-publishers',
 )

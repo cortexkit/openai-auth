@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
@@ -95,6 +96,47 @@ function make(overrides: Partial<SidebarState>): SidebarState {
 // validating shape. normalizeSidebarState() must guarantee a well-formed
 // SidebarState for every possible input.
 // ---------------------------------------------------------------------------
+
+test('a malformed nested sidebar quota reads as no reading for every account source', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sidebar-malformed-quota-'))
+  const file = join(dir, 'sidebar.json')
+  try {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        main: {
+          quota: {
+            primary: {
+              usedPercent: 80,
+              remainingPercent: 20,
+              resetsAt: { toString: 0 },
+            },
+          },
+        },
+        fallbacks: [
+          { id: 'fallback', quota: { spendControl: { limit: Infinity } } },
+        ],
+        vaultAccounts: [
+          {
+            id: 'vault',
+            quota: { credits: { hasCredits: 'yes', unlimited: false } },
+          },
+        ],
+      }),
+    )
+    const state = await getSidebarState(file)
+    const readings = [
+      state.main.quota,
+      state.fallbacks[0]!.quota,
+      state.vaultAccounts![0]!.quota,
+    ]
+    expect(readings).toEqual([null, null, null])
+    for (const reading of readings)
+      expect(getCollapsedQuotaSummary(reading).text).toBeNull()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 describe('normalizeSidebarState', () => {
   // (a) empty object — no main, no fallbacks

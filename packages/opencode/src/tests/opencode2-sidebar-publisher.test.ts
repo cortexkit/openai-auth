@@ -488,6 +488,27 @@ test('OpenCode 2 publisher: an equivalent vault refresh does not rewrite the sid
   expect(readFileSync(f.file, 'utf8')).toBe(before)
 })
 
+test('OpenCode 2 publisher retries a rejected observation write on the next unchanged tick', async () => {
+  const observation = sidebarObserver()
+  const f = await fixture(undefined, false, undefined, observation)
+  await observation.tick(f.file)
+  const publish = spyOn(
+    sidebarState,
+    'setSidebarMachineState',
+  ).mockRejectedValueOnce(new Error('sidebar write failed'))
+  cleanups.push(() => publish.mockRestore())
+  writeFileSync(
+    f.files.configPath,
+    `${readFileSync(f.files.configPath, 'utf8')}\n`,
+  )
+  await observation.tick(f.file)
+  expect(publish).toHaveBeenCalledTimes(1)
+  await observation.tick(f.file)
+  expect(publish).toHaveBeenCalledTimes(2)
+  await observation.tick(f.file)
+  expect(publish).toHaveBeenCalledTimes(2)
+})
+
 test('OpenCode 2 publisher: a pin notification after a mode change uses the current route', async () => {
   const f = await fixture()
   await mainFirst(f.a.client)

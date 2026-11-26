@@ -17,6 +17,7 @@ import {
   RPC_SERVER_REGISTRY_KEY,
   type RpcServerHandle,
 } from '../rpc/rpc-server'
+import { installControlPlane } from '../v2/control-plane'
 import { setupOpenAIAuth } from '../v2/setup'
 import { setupTrace } from '../v2/setup-trace'
 import { openCodeHostLogTail } from './fixtures/opencode2-control-plane'
@@ -226,6 +227,104 @@ test('OpenCode 2 late rejected RPC hand-over logs only the folder and leaves set
   expect(log).toContain(f.root)
   expect(log).not.toContain('secret-from-a-server-error')
 }, 10_000)
+
+async function controlPlaneLocation() {
+  const directory = mkdtempSync(join(tmpdir(), 'oc2-command-handover-'))
+  const { dir } = await resolveRpcDir(directory)
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  const locations = () =>
+    (
+      globals[Symbol.for('cortexkit.openai-auth.v2.commands')] as {
+        locations: Map<string, unknown>
+      }
+    ).locations
+  cleanups.push(async () => {
+    const { servers } = globals[Symbol.for(RPC_SERVER_REGISTRY_KEY)] as {
+      servers: Map<string, RpcServerHandle>
+    }
+    await servers.get(dir)?.stop()
+    servers.delete(dir)
+    locations().delete(directory)
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const menu = { command: 'openai' as const, title: 'OpenAI', sections: [] }
+  type Context = Parameters<typeof installControlPlane>[0]
+  return {
+    host: () => {
+      const host = fakeOpenCode2Host({ directory })
+      return { ...host, ctx: host.ctx as Context }
+    },
+    install: async (ctx: Context) => {
+      const dispose = await installControlPlane(ctx, {
+        open: async () => ({ command: 'openai', menu }),
+        apply: async () => ({ command: 'openai', ok: true, text: '', menu }),
+      })
+      cleanups.push(dispose)
+      return dispose
+    },
+    hasLocation: () => locations().has(directory),
+    portFile: join(dir, `port-${process.pid}.json`),
+  }
+}
+
+test('OpenCode 2 rolls back the replacement when predecessor command disposal rejects', async () => {
+  const f = await controlPlaneLocation()
+  const first = f.host()
+  const failure = new Error('command disposal failed')
+  const disposeFirst = await f.install({
+    ...first.ctx,
+    command: {
+      ...first.ctx.command,
+      transform: async () => ({
+        dispose: async () => {
+          throw failure
+        },
+      }),
+    },
+  })
+  const second = f.host()
+  try {
+    await expect(f.install(second.ctx)).rejects.toThrow(failure.message)
+  } finally {
+    await disposeFirst().catch(() => {})
+  }
+  expect(second.commands).toHaveLength(0)
+  expect({ location: f.hasLocation(), port: existsSync(f.portFile) }).toEqual({
+    location: false,
+    port: false,
+  })
+})
+
+test('OpenCode 2 disposes a command registration that resolves after replacement', async () => {
+  const f = await controlPlaneLocation()
+  const first = f.host()
+  const entered = deferred<void>()
+  const resume = deferred<void>()
+  const installing = f.install({
+    ...first.ctx,
+    command: {
+      ...first.ctx.command,
+      transform: async (callback) => {
+        entered.resolve()
+        await resume.promise
+        return first.ctx.command.transform(callback)
+      },
+    },
+  })
+  await entered.promise
+  const second = f.host()
+  try {
+    await f.install(second.ctx)
+  } finally {
+    resume.resolve()
+  }
+  const disposeFirst = await installing
+  expect(first.commands).toHaveLength(0)
+  await disposeFirst()
+  expect(second.commands).toHaveLength(1)
+  expect(f.hasLocation()).toBe(true)
+  expect(existsSync(f.portFile)).toBe(true)
+})
 
 test('setup tracing is opt-in and host-log diagnostics use only the isolated data folder', () => {
   const root = mkdtempSync(join(tmpdir(), 'oc2-setup-trace-'))

@@ -889,6 +889,33 @@ describe('OpenCode 2 keep-warm holders', () => {
     expect(fake.sent).toHaveLength(0)
   })
 
+  test('forgetting a session from another location invalidates a pending body capture', async () => {
+    const fake = served()
+    const paths = storePaths()
+    const { lease, clock } = acquire(fake.location, { paths })
+    const other = acquire(fake.location, { paths }).lease
+    const input = captured('ses')
+    const body = await input.request.clone().text()
+    const reading = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<string>()
+    spyOn(input.request, 'clone').mockImplementation(
+      () =>
+        ({
+          text: () => {
+            reading.resolve()
+            return resume.promise
+          },
+        }) as Request,
+    )
+    const capturing = lease.capture(input)
+    await reading.promise
+    other.forget('ses')
+    resume.resolve(body)
+    await capturing
+    await advance(lease, clock, 4 * MINUTE)
+    expect(fake.sent).toHaveLength(0)
+  })
+
   test('the last release joins the warm in flight', async () => {
     const fake = served()
     const gate = Promise.withResolvers<void>()

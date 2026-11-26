@@ -129,12 +129,6 @@ export async function installControlPlane(
   setupTrace('after RPC hand-over wait', directory)
   const previous = state.locations.get(directory)
   state.locations.set(directory, location)
-  if (isLocation(previous)) {
-    previous.closed.abort()
-    setupTrace('before previous.registration.dispose', directory)
-    await previous.registration?.dispose()
-    setupTrace('after previous.registration.dispose', directory)
-  }
   const currentCommand: NonNullable<Registry['command']> = {
     name: 'openai',
     description: 'OpenAI account menu',
@@ -189,11 +183,22 @@ export async function installControlPlane(
   state.command.execute = currentCommand.execute
   const command = state.command
   try {
-    setupTrace('before command.transform', directory)
-    location.registration = await ctx.command.transform((editor) => {
-      editor.add(command)
-    })
-    setupTrace('after command.transform', directory)
+    if (isLocation(previous)) {
+      previous.closed.abort()
+      setupTrace('before previous.registration.dispose', directory)
+      await previous.registration?.dispose()
+      setupTrace('after previous.registration.dispose', directory)
+    }
+    if (state.locations.get(directory) === location) {
+      setupTrace('before command.transform', directory)
+      const registration = await ctx.command.transform((editor) => {
+        editor.add(command)
+      })
+      setupTrace('after command.transform', directory)
+      if (state.locations.get(directory) === location)
+        location.registration = registration
+      else await registration.dispose()
+    }
   } catch (error) {
     location.closed.abort()
     if (state.locations.get(directory) === location)

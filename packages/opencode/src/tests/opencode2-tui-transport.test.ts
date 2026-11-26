@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import type { Plugin } from '@opencode/plugin/tui'
-import type { OpenDialogPayload } from '../rpc/protocol'
+import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import { setupTui } from '../tui/v2'
 import { openControlDialog } from '../tui/v2-dialog'
 
@@ -101,6 +101,24 @@ test('OpenCode 2 native menu shows unavailable text and apply errors', async () 
     'Not available on OpenCode 2 yet.',
     'Exact apply error',
   ])
+})
+
+test('OpenCode 2 native dialog retains its menu on a menu-less apply result', async () => {
+  const titles: string[] = []
+  const alerts: Array<{ title: string; message: string }> = []
+  const dialog = {
+    async select(input: { title: string; options: Array<{ value: unknown }> }) {
+      titles.push(input.title)
+      return titles.length <= 2 ? input.options[0]?.value : undefined
+    },
+    async alert(input: { title: string; message: string }) {
+      alerts.push(input)
+    },
+  } as unknown as Plugin.Context['ui']['dialog']
+  const result = { command: 'openai', ok: true, text: 'Account added' }
+  await openControlDialog(dialog, payload, async () => result as ApplyResult)
+  expect(alerts).toEqual([{ title: 'OpenAI', message: 'Account added' }])
+  expect(titles).toEqual(['OpenAI', 'Accounts\nCurrent accounts', 'OpenAI'])
 })
 
 for (const cancel of [false, true]) {

@@ -54,8 +54,7 @@ export interface AccountCredits {
 /**
  * The prepaid-credits text for an account (`Unlimited`, `<n> credits` or
  * `Available`), or undefined when it has none or the file holds no
- * well-formed credits record. The file is read unchecked, so the record's
- * fields are checked here before the shared wording is applied.
+ * well-formed credits record.
  */
 export function accountCreditsText(
   quota: AccountQuota | null | undefined,
@@ -416,6 +415,70 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   lastUpdated: 0,
 }
 
+function quotaRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function quotaNumber(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function quotaWindow(value: unknown): boolean {
+  return (
+    quotaRecord(value) &&
+    quotaNumber(value.usedPercent) &&
+    quotaNumber(value.remainingPercent) &&
+    (value.checkedAt === undefined || quotaNumber(value.checkedAt)) &&
+    (value.resetsAt === undefined || typeof value.resetsAt === 'string') &&
+    (value.windowMinutes === undefined || quotaNumber(value.windowMinutes))
+  )
+}
+
+function quotaSpendControl(value: unknown): boolean {
+  return (
+    quotaRecord(value) &&
+    quotaNumber(value.limit) &&
+    quotaNumber(value.used) &&
+    quotaNumber(value.remaining) &&
+    quotaNumber(value.usedPercent) &&
+    quotaNumber(value.remainingPercent) &&
+    typeof value.reached === 'boolean' &&
+    (value.resetsAt === undefined || typeof value.resetsAt === 'string') &&
+    (value.unit === undefined || typeof value.unit === 'string') &&
+    (value.source === undefined || typeof value.source === 'string')
+  )
+}
+
+function quotaCredits(value: unknown): boolean {
+  return (
+    quotaRecord(value) &&
+    typeof value.hasCredits === 'boolean' &&
+    typeof value.unlimited === 'boolean' &&
+    (value.balance === undefined || quotaNumber(value.balance)) &&
+    (value.checkedAt === undefined || quotaNumber(value.checkedAt)) &&
+    (value.overageLimitReached === undefined ||
+      typeof value.overageLimitReached === 'boolean')
+  )
+}
+
+function readAccountQuota(value: unknown): AccountQuota | null {
+  if (
+    !quotaRecord(value) ||
+    (value.checkedAt !== undefined && !quotaNumber(value.checkedAt)) ||
+    (value.primary !== undefined && !quotaWindow(value.primary)) ||
+    (value.secondary !== undefined && !quotaWindow(value.secondary)) ||
+    (value.spendControl !== undefined &&
+      !quotaSpendControl(value.spendControl)) ||
+    (value.spendControlCleared !== undefined &&
+      value.spendControlCleared !== true) ||
+    (value.resetCreditsAvailable !== undefined &&
+      !quotaNumber(value.resetCreditsAvailable)) ||
+    (value.credits !== undefined && !quotaCredits(value.credits))
+  )
+    return null
+  return value as AccountQuota
+}
+
 /**
  * Normalize an arbitrary parsed value into a well-formed SidebarState.
  *
@@ -442,7 +505,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   ) {
     const m = rawMain as Record<string, unknown>
     main = {
-      quota: ('quota' in m ? m.quota : null) as AccountQuota | null,
+      quota: readAccountQuota(m.quota),
       killed: typeof m.killed === 'boolean' ? m.killed : false,
       ...(typeof m.mainAccountId === 'string'
         ? { mainAccountId: m.mainAccountId }
@@ -527,7 +590,7 @@ function normalizeAccountList(raw: unknown): SidebarAccountState[] {
         : {}),
       label: typeof e.label === 'string' ? e.label : undefined,
       ...(typeof e.accountId === 'string' ? { accountId: e.accountId } : {}),
-      quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
+      quota: readAccountQuota(e.quota),
       killed: typeof e.killed === 'boolean' ? e.killed : false,
       enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
       ...(typeof e.routable === 'boolean' ? { routable: e.routable } : {}),
