@@ -625,17 +625,22 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
       arguments: '{"path":"README.md"}',
     }
     let sdkInput: readonly unknown[] = []
+    let suppliedInput: readonly unknown[] = []
     let sdkInputBytes = ''
     const sent = await httpBody(
       {
         onPayload(raw) {
           const body = raw as { input: unknown[] }
           sdkInput = body.input
-          expect(sdkInput[1]).toEqual(replayed)
+          expect(sdkInput[1]).toEqual({ ...replayed, status: 'completed' })
+          // Keep testing older or caller-supplied input that lacks a replay status.
           body.input = [
-            ...sdkInput,
+            sdkInput[0],
+            replayed,
+            ...sdkInput.slice(2),
             { ...replayed, id: 'fc_explicit', status: 'incomplete' },
           ]
+          suppliedInput = body.input
           sdkInputBytes = JSON.stringify(body.input)
           return body
         },
@@ -654,7 +659,7 @@ test('Pi restores GPT-6.2 replayed call status without instructions and keeps GP
           { ...replayed, id: 'fc_explicit', status: 'incomplete' },
         ]),
       )
-      expect(sdkInput[1]).toEqual(replayed)
+      expect(suppliedInput[1]).toEqual(replayed)
     }
   }
 })
@@ -767,16 +772,42 @@ test('Pi leaves native effort updates and top-level effort alone in a pinned ses
   const opening = await httpBody({ sessionId, reasoning: 'low' }, effortModel)
   expect(opening.reasoning).toEqual({ effort: 'low', summary: 'auto' })
 
+  // pi-ai uses the first recorded assistant effort as the native baseline.
+  const priorReply: Context['messages'][number] = {
+    role: 'assistant',
+    api: effortModel.api,
+    provider: effortModel.provider,
+    model: effortModel.id,
+    providerThinkingLevel: 'medium',
+    content: [{ type: 'text', text: 'Blue.', textSignature: 'msg_1' }],
+    stopReason: 'stop',
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { ...model.cost, total: 0 },
+    },
+    timestamp: 2,
+  }
   const changed = await httpBody(
     { sessionId, reasoning: 'high' },
     { ...effortModel, compat: { supportsMidConvoEffort: true } },
-    { systemPrompt, messages: [firstUser, secondUser] },
+    { systemPrompt, messages: [firstUser, priorReply, secondUser] },
   )
   expect({ reasoning: changed.reasoning, input: changed.input }).toEqual({
     reasoning: { effort: 'medium', summary: 'auto' },
     input: [
       developerMessage(systemPrompt, systemId),
       userItem(firstUser.content),
+      {
+        type: 'message',
+        role: 'assistant',
+        id: 'msg_1',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'Blue.', annotations: [] }],
+      },
       userItem(secondUser.content),
       effortUpdate('high'),
     ],
@@ -1875,8 +1906,11 @@ test('Pi chains GPT-6.2 after a completed call and restores statuses on full Web
         ...cachedWebSocketOptions(),
         onPayload(raw) {
           const body = raw as { input: Record<string, unknown>[] }
+          const seed = body.input.find((item) => item.id === 'fc_seed')
           const explicit = body.input.find((item) => item.id === 'fc_explicit')
-          if (!explicit) throw new Error('Missing explicit-status fixture')
+          if (!seed || !explicit) throw new Error('Missing replayed tool call')
+          // pi-ai now sends completed by default; still exercise wire repair.
+          delete seed.status
           explicit.status = 'incomplete'
         },
       }
