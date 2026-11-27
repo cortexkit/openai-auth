@@ -2008,8 +2008,6 @@ export async function CodexAuthPlugin(
           )
         }
 
-        // The pure resolver prefers an admission error's explicit reset and
-        // otherwise uses this account's cached named-window quota.
         function rateLimitQuota(
           accountKey: string,
           migrated = false,
@@ -2028,21 +2026,6 @@ export async function CodexAuthPlugin(
             ? quotaManager.peekMainForPolicy()?.quota
             : quotaManager.peekFallbackForPolicy(accountKey)?.quota
         }
-        function midStreamRateLimitResetAt(
-          accountKey: string,
-          window: string,
-          explicitResetAt?: number,
-        ): number {
-          const quota = rateLimitQuota(accountKey)
-          return resolveMidStreamRateLimitResetAt(
-            quota,
-            window,
-            Date.now(),
-            DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS,
-            explicitResetAt,
-          )
-        }
-
         // Quota and rate-limit frames for a vault account arrive on the
         // WebSocket while the response body streams, after the fetch call has
         // returned. So each vault send gets a unique key, passed to the
@@ -2167,12 +2150,25 @@ export async function CodexAuthPlugin(
                   owner.enqueue(command, provenance)
                   return
                 }
-                const resetAt = midStreamRateLimitResetAt(
-                  accountKey,
+                const quota = rateLimitQuota(accountKey)
+                const resetAt = resolveMidStreamRateLimitResetAt(
+                  quota,
                   window,
+                  Date.now(),
+                  DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS,
                   explicitResetAt,
                 )
-                quotaManager.markRateLimited(accountKey, resetAt)
+                // A slot does not identify the length: Codex can put a lone
+                // weekly window in primary.
+                const causeWindowMinutes =
+                  window === 'primary' || window === 'secondary'
+                    ? quota?.[window]?.windowMinutes
+                    : undefined
+                quotaManager.markRateLimited(
+                  accountKey,
+                  resetAt,
+                  causeWindowMinutes,
+                )
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
                   accountId: accountKey,

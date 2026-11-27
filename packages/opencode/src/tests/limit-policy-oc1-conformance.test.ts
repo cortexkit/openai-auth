@@ -334,28 +334,48 @@ describe('OC1 limit-policy conformance', () => {
       checkedAt: NOW,
       refreshAfter: NOW + 60_000,
     })
-    manager.markRateLimited('main', NOW + 24 * 60 * 60_000)
+    manager.markRateLimited('main', NOW + 24 * 60 * 60_000, 10_080)
     manager.setMain('a', entry({}))
     expect(manager.isRateLimited('main')).toBe(true)
     manager.setMain(
       'a',
       entry({
-        primary: { usedPercent: 10, remainingPercent: 90, checkedAt: NOW },
-        secondary: { usedPercent: 100, remainingPercent: 0, checkedAt: NOW },
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 300,
+          checkedAt: NOW,
+        },
+        secondary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          windowMinutes: 10_080,
+          checkedAt: NOW,
+        },
       }),
     )
     expect(manager.isRateLimited('main')).toBe(true)
     manager.setMain(
       'a',
       entry({
-        primary: { usedPercent: 10, remainingPercent: 90, checkedAt: NOW },
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 300,
+          checkedAt: NOW,
+        },
       }),
     )
     expect(manager.isRateLimited('main')).toBe(true)
     manager.setMain(
       'a',
       entry({
-        secondary: { usedPercent: 10, remainingPercent: 90, checkedAt: NOW },
+        secondary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 10_080,
+          checkedAt: NOW,
+        },
       }),
     )
     expect(manager.isRateLimited('main')).toBe(false)

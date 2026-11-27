@@ -221,7 +221,10 @@ export class QuotaManager {
   // rate_limit_reached_type signal — never a quota-API call). Keyed by the
   // internal storage id ('main' or a fallback id). Expires purely by
   // read-time comparison in isRateLimited(); no timer is armed. ---
-  private rateLimitedUntilMap = new Map<string, number>()
+  private rateLimitMarks = new Map<
+    string,
+    { resetAtMs: number; causeWindowMinutes?: number }
+  >()
 
   // --- Serial API gate (prevents concurrent quota API calls) ---
   private apiGate: Promise<unknown> = Promise.resolve()
@@ -415,19 +418,22 @@ export class QuotaManager {
 
   /**
    * Mark accountId ('main' or a fallback id) rate-limited until resetAtMs.
-   * Keeps the LATER reset: skips only when an existing mark is strictly
-   * later than resetAtMs, so an equal-reset re-mark still applies (idempotent)
-   * instead of being silently dropped by a stale `>=` comparison.
+   * A strictly later existing reset keeps its cause; otherwise the new mark
+   * replaces both the reset and the cause.
    */
-  markRateLimited(accountId: string, resetAtMs: number): void {
-    const existing = this.rateLimitedUntilMap.get(accountId)
-    if (existing !== undefined && existing > resetAtMs) return
-    this.rateLimitedUntilMap.set(accountId, resetAtMs)
+  markRateLimited(
+    accountId: string,
+    resetAtMs: number,
+    causeWindowMinutes?: number,
+  ): void {
+    const existing = this.rateLimitMarks.get(accountId)
+    if (existing && existing.resetAtMs > resetAtMs) return
+    this.rateLimitMarks.set(accountId, { resetAtMs, causeWindowMinutes })
   }
 
   /** True iff accountId has a mark whose reset has not yet passed. */
   isRateLimited(accountId: string): boolean {
-    const until = this.rateLimitedUntilMap.get(accountId)
+    const until = this.rateLimitedUntil(accountId)
     return until !== undefined && this.now() < until
   }
 
@@ -438,43 +444,38 @@ export class QuotaManager {
    * true) and want its exact reset estimate for a Retry-After computation.
    */
   rateLimitedUntil(accountId: string): number | undefined {
-    return this.rateLimitedUntilMap.get(accountId)
+    return this.rateLimitMarks.get(accountId)?.resetAtMs
   }
 
   /** Explicit early clear — read-time expiry in isRateLimited is primary. */
   clearRateLimited(accountId: string): void {
-    this.rateLimitedUntilMap.delete(accountId)
+    this.rateLimitMarks.delete(accountId)
   }
 
   private clearRecoveredRateLimit(accountId: string, entry: QuotaEntry): void {
-    const until = this.rateLimitedUntilMap.get(accountId)
-    if (until === undefined || !Number.isFinite(entry.checkedAt)) return
-    // Use the reading's time so a delayed delivery cannot make a weekly
-    // reset look like a short reset. An unrelated window cannot prove recovery.
-    const short = until - entry.checkedAt <= 5 * 60 * 60_000
+    const mark = this.rateLimitMarks.get(accountId)
+    if (!mark || !Number.isFinite(entry.checkedAt)) return
     const { primary, secondary } = entry.quota
-    const windowMinutes = short ? 300 : 10_080
-    const hasLength =
-      primary?.windowMinutes !== undefined ||
-      secondary?.windowMinutes !== undefined
-    // Codex can put a single weekly window in primary. Trust slot names only
-    // for readings that give neither window's length.
-    const bySlot = short ? primary : secondary
-    const window = hasLength
-      ? [primary, secondary].find(
-          (reading) => reading?.windowMinutes === windowMinutes,
-        )
-      : bySlot
-    if (
-      window &&
+    const windows = [primary, secondary].filter(
+      (window) => window !== undefined,
+    )
+    const hasRoom = (window: AccountQuotaWindow) =>
       Number.isFinite(window.usedPercent) &&
       window.usedPercent >= 0 &&
       window.usedPercent < 100 &&
       Number.isFinite(window.remainingPercent) &&
       window.remainingPercent > 0
-    ) {
-      this.clearRateLimited(accountId)
-    }
+    // An unrelated window cannot prove recovery. Without a known cause,
+    // require room in every window the provider reports.
+    const recovered =
+      mark.causeWindowMinutes === undefined
+        ? windows.length > 0 && windows.every(hasRoom)
+        : windows.some(
+            (window) =>
+              window.windowMinutes === mark.causeWindowMinutes &&
+              hasRoom(window),
+          )
+    if (recovered) this.clearRateLimited(accountId)
   }
 
   // =========================================================================

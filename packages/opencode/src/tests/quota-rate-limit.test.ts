@@ -193,7 +193,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
-  it('setMain clears a short mark when the only present window is a healthy 5h window', async () => {
+  it('clears a known 5h mark when the 5h window has room even if the weekly window is exhausted', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -207,7 +207,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       },
     })
 
-    qm.markRateLimited('main', now + 60_000)
+    qm.markRateLimited('main', now + 60_000, 300)
     expect(qm.isRateLimited('main')).toBe(true)
 
     qm.setMain('token-a', {
@@ -218,6 +218,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
           windowMinutes: 300,
           checkedAt: now,
         },
+        secondary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          windowMinutes: 10_080,
+          checkedAt: now,
+        },
       },
       refreshAfter: now + 60_000,
       checkedAt: now,
@@ -225,7 +231,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
-  it('setMain does not clear a weekly mark while the weekly window is still exhausted', async () => {
+  it('keeps an exhausted weekly mark with four hours left even when the 5h window has room', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -239,13 +245,23 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       },
     })
 
-    qm.markRateLimited('main', now + 24 * 60 * 60_000)
+    qm.markRateLimited('main', now + 4 * 60 * 60_000, 10_080)
     expect(qm.isRateLimited('main')).toBe(true)
 
     qm.setMain('token-a', {
       quota: {
-        primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
-        secondary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 300,
+          checkedAt: now,
+        },
+        secondary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          windowMinutes: 10_080,
+          checkedAt: now,
+        },
       },
       refreshAfter: now + 60_000,
       checkedAt: now,
@@ -277,11 +293,11 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       checkedAt,
     }
 
-    qm.markRateLimited('main', checkedAt + 5 * hour)
+    qm.markRateLimited('main', checkedAt + 5 * hour, 300)
     qm.setMain('token-a', entry)
     expect(qm.isRateLimited('main')).toBe(true)
 
-    qm.markRateLimited('main', checkedAt + 24 * hour)
+    qm.markRateLimited('main', checkedAt + 24 * hour, 10_080)
     qm.setMain('token-a', entry)
     expect(qm.isRateLimited('main')).toBe(false)
   })
@@ -296,8 +312,6 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     const qm = new QuotaManager({
       configPath: getAccountStoragePath(),
       storage: null,
-      // At delivery the same expiry is less than 5h away. The age of the
-      // reading must not make its 5h window explain a weekly mark.
       now: () => checkedAt + 2 * hour,
     })
     const primary = {
@@ -315,7 +329,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
         secondary: { ...weekly, usedPercent: 100, remainingPercent: 0 },
       },
     })
-    qm.markRateLimited('fb-1', resetAt)
+    qm.markRateLimited('fb-1', resetAt, 10_080)
     qm.setFallback('fb-1', { ...entry, quota: { primary } })
     expect(qm.isRateLimited('fb-1')).toBe(true)
 
@@ -329,6 +343,80 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
 
     qm.setFallback('fb-1', { ...entry, quota: { secondary: weekly } })
     expect(qm.isRateLimited('fb-1')).toBe(false)
+  })
+
+  it('keeps an unknown-cause mark until there is at least one window and all windows have room', async () => {
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const checkedAt = 4_070_000
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+      now: () => checkedAt,
+    })
+    const entry = { checkedAt, refreshAfter: checkedAt + 60_000 }
+    const primary = {
+      usedPercent: 10,
+      remainingPercent: 90,
+      windowMinutes: 300,
+      checkedAt,
+    }
+    const secondary = { ...primary, windowMinutes: 10_080 }
+    const exhausted = { usedPercent: 100, remainingPercent: 0 }
+    qm.markRateLimited('main', checkedAt + 60_000)
+
+    qm.setMain('token-a', { ...entry, quota: {} }, undefined, true)
+    expect(qm.isRateLimited('main')).toBe(true)
+
+    for (const quota of [
+      { primary, secondary: { ...secondary, ...exhausted } },
+      { primary: { ...primary, ...exhausted }, secondary },
+    ]) {
+      qm.setMain('token-a', { ...entry, quota })
+      expect(qm.isRateLimited('main')).toBe(true)
+    }
+
+    qm.setMain('token-a', { ...entry, quota: { primary, secondary } })
+    expect(qm.isRateLimited('main')).toBe(false)
+  })
+
+  it('earlier re-marks leave the cause intact and later re-marks replace it', async () => {
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const checkedAt = 4_080_000
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+      now: () => checkedAt,
+    })
+    const entry = {
+      checkedAt,
+      refreshAfter: checkedAt + 60_000,
+      quota: {
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 300,
+          checkedAt,
+        },
+        secondary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          windowMinutes: 10_080,
+          checkedAt,
+        },
+      },
+    }
+    qm.markRateLimited('main', checkedAt + 120_000, 10_080)
+    qm.markRateLimited('main', checkedAt + 60_000, 300)
+    qm.setMain('token-a', entry)
+    expect(qm.isRateLimited('main')).toBe(true)
+
+    qm.markRateLimited('main', checkedAt + 180_000, 300)
+    qm.setMain('token-a', entry)
+    expect(qm.isRateLimited('main')).toBe(false)
   })
 
   it('setMain clears the mark when both present windows are healthy', async () => {
