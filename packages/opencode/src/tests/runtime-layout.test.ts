@@ -245,6 +245,10 @@ const PREPARE_SETTLE_MS = 25_000
  * job on windows-latest passed. The two-config-folder case moves two full
  * layouts: 0.48-0.91 s on six windows-2022 and windows-latest runs, then
  * 5.4 s once on windows-latest (23 Nov 2026) while its neighbours stayed normal.
+ * The atomic-write temp cases move a full layout, and the retry case moves it
+ * twice. On one windows-2022 run (27 Nov 2026) the retry case's trace showed
+ * every lock step under 0.3 s, but two owner-only writes of small files took
+ * 1.7 and 2.2 s each, so the case passed 5 s with the move still running.
  * Don't raise this further without measuring where the time goes.
  */
 const CREDENTIAL_CASE_TIMEOUT_MS = 20_000
@@ -632,53 +636,58 @@ describe('the runtime layout on a fresh install', () => {
 
 describe('moving an existing layout', () => {
   for (const phase of ['move', 'retry', 'finished'] as const) {
-    it(`removes only owned atomic-write temps on ${phase}, preserving enrollment state`, async () => {
-      const files = oldLayout()
-      seed(configDir(), files)
-      if (phase !== 'move') {
-        await prepare({
-          ...(phase === 'retry'
-            ? {
-                steps: {
-                  afterMarker: () => {
-                    throw new Error('crash')
+    it(
+      `removes only owned atomic-write temps on ${phase}, preserving enrollment state`,
+      async () => {
+        const files = oldLayout()
+        seed(configDir(), files)
+        if (phase !== 'move') {
+          await prepare({
+            ...(phase === 'retry'
+              ? {
+                  steps: {
+                    afterMarker: () => {
+                      throw new Error('crash')
+                    },
                   },
-                },
-              }
-            : {}),
-        })
-        resetProcess()
-      }
-      const uuid = '01234567-89ab-4cde-8fab-0123456789ab'
-      const temps = Object.fromEntries(
-        Object.keys(files).map((name) => [`${name}.${uuid}.tmp`, 'staged']),
-      )
-      seed(configDir(), temps)
-      const foreign = {
-        [`openai-auth.json.${uuid}.tmp`]: 'settings are not moved',
-        [`other.json.${uuid}.tmp`]: 'not ours',
-        [`openai-auth-vault/other.json.${uuid}.tmp`]: 'not ours',
-        'openai-auth-vault/opencode-roster.json.not-a-uuid.tmp': 'not ours',
-        [`openai-auth-vault/opencode-roster.json.${uuid}.tmp.bak`]: 'not ours',
-      }
-      seed(configDir(), foreign)
-      const stagedDir = join(
-        configDir(),
-        `openai-auth-state.json.${uuid.replace('01234567', '12345678')}.tmp`,
-      )
-      mkdirSync(stagedDir)
+                }
+              : {}),
+          })
+          resetProcess()
+        }
+        const uuid = '01234567-89ab-4cde-8fab-0123456789ab'
+        const temps = Object.fromEntries(
+          Object.keys(files).map((name) => [`${name}.${uuid}.tmp`, 'staged']),
+        )
+        seed(configDir(), temps)
+        const foreign = {
+          [`openai-auth.json.${uuid}.tmp`]: 'settings are not moved',
+          [`other.json.${uuid}.tmp`]: 'not ours',
+          [`openai-auth-vault/other.json.${uuid}.tmp`]: 'not ours',
+          'openai-auth-vault/opencode-roster.json.not-a-uuid.tmp': 'not ours',
+          [`openai-auth-vault/opencode-roster.json.${uuid}.tmp.bak`]:
+            'not ours',
+        }
+        seed(configDir(), foreign)
+        const stagedDir = join(
+          configDir(),
+          `openai-auth-state.json.${uuid.replace('01234567', '12345678')}.tmp`,
+        )
+        mkdirSync(stagedDir)
 
-      expect(await prepare()).toBe('state-home')
-      expect(present(configDir(), temps)).toEqual(absent(temps))
-      expect(present(configDir(), foreign)).toEqual(foreign)
-      expect(statSync(stagedDir).isDirectory()).toBe(true)
-      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
-      expect(present(runtimeDir(), temps)).toEqual(absent(temps))
-      expect(marker()?.oldFilesRemoved).toBe(true)
-      expect(marker()?.keptVaultState).toBe(
-        sha256(files[VAULT_STATE] as string),
-      )
-    })
+        expect(await prepare()).toBe('state-home')
+        expect(present(configDir(), temps)).toEqual(absent(temps))
+        expect(present(configDir(), foreign)).toEqual(foreign)
+        expect(statSync(stagedDir).isDirectory()).toBe(true)
+        expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+        expect(present(runtimeDir(), temps)).toEqual(absent(temps))
+        expect(marker()?.oldFilesRemoved).toBe(true)
+        expect(marker()?.keptVaultState).toBe(
+          sha256(files[VAULT_STATE] as string),
+        )
+      },
+      CREDENTIAL_CASE_TIMEOUT_MS,
+    )
   }
 
   it('moves the state, the vault folder and both sessions files byte for byte, keeping vault mode', async () => {
