@@ -1,6 +1,9 @@
-// The OpenCode 2 session-deletion subscription: setup asks the host for only
-// `session.deleted` events, and a deleted session still loses its routing pin,
-// its frame-mirror snapshot and its keep-warm target.
+// The OpenCode 2 session-event subscriptions: setup listens for only
+// `session.deleted`, while the auth installer also takes the run-end events
+// that release held retries. A deleted session still loses its routing pin,
+// its frame-mirror snapshot and its keep-warm target, and an interrupted run
+// releases a held same-account retry so the next primary request chooses
+// fresh.
 
 import { expect, spyOn, test } from 'bun:test'
 import { rmSync } from 'node:fs'
@@ -101,14 +104,20 @@ test('session deletion arrives through a filtered subscription and forgets the s
     fetch: offline,
   })
   try {
-    // Only the deletion loop filters; every requested type across every
-    // subscription is exactly the deletion event.
+    // The installer takes deletion plus the run-end events that release held
+    // retries; setup's own loop takes only deletion.
     const requested = subscribe.mock.calls.map(
       ([options]) =>
         (options as { types?: readonly string[] } | undefined)?.types ?? [],
     )
-    expect(requested.flatMap((types) => [...types])).toEqual([
-      'session.deleted',
+    expect(requested).toEqual([
+      [
+        'session.deleted',
+        'session.execution.succeeded',
+        'session.execution.failed',
+        'session.execution.interrupted',
+      ],
+      ['session.deleted'],
     ])
     const filtered = subscribe.mock.calls.find(([options]) =>
       (options as { types?: readonly string[] } | undefined)?.types?.includes(
@@ -140,6 +149,96 @@ test('session deletion arrives through a filtered subscription and forgets the s
     subscribe.mockRestore()
     mirrorForget.mockRestore()
     keepSpy.mockRestore()
+    rmSync(files.dir, { recursive: true, force: true })
+  }
+})
+
+async function sendPrimary(host: Host, sessionID = 'ses_1') {
+  const model = {
+    ...scope(sessionID),
+    model: { providerID: 'openai', id: 'gpt-5.5' },
+    headers: {} as Record<string, string>,
+  }
+  await host.fire('model.request', model)
+  const draft = {
+    ...scope(sessionID),
+    model: model.model,
+    request: new Request('http://codex.test/v1/responses', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${PLACEHOLDER}`,
+        ...model.headers,
+      },
+      body: '{}',
+    }),
+  }
+  await host.fire('http.request', draft)
+  return draft
+}
+
+async function refuseUsageLimit(
+  host: Host,
+  draft: Awaited<ReturnType<typeof sendPrimary>>,
+) {
+  const response = {
+    ...scope(draft.sessionID),
+    request: draft.request,
+    response: Response.json(
+      { error: { type: 'usage_limit_reached' } },
+      { status: 429 },
+    ),
+  }
+  await host.fire('http.response', response)
+  await response.response.text()
+  const retry = {
+    sessionID: draft.sessionID,
+    model: { providerID: 'openai', id: 'gpt-5.5' },
+    attempt: 1,
+    error: { type: 'api', message: 'usage limit', status: 429 },
+    decision: { retry: true, delay: 1234 },
+  }
+  await host.fire('retry', retry)
+  return retry.decision
+}
+
+const bearerOf = (request: Request) => request.headers.get('authorization')
+
+test('an interrupted run releases a held same-account retry so the next primary request chooses fresh', async () => {
+  const files = poolFiles()
+  // One account: the refused send holds the host's wait on that same account.
+  seedPool(files, 'sticky-balanced', [{ id: 'a', usedPercent: 10 }])
+  const host = fakeOpenCode2Host()
+  const ctx: Parameters<typeof setupOpenAIAuth>[0] = host.ctx
+  const stop = await setupOpenAIAuth(ctx, {
+    paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
+    slot: opencode1HostSlot(join(files.dir, 'auth.json')),
+    fence: async () => ({ open: true }),
+    heartbeat: false,
+    fetch: offline,
+  })
+  try {
+    expect(bearerOf((await sendPrimary(host)).request)).toBe('Bearer a-token')
+    // A 429 on the only account keeps the host's wait on that same account.
+    expect(await refuseUsageLimit(host, await sendPrimary(host))).toEqual({
+      retry: true,
+      delay: 1234,
+    })
+    // A new account with plenty of room joins the pool; a fresh choice would
+    // take it, while the held retry would stay on the refused account.
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 10 },
+      { id: 'b', usedPercent: 5 },
+    ])
+    // The user interrupts the run: the held retry is released instead of
+    // pinning the next primary request to the refused account.
+    await host.publish('session.execution.interrupted', {
+      sessionID: 'ses_1',
+      reason: 'user',
+    })
+    expect(bearerOf((await sendPrimary(host)).request)).toBe('Bearer b-token')
+  } finally {
+    await stop?.()
     rmSync(files.dir, { recursive: true, force: true })
   }
 })

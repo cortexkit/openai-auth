@@ -602,9 +602,11 @@ test.each(['resumed', 'cancelled', 'abandoned'] as const)(
         expect(env.authorized).toEqual(['vault:b', 'vault:b'])
       } else {
         if (outcome === 'cancelled')
-          await host.publish('session.status', {
+          // The host reports a user-interrupted run; the installer releases
+          // the held same-account wait instead of waiting out the delay.
+          await host.publish('session.execution.interrupted', {
             sessionID,
-            status: { type: 'idle' },
+            reason: 'user',
           })
         else env.openai.beginTurn(sessionID)
         expect(env.authorized).toEqual(['vault:b'])
