@@ -1256,12 +1256,17 @@ async function initializeOpenAIAuth(
   setupTrace('after installControlPlane', directory)
 
   // A deleted session's pin, remembered account, mirror and keep-warm target
-  // go with it.
+  // go with it. The host filters the subscription at its bus, so all other
+  // bus traffic is never encoded for this listener. Hosts that predate the
+  // filter ignore it and deliver everything; the check below still applies.
   const abort = new AbortController()
   cleanup.defer('session events', () => abort.abort())
   void (async () => {
     try {
-      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+      for await (const event of ctx.event.subscribe({
+        types: ['session.deleted'],
+        signal: abort.signal,
+      })) {
         if (event.type === 'session.deleted') {
           openai.forgetSession(event.data.sessionID)
           cacheKeep.forget(event.data.sessionID)

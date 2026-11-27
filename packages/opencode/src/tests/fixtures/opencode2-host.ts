@@ -54,8 +54,13 @@ export function fakeOpenCode2Host(
   const hooks: Hook[] = []
   const methods: RegisteredMethod[] = [...(options.methods ?? [])]
   const modelTransforms: Array<(editor: unknown) => void> = []
-  const pending: Array<{ type: string; data: unknown }> = []
-  let wake: (() => void) | undefined
+  // One queue per subscriber, filtered by the requested types the way the
+  // host's bus delivers only matching events to a typed subscription.
+  const subscribers = new Set<{
+    types?: readonly string[]
+    queue: Array<{ type: string; data: unknown }>
+    wake?: () => void
+  }>()
   const registration = (onDispose: () => void = () => {}) => ({
     dispose: async () => onDispose(),
   })
@@ -113,23 +118,36 @@ export function fakeOpenCode2Host(
       },
     },
     event: {
-      subscribe(subscribeOptions?: { signal?: AbortSignal }) {
+      subscribe(subscribeOptions?: {
+        signal?: AbortSignal
+        types?: readonly string[]
+      }) {
+        const subscriber = {
+          types: subscribeOptions?.types,
+          queue: [] as Array<{ type: string; data: unknown }>,
+          wake: undefined as (() => void) | undefined,
+        }
+        subscribers.add(subscriber)
         return {
           async *[Symbol.asyncIterator]() {
-            while (!subscribeOptions?.signal?.aborted) {
-              const next = pending.shift()
-              if (next) {
-                yield next
-                continue
+            try {
+              while (!subscribeOptions?.signal?.aborted) {
+                const next = subscriber.queue.shift()
+                if (next) {
+                  yield next
+                  continue
+                }
+                await new Promise<void>((resolve) => {
+                  subscriber.wake = resolve
+                  subscribeOptions?.signal?.addEventListener(
+                    'abort',
+                    () => resolve(),
+                    { once: true },
+                  )
+                })
               }
-              await new Promise<void>((resolve) => {
-                wake = resolve
-                subscribeOptions?.signal?.addEventListener(
-                  'abort',
-                  () => resolve(),
-                  { once: true },
-                )
-              })
+            } finally {
+              subscribers.delete(subscriber)
             }
           },
         }
@@ -222,8 +240,11 @@ export function fakeOpenCode2Host(
     },
     /** Delivers a host event to subscribers and lets them process it. */
     async publish(type: string, data: unknown) {
-      pending.push({ type, data })
-      wake?.()
+      for (const subscriber of subscribers) {
+        if (subscriber.types && !subscriber.types.includes(type)) continue
+        subscriber.queue.push({ type, data })
+        subscriber.wake?.()
+      }
       await new Promise((resolve) => setTimeout(resolve, 0))
     },
     /** Runs every live hook registered for `name` that applies to the draft's provider. */

@@ -620,8 +620,11 @@ describe('WebSocket frame turn in the OpenCode 2 plugin', () => {
       expect(await plugin.send(full([user('one')]))).toBe(1)
       await plugin.host.publish('session.deleted', { sessionID: SESSION })
       expect(plugin.codex.frameTurns.get(SESSION)).toBeUndefined()
-      // The next frame of a session with that id starts a new turn, even as
-      // an unchanged full frame that would otherwise be a resend.
+      // Deletion also drops the socket's ownership, as on the host, so the
+      // reused id handshakes again before its next frame. That frame starts
+      // a new turn, even as an unchanged full frame that would otherwise be
+      // a resend.
+      await plugin.handshake('primary')
       expect(await plugin.send(full([user('one')]))).toBe(2)
     })
   }
