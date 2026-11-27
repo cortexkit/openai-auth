@@ -6,7 +6,14 @@
 // than named imports, so each one fails on its own assertion against a build
 // that lacks them instead of the whole file failing to load.
 import { dlopen, FFIType, ptr } from 'bun:ffi'
-import { afterEach, beforeEach, it as bunIt, describe, expect } from 'bun:test'
+import {
+  afterEach,
+  beforeEach,
+  it as bunIt,
+  describe,
+  expect,
+  setDefaultTimeout,
+} from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -249,9 +256,14 @@ const PREPARE_SETTLE_MS = 25_000
  * twice. On one windows-2022 run (27 Nov 2026) the retry case's trace showed
  * every lock step under 0.3 s, but two owner-only writes of small files took
  * 1.7 and 2.2 s each, so the case passed 5 s with the move still running.
- * Don't raise this further without measuring where the time goes.
+ * On the next run every file and lock step in a crash-then-restart case ran
+ * 0.1-0.6 s, and its two moves together passed 5 s.
+ * Each stall hit whichever cases moved files at that moment, so on Windows
+ * every case in this file gets this limit, not only the ones that stalled so
+ * far. Don't raise it further without measuring where the time goes.
  */
 const CREDENTIAL_CASE_TIMEOUT_MS = 20_000
+if (process.platform === 'win32') setDefaultTimeout(CREDENTIAL_CASE_TIMEOUT_MS)
 
 afterEach(async () => {
   // A timeout does not stop an async test body. Reject its prepare continuation
