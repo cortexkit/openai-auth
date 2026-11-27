@@ -374,6 +374,18 @@ function parseJson(text: string): unknown {
   }
 }
 
+// Match a whole compact object, not just its prefix: a second type key or
+// fields such as status, error and response can change how a frame is handled.
+// The remaining fields may only be known indexes, JSON strings or empty logprobs.
+const JSON_STRING_CHARS = String.raw`[^"\\\x00-\x1f]*`
+const JSON_STRING = String.raw`"${JSON_STRING_CHARS}(?:\\(?:["\\/bfnrt]|u[\da-fA-F]{4})${JSON_STRING_CHARS})*"`
+const COMPACT_DELTA_FRAME = new RegExp(
+  String.raw`^\{"type":"([\w.]+\.delta)"` +
+    String.raw`(?:,"(?:sequence_number|output_index|content_index|summary_index)":(?:0|[1-9]\d*)` +
+    `|,"(?:item_id|response_id|delta|obfuscation)":${JSON_STRING}` +
+    String.raw`|,"logprobs":\[\])*\}$`,
+)
+
 function identityOfToken(token: string): string | undefined {
   const claims = parseJwtClaims(token)
   return claims ? extractAccountIdFromClaims(claims) : undefined
@@ -2571,7 +2583,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return result
     },
     inspectEvent: ({ data, transport, attempt }) => {
-      const event = parseJson(data)
+      const deltaType = COMPACT_DELTA_FRAME.exec(data)?.[1]
+      const event =
+        deltaType === undefined ? parseJson(data) : { type: deltaType }
       const type = isRecord(event) ? event.type : undefined
       const completed = type === 'response.completed'
       const failed = type === 'response.failed' || type === 'error'
@@ -2598,15 +2612,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       if (
         attempt.data?.kind === 'vault' &&
+        type === 'codex.rate_limits' &&
         data.includes('codex.rate_limits')
       ) {
-        const frame = parseJson(data)
-        if (isRecord(frame) && frame.type === 'codex.rate_limits')
-          vault?.reportUsage(
-            attempt.data.routeId,
-            { frame },
-            attempt.data.receipt,
-          )
+        vault?.reportUsage(
+          attempt.data.routeId,
+          { frame: event },
+          attempt.data.receipt,
+        )
       }
       if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()) {
         const record = billing.get(attempt)

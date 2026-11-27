@@ -1488,7 +1488,7 @@ function keepWarmPool() {
 describe('OpenCode 2 keep-warm in setup', () => {
   for (const [accessor, type, expectedParses] of [
     [false, 'response.incomplete', 1],
-    [true, 'response.output_text.delta', 1],
+    [true, 'response.output_text.delta', 0],
     [true, 'response.incomplete', 2],
   ] as const) {
     test(`OC2 cache reporting parser: accessor ${accessor}, frame ${type}`, async () => {
@@ -1514,8 +1514,8 @@ describe('OpenCode 2 keep-warm in setup', () => {
           ...scope('ses_ws'),
           frame,
         })
-        // The existing account event inspector parses once for quota/output
-        // classification. Cache reporting adds a parse only for routed terminals.
+        // Account inspection skips compact deltas. Cache reporting adds a parse
+        // only for routed terminals, which account inspection also parses.
         expect(parses).toBe(expectedParses)
       } finally {
         parser.mockRestore()

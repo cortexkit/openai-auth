@@ -1110,8 +1110,8 @@ test('OpenCode 2 skips inactive routing observation and checks the bridge again 
           data: '{"type":"response.output_text.delta","delta":"hello"}',
           attempt: attempt!,
         })
-        // Only the existing provider event parser runs, not another routing parser.
-        expect(parse).toHaveBeenCalledTimes(1)
+        // Neither provider inspection nor routing needs to parse a compact delta.
+        expect(parse).toHaveBeenCalledTimes(0)
       } finally {
         parse.mockRestore()
       }

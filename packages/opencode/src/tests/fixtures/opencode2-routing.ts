@@ -134,6 +134,9 @@ export function fixture(
   }))
   const refused = new Set<string>()
   const authorized: string[] = []
+  const reportUsage = mock<
+    NonNullable<OpenAIAdapterDeps['vault']>['reportUsage']
+  >(() => {})
   const pins = new SessionPins()
   const storage: AccountStorage = {
     version: 1,
@@ -169,7 +172,7 @@ export function fixture(
       },
       reportFailure: async () => {},
       recordSnapshot: async () => {},
-      reportUsage: () => {},
+      reportUsage,
       requestReading: () => {},
       grantReach: () => undefined,
       name: 'openai-auth-opencode',
@@ -183,7 +186,17 @@ export function fixture(
     kind: 'primary',
     phase: 'request',
   }
-  return { openai, pins, storage, routes, refused, authorized, request, source }
+  return {
+    openai,
+    pins,
+    storage,
+    routes,
+    refused,
+    authorized,
+    request,
+    source,
+    reportUsage,
+  }
 }
 
 export async function placementRequest(
