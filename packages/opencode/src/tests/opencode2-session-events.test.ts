@@ -203,6 +203,73 @@ async function refuseUsageLimit(
 
 const bearerOf = (request: Request) => request.headers.get('authorization')
 
+test('a post-output WebSocket continuation keeps its HTTP fallback on the same account', async () => {
+  const files = poolFiles()
+  // Account a starts with the most room, so the session pins to it.
+  seedPool(files, 'sticky-balanced', [
+    { id: 'a', usedPercent: 10 },
+    { id: 'b', usedPercent: 50 },
+  ])
+  const host = fakeOpenCode2Host()
+  const ctx: Parameters<typeof setupOpenAIAuth>[0] = host.ctx
+  const stop = await setupOpenAIAuth(ctx, {
+    paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
+    slot: opencode1HostSlot(join(files.dir, 'auth.json')),
+    fence: async () => ({ open: true }),
+    heartbeat: false,
+    fetch: offline,
+  })
+  const handshake = async () => {
+    const draft = {
+      ...scope(),
+      url: 'wss://api.openai.com/v1/responses',
+      headers: { authorization: `Bearer ${PLACEHOLDER}` },
+    }
+    await host.fire('experimental.ws.handshake', draft)
+    return draft.headers
+  }
+  try {
+    // The stream starts on account a over WebSocket and produces output,
+    // so the attempt owns the session's post-output pin.
+    expect((await handshake()).authorization).toBe('Bearer a-token')
+    await host.fire('experimental.ws.send', {
+      ...scope(),
+      frame: JSON.stringify({ type: 'response.create', input: [] }),
+    })
+    await host.fire('experimental.ws.receive', {
+      ...scope(),
+      frame: JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: 'hello',
+      }),
+    })
+    // The socket dies mid-stream; the host retries the interrupted read and
+    // the continuation reconnects on the same account, taking the pin.
+    const retry = {
+      sessionID: 'ses_1',
+      model: { providerID: 'openai', id: 'gpt-5.5' },
+      attempt: 1,
+      error: { type: 'provider.transport', message: 'socket closed' },
+      decision: { retry: true, delay: 1234 },
+    }
+    await host.fire('retry', retry)
+    expect(retry.decision).toEqual({ retry: true, delay: 1234 })
+    expect((await handshake()).authorization).toBe('Bearer a-token')
+    // Account a then fills up, so a fresh choice would move the session to
+    // account b. The HTTP fallback still belongs to the pinned attempt, so
+    // it stays on the account that owns the session's output.
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 100 },
+      { id: 'b', usedPercent: 10 },
+    ])
+    expect(bearerOf((await sendPrimary(host)).request)).toBe('Bearer a-token')
+  } finally {
+    await stop?.()
+    rmSync(files.dir, { recursive: true, force: true })
+  }
+})
+
 test('an interrupted run releases a held same-account retry so the next primary request chooses fresh', async () => {
   const files = poolFiles()
   // One account: the refused send holds the host's wait on that same account.
